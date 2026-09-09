@@ -1,7 +1,7 @@
 # ============================================================
 #  mes-ai-assistant（使用宿主机 Ollama，不再起 sidecar 容器）
 #
-#  启动：docker compose --env-file .env.docker up -d --build
+#  启动：docker compose up -d --build
 #  访问：http://<宿主机IP>:3001
 #
 #  ⚠ 网络模式：host（本配置的关键）
@@ -39,8 +39,7 @@ services:
     restart: unless-stopped
     # 共享宿主机网络栈：3001 直接监听宿主机，Ollama 走 127.0.0.1 可达
     network_mode: host
-    env_file:
-      - .env.docker
+    # 不写 env_file：docker compose 会自动加载同目录 .env（变量替换 + 注入容器）
     environment:
       PORT: 3001
       # host 模式下监听 IPv4 通配符，局域网可访问
