@@ -149,8 +149,7 @@ curl -o /dev/null -w "%{http_code}\n" http://127.0.0.1:3001/api/health   # 期�
 ## 七、文件清单
 
 - `server/.env`：后端运行配置（HOST / ADMIN_TOKEN / PORT）
-- `server/.env.example`：配置示例与说明
-- 项目根 `.env`：前端构建期变量（VITE_ADMIN_TOKEN）
+- 项目根 `.env`：前端构建期变量（VITE_ADMIN_TOKEN）；容器部署时同时提供 `ADMIN_TOKEN` 与 `OLLAMA_BASE`
 - `deploy-lan.bat`：一键部署（防火墙 + 构建 + 启动）
 - `start-lan.bat`：日常启动（不重建）
 - `dist/`：构建后的前端包（含烧入的令牌）

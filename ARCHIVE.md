@@ -105,10 +105,11 @@ archive/mes-ai-assistant-full-20260909.tar.gz
 
 ## 五、归档文件清单
 
+源码以 GitHub 仓库为准（https://github.com/nzggs/mes-ai-assistant），不再单独留存源码包。
+
 | 文件 | 内容 | 用途 |
 |---|---|---|
-| `archive/mes-ai-assistant-source-20260909.zip` | 源码（git 已跟踪文件，1.7M） | 分发、上传 GitHub |
-| `archive/mes-ai-assistant-full-20260909.tar.gz` | 源码 + `dist/` + `server/data/`（55M） | 本机完整灾备，含知识库 |
+| `archive/mes-ai-assistant-full-20260909.tar.gz` | 源码 + `dist/` + `server/data/`（55M，位于项目外 `archive/`） | 本机完整灾备，**含知识库数据**（数据不入库，这是唯一的整包快照） |
 
 ---
 

@@ -37,8 +37,6 @@ scripts
 deploy.sh
 DEPLOY-UBUNTU.md
 部署与运维手册.docx
-deployment-guide.html
 *.bat
 Dockerfile
 docker-compose.yml
-.env.docker

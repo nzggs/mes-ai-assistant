@@ -1,7 +1,7 @@
 # MES AI 智能助手 — 数据存储与运维部署说明
 
-本文档说明：上传的文档与切片存在哪里、如何把系统打包成"安装包"做后续升级、以及日常运维怎么做。
-配套脚本：`make-release.bat`（开发机打包）、`update-lan.bat`（服务器就地升级）、`deploy-lan.bat` / `start-lan.bat`（部署/启动）。
+本文档说明：上传的文档与切片存在哪里、如何备份迁移、程序如何升级，以及日常运维怎么做。
+配套脚本：`deploy-lan.bat` / `start-lan.bat`（Windows 部署/启动）；Docker 部署与运维见 `DEPLOY-UBUNTU.md`。
 
 ---
 
@@ -77,52 +77,35 @@ xcopy /E /I /Y server\data  D:\backup\mes-ai-data-%DATE:~0,4%%DATE:~5,2%%DATE:~8
 
 ---
 
-## 三、安装包更新（后续升级方法）
+## 三、程序升级（代码与数据分离）
 
-升级思路：**业务数据（`server/data`）与程序代码分离**。升级只替换程序（前端 `dist/`、后端 `server/`、`shared/`、配置脚本），数据目录原样保留。
+升级思路：**业务数据与程序代码分离**。升级只替换程序代码与前端包，数据目录原样保留。
 
-### 3.1 开发机：打包"安装包"
+### 3.1 Docker 部署（线上方式，推荐）
 
-运行 `make-release.bat`，它会：
+数据落在 Docker 卷（容器内 `/data`），重建容器不丢数据：
 
-- 用当前 `VITE_ADMIN_TOKEN`（根目录 `.env`）构建前端，把管理员令牌烧入 `dist/`；
-- 把 `dist/`、`server/`、`shared/`、`package.json`、`package-lock.json`、`build.cjs`、`vite.config.ts`、`.env`（根，含 VITE_ADMIN_TOKEN）、`*.bat` 脚本打成一个 zip：`mes-ai-release-<日期>.zip`。
+```bash
+cd mes-ai-assistant
+git pull                        # 拉取最新代码
+docker compose up -d --build    # 重建并启动
+```
 
-> 打包内容**不含** `server/data`（用户数据）和 `node_modules`（服务器侧按需安装，见下）。
+> 目录名不要改：compose 项目名由目录名决定，改名会新建卷，导致知识库数据"消失"（旧卷仍在，可找回）。
 
-### 3.2 服务器：用安装包就地升级
+### 3.2 Windows 本机部署
 
-1. 把 `mes-ai-release-<日期>.zip` 传到服务器，解压到一个**临时目录**（如 `C:\temp\mes-ai-release`）。
-2. 进入该临时目录，运行：
+运行 `deploy-lan.bat`（重新构建前端并烧入令牌，然后启动）。
 
-   ```bat
-   update-lan.bat  "C:\path\to\当前安装目录"
-   ```
-
-   （若省略路径，默认把当前安装目录当作脚本所在目录自身，即"在已安装目录里就地跑更新包"——此时请先把新包内容解压覆盖到安装目录，再运行 `update-lan.bat`。）
-
-`update-lan.bat` 会自动完成：
-
-- 停止 3001 端口上的旧服务；
-- 备份旧 `server/data` 到 `..\mes-ai-data-backup-<时间戳>`；
-- 同步新包的程序文件到安装目录，**但保留** `server/data/`（用户数据）和 `server/.env`（本机令牌/端口配置）；
-- 若新包带 `node_modules` 则一并覆盖，否则在服务器执行 `npm install`（需 Node 环境）；
-- 重新放行防火墙 3001；
-- 重新启动服务。
-
-> 升级过程数据不丢、配置不丢。若升级失败，可用备份的 `server/data` 回退。
-
-### 3.3 更换管理员令牌（升级或定期轮换）
+### 3.3 更换管理员令牌（定期轮换）
 
 `ADMIN_TOKEN`（服务端）与 `VITE_ADMIN_TOKEN`（前端，烧进 `dist`）**必须一致**：
 
-1. 开发机：`openssl rand -hex 32` 生成新令牌；
-2. 改根目录 `.env` 的 `VITE_ADMIN_TOKEN` 和 `server/.env` 的 `ADMIN_TOKEN` 为同一值；
-3. 重新跑 `make-release.bat` 打包（前端需重新构建以烧入新令牌）；
-4. 服务器用新包 `update-lan.bat` 升级。
+1. 生成新值：`node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`
+2. 同步修改根目录 `.env` 中的 `VITE_ADMIN_TOKEN` 与 `ADMIN_TOKEN`（同一值）
+3. 重新构建：Docker 走 `docker compose up -d --build`；本机走 `deploy-lan.bat`
 
 ---
-
 ## 四、日常运维
 
 ### 4.1 启动 / 停止
@@ -180,7 +163,6 @@ curl http://127.0.0.1:3001/                 # 首页 200 即前端可访问
 | `shared/providers.js` | 模型提供商单一数据源（前端+后端共用） |
 | `deploy-lan.bat` | 一次性部署：构建 + 启动 + 防火墙 |
 | `start-lan.bat` | 日常启动（不重建） |
-| `make-release.bat` | 开发机：打包发布包（安装包） |
-| `update-lan.bat` | 服务器：用安装包就地升级（保留数据与配置） |
+| `Dockerfile` / `docker-compose.yml` | 容器化构建与运行（host 网络，卷持久化 `/data`） |
 | `README-部署.md` | 局域网部署与排错 |
 | `README-数据存储与运维.md` | 本文档 |
