@@ -35,8 +35,7 @@ vitest.config.ts.timestamp-*.mjs
 # 文档与本地脚本（镜像内不需要）
 scripts
 deploy.sh
-DEPLOY-UBUNTU.md
-部署与运维手册.docx
-*.bat
+*.md
+*.docx
 Dockerfile
 docker-compose.yml

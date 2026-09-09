@@ -67,7 +67,8 @@ fi
 
 # ---------- 4. 构建并启动 ----------
 say "[4/5] 构建镜像并启动容器"
-$COMPOSE --env-file .env up -d --build
+# 不写 --env-file：docker compose 会自动加载同目录 .env
+$COMPOSE up -d --build
 
 # ---------- 5. 健康检查 ----------
 say "[5/5] 等待服务就绪"
