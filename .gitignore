@@ -1,0 +1,52 @@
+# 依赖
+node_modules/
+server/node_modules/
+
+# 构建产物
+dist/
+.temp/
+
+# 后端持久化数据（上传文档、docs.json、日志，含敏感业务数据）
+server/data/
+server/.env
+
+# Docker 部署配置（含管理员令牌，禁止入库）
+.env.docker
+
+# 日志
+*.log
+npm-debug.log*
+
+# 系统 / 编辑器
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# WorkBuddy 项目数据
+.workbuddy/
+
+# 测试覆盖率产物
+coverage/
+
+# 构建产物备份（历史残留）
+dist.bak/
+dist.bak_*/
+dist-bak-*/
+
+# TypeScript 构建缓存
+*.tsbuildinfo
+
+# vitest 临时文件
+vitest.config.ts.timestamp-*.mjs
+
+# 临时目录
+tmp/
+.buildtmp/
+
+# 根目录前端构建期变量（含 VITE_ADMIN_TOKEN，禁止入库）
+.env
+
+# 本机部署脚本（含真实管理员令牌，不入库；仓库内提供 .example 版本）
+start-lan.bat
+deploy-lan.bat

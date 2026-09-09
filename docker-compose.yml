@@ -1,0 +1,58 @@
+# ============================================================
+#  mes-ai-assistant（使用宿主机 Ollama，不再起 sidecar 容器）
+#
+#  启动：docker compose --env-file .env.docker up -d --build
+#  访问：http://<宿主机IP>:3001
+#
+#  ⚠ 网络模式：host（本配置的关键）
+#    目标机 Ubuntu 20.04 的 docker bridge 网络不可用，实测：
+#      bridge 下 DNS 解析 getaddrinfo EAI_AGAIN
+#      bridge 下访问外网 IP → EHOSTUNREACH
+#      bridge 下访问宿主机 172.28.1.15:11434 → 连接超时
+#      host   下访问 registry → 308ms HTTP 200
+#    改用 host 网络后：
+#      - 构建期 npm ci 能正常联网
+#      - 运行期 127.0.0.1:11434 就是宿主机 Ollama，无需防火墙放行
+#      - 3001 端口直接监听在宿主机上，不需要端口映射
+#    若换到 bridge 网络正常的机器，可删掉 network_mode / build.network
+#    并恢复 ports 映射、把 OLLAMA_BASE 改为宿主机非回环 IP。
+#
+#  宿主机侧前置条件：
+#    1) 已拉取本地模型：ollama pull deepseek-r1:1.5b
+#    2) Ollama 服务已启动（host 模式下即使只监听 127.0.0.1 也能被容器访问）
+# ============================================================
+
+services:
+  # ---------- 主应用（Express 托管前端 + API） ----------
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      # 构建阶段同样需要外网（npm ci），bridge 出不去 → 用 host
+      network: host
+      args:
+        # 构建期烧入前端包，必须与运行时 ADMIN_TOKEN 一致
+        VITE_ADMIN_TOKEN: ${ADMIN_TOKEN:-}
+        VITE_BACKEND_URL: ${VITE_BACKEND_URL:-}
+    image: mes-ai-assistant:latest
+    container_name: mes-ai-assistant
+    restart: unless-stopped
+    # 共享宿主机网络栈：3001 直接监听宿主机，Ollama 走 127.0.0.1 可达
+    network_mode: host
+    env_file:
+      - .env.docker
+    environment:
+      PORT: 3001
+      # host 模式下监听 IPv4 通配符，局域网可访问
+      HOST: 0.0.0.0
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-}
+      # 知识库数据落点（对应卷 mes-data）
+      MES_DATA_DIR: /data
+      # host 网络下 127.0.0.1 即宿主机 → 直连宿主机 Ollama
+      OLLAMA_API_URL: ${OLLAMA_BASE:-http://127.0.0.1:11434}/v1/chat/completions
+    volumes:
+      - mes-data:/data
+
+volumes:
+  # 知识库文档、用户数据
+  mes-data:

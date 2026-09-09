@@ -1,0 +1,239 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html, body, #root {
+  height: 100%;
+  width: 100%;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;
+  background-color: #f7f7f8;
+  color: #1a1a1a;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #d1d1d1;
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #b1b1b1;
+}
+
+/* Markdown content styles */
+.markdown-content {
+  line-height: 1.75;
+  font-size: 15px;
+}
+
+.markdown-content p {
+  margin-bottom: 12px;
+}
+
+.markdown-content h1, .markdown-content h2, .markdown-content h3 {
+  font-weight: 600;
+  margin-top: 20px;
+  margin-bottom: 10px;
+}
+
+.markdown-content h1 { font-size: 1.4em; }
+.markdown-content h2 { font-size: 1.25em; }
+.markdown-content h3 { font-size: 1.1em; }
+
+.markdown-content ul, .markdown-content ol {
+  margin-left: 20px;
+  margin-bottom: 12px;
+}
+
+.markdown-content li {
+  margin-bottom: 6px;
+}
+
+.markdown-content code {
+  background: #f0f0f0;
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-size: 0.9em;
+  font-family: 'Fira Code', 'Consolas', monospace;
+}
+
+.markdown-content pre {
+  background: #1e1e1e;
+  color: #d4d4d4;
+  padding: 14px 16px;
+  border-radius: 8px;
+  overflow-x: auto;
+  margin-bottom: 12px;
+}
+
+.markdown-content pre code {
+  background: none;
+  padding: 0;
+  color: inherit;
+}
+
+.markdown-content table {
+  border-collapse: collapse;
+  width: 100%;
+  margin-bottom: 12px;
+}
+
+.markdown-content th, .markdown-content td {
+  border: 1px solid #e5e5e5;
+  padding: 8px 12px;
+  text-align: left;
+}
+
+.markdown-content th {
+  background: #f7f7f8;
+  font-weight: 600;
+}
+
+.markdown-content blockquote {
+  border-left: 3px solid #4d6bfe;
+  padding-left: 12px;
+  color: #6b6b6b;
+  margin-bottom: 12px;
+}
+
+.markdown-content strong {
+  font-weight: 600;
+}
+
+/* Typing cursor */
+.typing-cursor::after {
+  content: '▊';
+  animation: blink 1s infinite;
+  color: #4d6bfe;
+  margin-left: 2px;
+}
+
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+
+/* Smooth transitions */
+.transition-all-smooth {
+  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+/* ===== 原始文档在线预览 ===== */
+.docx-preview-container {
+  background: #fff;
+  border-radius: 8px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+  padding: 24px 32px;
+  line-height: 1.6;
+  color: #333;
+  overflow-x: auto;
+}
+.docx-preview-container img {
+  max-width: 100%;
+  height: auto;
+}
+.docx-preview-container table {
+  border-collapse: collapse;
+  margin: 8px 0;
+}
+.docx-preview-container td,
+.docx-preview-container th {
+  border: 1px solid #ccc;
+  padding: 6px 10px;
+  font-size: 13px;
+}
+
+.xlsx-sheet-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: #1f2937;
+  margin: 18px 0 6px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid #e5e7eb;
+}
+.xlsx-sheet-title:first-child {
+  margin-top: 0;
+}
+.docx-preview-container table.sheet-table,
+.docx-preview-container table.rtl {
+  border-collapse: collapse;
+  background: #fff;
+  border-radius: 6px;
+  overflow: hidden;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06);
+}
+.docx-preview-container td,
+.docx-preview-container th {
+  border: 1px solid #e5e7eb;
+  padding: 6px 10px;
+  font-size: 12px;
+}
+
+.pptx-para {
+  font-size: 14px;
+  line-height: 1.8;
+  color: #333;
+  margin-bottom: 8px;
+}
+
+/* ===== 知识库预览：Excel 内嵌图片叠加 ===== */
+.xlsx-sheet-block {
+  margin-bottom: 22px;
+}
+.xlsx-sheet-canvas {
+  position: relative;
+  overflow: auto;
+  background: #fff;
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+  padding: 0;
+}
+.xlsx-sheet-canvas table {
+  border-collapse: collapse;
+  background: #fff;
+}
+.xlsx-sheet-canvas td,
+.xlsx-sheet-canvas th {
+  border: 1px solid #d8dee6;
+  padding: 3px 8px;
+  font-size: 12px;
+  min-width: 60px;
+  white-space: nowrap;
+}
+
+/* ===== 知识库预览：PPT 幻灯片式浏览 ===== */
+.pptx-slide {
+  background: #fff;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  padding: 20px 24px;
+  margin-bottom: 20px;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.06);
+}
+.pptx-slide-no {
+  font-size: 12px;
+  font-weight: 600;
+  color: #ea580c;
+  margin-bottom: 8px;
+}
+

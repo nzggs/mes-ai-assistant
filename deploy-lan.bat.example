@@ -1,0 +1,33 @@
+@echo off
+REM ============================================================
+REM  局域网部署脚本（一次性/改用令牌后重跑）
+REM  - 构建时把管理员令牌烧入前端包（VITE_ADMIN_TOKEN）
+REM  - 启动后端监听 0.0.0.0:3001（HOST / ADMIN_TOKEN）
+REM  注意：ADMIN_TOKEN 与 VITE_ADMIN_TOKEN 必须一致！
+REM  换令牌：openssl rand -hex 32，下面两处一起改。
+REM ============================================================
+cd /d %~dp0
+
+REM 放行防火墙 3001 入站（已存在则忽略错误）
+netsh advfirewall firewall add rule name="MES-AI-Assistant-3001" dir=in action=allow protocol=TCP localport=3001 >nul 2>&1
+
+set VITE_ADMIN_TOKEN=your-admin-token-here
+
+if not exist .buildtmp mkdir .buildtmp
+set NODE_OPTIONS=
+set ESBUILD_WORKER_THREADS=0
+set TEMP=%CD%\.buildtmp
+set TMP=%CD%\.buildtmp
+
+echo [1/2] 构建前端（烧入管理员令牌）...
+call node build.cjs
+if errorlevel 1 (
+  echo 构建失败，请检查 Node 环境与依赖。
+  pause
+  exit /b 1
+)
+
+echo [2/2] 启动后端（监听 0.0.0.0:3001）...
+set HOST=0.0.0.0
+set ADMIN_TOKEN=your-admin-token-here
+node server/index.js

@@ -1,0 +1,44 @@
+# .dockerignore —— 避免把依赖、备份产物、本地数据与密钥打进构建上下文
+node_modules
+**/node_modules
+
+# 构建产物与历史备份（dist.bak_* / dist-bak-* 有十几个，体积大）
+dist
+dist.bak
+dist.bak_*
+dist-bak-*
+dist-esbuild-test.css
+
+# 本地数据 & 密钥（绝不进镜像）
+.env
+server/.env
+server/data
+data
+
+# 日志与临时文件
+*.log
+build*.log
+ollama-serve.log
+server-run.log
+.temp
+tmp
+.buildtmp
+
+# 测试 / 覆盖率 / 构建缓存
+coverage
+.git
+.github
+.vitest
+vitest.config.ts.timestamp-*.mjs
+*.tsbuildinfo
+
+# 文档与本地脚本（镜像内不需要）
+scripts
+deploy.sh
+DEPLOY-UBUNTU.md
+部署与运维手册.docx
+deployment-guide.html
+*.bat
+Dockerfile
+docker-compose.yml
+.env.docker
