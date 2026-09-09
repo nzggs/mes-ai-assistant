@@ -6,5 +6,5 @@ REM  监听 0.0.0.0:3001，局域网设备访问 http://<本机IP>:3001
 REM ============================================================
 cd /d %~dp0
 set HOST=0.0.0.0
-set ADMIN_TOKEN=your-admin-token-here
+set ADMIN_TOKEN=64f240429544b325e236d983a0725df6c7410c6ba0eebe68480c4117312c53ce
 node server/index.js

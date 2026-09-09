@@ -7,11 +7,11 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-# 宿主机 Ollama 地址：优先取环境变量，其次读 .env.docker，最后用默认值
+# 宿主机 Ollama 地址：优先取环境变量，其次读 .env，最后用默认值
 DEFAULT_IP="127.0.0.1"
 HOST_IP="${OLLAMA_HOST_IP:-}"
 if [ -z "$HOST_IP" ]; then
-  HOST_IP="$(grep -E '^OLLAMA_BASE=http://' .env.docker 2>/dev/null \
+  HOST_IP="$(grep -E '^OLLAMA_BASE=http://' .env 2>/dev/null \
              | head -1 | sed -E 's#^OLLAMA_BASE=http://([^:/]+).*#\1#')"
 fi
 HOST_IP="${HOST_IP:-$DEFAULT_IP}"
@@ -67,7 +67,7 @@ fi
 
 # ---------- 4. 构建并启动 ----------
 say "[4/5] 构建镜像并启动容器"
-$COMPOSE --env-file .env.docker up -d --build
+$COMPOSE --env-file .env up -d --build
 
 # ---------- 5. 健康检查 ----------
 say "[5/5] 等待服务就绪"

@@ -110,7 +110,7 @@ scp "C:/Users/Administrator/WorkBuddy/AI智能助手/mes-ai-deploy.tar.gz" <用�
 mkdir -p ~/mes-ai-assistant
 tar xzf ~/mes-ai-deploy.tar.gz -C ~/mes-ai-assistant
 cd ~/mes-ai-assistant
-ls -l            # 应能看到 Dockerfile / docker-compose.yml / .env.docker / deploy.sh
+ls -l            # 应能看到 Dockerfile / docker-compose.yml / .env / deploy.sh
 ```
 
 ### 方式 A：一键脚本（推荐）
@@ -127,11 +127,17 @@ chmod +x deploy.sh
 ### 方式 B：手动执行
 
 ```bash
-docker compose --env-file .env.docker up -d --build
+# 推荐（脚本会自检环境、探测 Ollama、检查模型）
+docker compose up -d --build
+
+# 等价显式写法
+docker compose --env-file .env up -d --build
 ```
 
-> `--env-file .env.docker` **不能省**：构建期要把 `VITE_ADMIN_TOKEN` 烧进前端包，
-> 运行时后端用同一个 `ADMIN_TOKEN`。省了会导致上传/删除文档 403。
+> `.env` 是唯一配置文件，docker compose 默认会自动加载它，所以 `--env-file`
+> 可以省略（仓库已提交该文件，clone 后无需任何改动即可构建）。
+> 它同时提供构建期的 `VITE_ADMIN_TOKEN` 和运行时的 `ADMIN_TOKEN`，两者取自同一值，
+> 若自行拆分或改动只改一处，会导致局域网设备上传/删除文档 403。
 
 首次构建需要 `npm ci`（前后端两份依赖），约 3–8 分钟，取决于网络。
 
@@ -192,10 +198,10 @@ docker volume inspect mes-ai-assistant_mes-data   # 查看实际存储路径
 |---|---|---|
 | 构建卡在 `npm ci` | 网络慢/被限流 | 重跑；或换 npm 源 `npm config set registry https://registry.npmmirror.com` |
 | 页面能开，本地模型报"连接失败" | Ollama 只听 127.0.0.1 | 回到第 1 步 |
-| 上传/删除文档 403 | token 不一致 | 确认用了 `--env-file .env.docker`；两者都取自同文件的 `ADMIN_TOKEN` |
+| 上传/删除文档 403 | token 不一致 | 确认用了 `--env-file .env`；两者都取自同文件的 `ADMIN_TOKEN` |
 | 容器反复重启 | 端口占用 | `sudo ss -lntp \| grep 3001` 查占用；改 `docker-compose.yml` 的 `ports` |
-| `host.docker.internal` 解析失败 | 用了回退方案 | `.env.docker` 里 `OLLAMA_BASE` 已填 `http://172.28.1.15:11434`，一般遇不到 |
-| 想换 Ollama 地址 | 虚拟机 IP 变了 | 改 `.env.docker` 的 `OLLAMA_BASE`，然后 `docker compose up -d`（无需重建镜像） |
+| `host.docker.internal` 解析失败 | 用了回退方案 | `.env` 里 `OLLAMA_BASE` 已填 `http://172.28.1.15:11434`，一般遇不到 |
+| 想换 Ollama 地址 | 虚拟机 IP 变了 | 改 `.env` 的 `OLLAMA_BASE`，然后 `docker compose up -d`（无需重建镜像） |
 
 ---
 
@@ -203,7 +209,7 @@ docker volume inspect mes-ai-assistant_mes-data   # 查看实际存储路径
 
 | 文件 | 作用 |
 |---|---|
-| `.env.docker` | `ADMIN_TOKEN`（管理与前端共用）、`OLLAMA_BASE`（宿主机 Ollama 地址） |
+| `.env` | `ADMIN_TOKEN`（管理与前端共用）、`OLLAMA_BASE`（宿主机 Ollama 地址） |
 | `docker-compose.yml` | 单服务 `app`，映射 3001，挂卷 `mes-data` |
 | `Dockerfile` | 多阶段：builder 出 `dist/` → runtime 由 Express 托管前端与 API |
 | `deploy.sh` | 一键部署 + 自检脚本 |

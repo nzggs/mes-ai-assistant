@@ -11,7 +11,7 @@ cd /d %~dp0
 REM 放行防火墙 3001 入站（已存在则忽略错误）
 netsh advfirewall firewall add rule name="MES-AI-Assistant-3001" dir=in action=allow protocol=TCP localport=3001 >nul 2>&1
 
-set VITE_ADMIN_TOKEN=your-admin-token-here
+set VITE_ADMIN_TOKEN=64f240429544b325e236d983a0725df6c7410c6ba0eebe68480c4117312c53ce
 
 if not exist .buildtmp mkdir .buildtmp
 set NODE_OPTIONS=
@@ -29,5 +29,5 @@ if errorlevel 1 (
 
 echo [2/2] 启动后端（监听 0.0.0.0:3001）...
 set HOST=0.0.0.0
-set ADMIN_TOKEN=your-admin-token-here
+set ADMIN_TOKEN=64f240429544b325e236d983a0725df6c7410c6ba0eebe68480c4117312c53ce
 node server/index.js
