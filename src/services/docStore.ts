@@ -76,9 +76,10 @@ export async function syncLocalToBackend(): Promise<void> {
     if (!res.ok) return
     const remote = await res.json() as { id: string }[]
     const remoteIds = new Set(remote.map(r => r.id))
-    const db = await getDb()
-    const req = db.transaction(STORE, 'readonly').objectStore(STORE).getAll() as IDBRequest<StoredDocRecord[]>
-    const records = (await requestResult<StoredDocRecord[]>(req)) || []
+    const records = await withDb(async db => {
+      const req = db.transaction(STORE, 'readonly').objectStore(STORE).getAll() as IDBRequest<StoredDocRecord[]>
+      return (await requestResult<StoredDocRecord[]>(req)) || []
+    })
     for (const r of records) {
       if (remoteIds.has(r.id)) continue
       const fileBase64 = r.blob ? await blobToBase64(r.blob) : undefined
@@ -104,8 +105,23 @@ function openDb(): Promise<IDBDatabase> {
         db.createObjectStore(STORE, { keyPath: 'id' })
       }
     }
-    req.onsuccess = () => resolve(req.result)
+    req.onsuccess = () => {
+      const db = req.result
+      // 连接被浏览器/其他标签页异常关闭时（存储被清理、磁盘错误、版本升级等），
+      // 必须丢弃缓存的连接实例，否则后续 db.transaction 会抛
+      // "Failed to execute 'transaction' on 'IDBDatabase': The database connection is closing."
+      db.onclose = () => {
+        dbPromise = null
+        console.warn('[docStore] IndexedDB 连接已被关闭，下次操作时自动重连')
+      }
+      db.onversionchange = () => {
+        try { db.close() } catch { /* 忽略 */ }
+        dbPromise = null
+      }
+      resolve(db)
+    }
     req.onerror = () => reject(req.error || new Error('打开 IndexedDB 失败'))
+    req.onblocked = () => { dbPromise = null }
   })
 }
 
@@ -118,6 +134,32 @@ function getDb(): Promise<IDBDatabase> {
     })
   }
   return dbPromise
+}
+
+/** 判断是否为"连接已关闭/失效"类错误（这类错误重连即可恢复） */
+function isClosingError(e: any): boolean {
+  const name = e?.name || ''
+  const msg = String(e?.message || e || '')
+  return name === 'InvalidStateError' || /connection is closing|database connection is closing|is closing/i.test(msg)
+}
+
+/**
+ * 统一的 IndexedDB 访问入口：连接失效时自动重连并重试一次。
+ * 覆缓存连接在后台被浏览器关闭的场景（此前会直接抛出 connection is closing 导致
+ * 上传/审核/总结落盘全部失败）。
+ */
+async function withDb<T>(fn: (db: IDBDatabase) => Promise<T>): Promise<T> {
+  try {
+    const db = await getDb()
+    return await fn(db)
+  } catch (e) {
+    if (!isClosingError(e)) throw e
+    // 丢弃失效连接，重新打开后再执行一次（幂等操作可安全重试）
+    try { (await getDb())?.close?.() } catch { /* 忽略 */ }
+    dbPromise = null
+    const db = await getDb()
+    return await fn(db)
+  }
 }
 
 function requestResult<T>(req: IDBRequest<T>): Promise<T> {
@@ -161,33 +203,84 @@ function slimDoc(doc: KnowledgeDoc): KnowledgeDoc {
 
 /** 保存新上传文档（元数据 + 原始文件 Blob），并同步到后端 */
 export async function saveUploadedDoc(doc: KnowledgeDoc, blob: Blob): Promise<void> {
-  const db = await getDb()
-  const tx = db.transaction(STORE, 'readwrite')
-  tx.objectStore(STORE).put({ id: doc.id, doc: slimDoc(stripUrls(doc)), blob } as StoredDocRecord)
-  // IndexedDB 落盘完成即返回，保证"上传后立即刷新"也能从 IndexedDB 恢复文档
-  await txDone(tx)
+  // 本地落盘（保证"上传后立即刷新"也能从 IndexedDB 恢复）。
+  // 失败时**不能**阻断后面的后端同步：此前本地一挂，后端就完全没有该文档，
+  // 后续"整篇总结"会因后端查不到分片而报"文档不存在"。
+  try {
+    await withDb(async db => {
+      const tx = db.transaction(STORE, 'readwrite')
+      tx.objectStore(STORE).put({ id: doc.id, doc: slimDoc(stripUrls(doc)), blob } as StoredDocRecord)
+      await txDone(tx)
+    })
+  } catch (e) {
+    console.error('保存文档到 IndexedDB 失败（将继续同步后端）:', doc.name, e)
+    reportError(`文档「${doc.name}」本地缓存写入失败：${(e as Error)?.message || e}（已尝试同步到服务器，不影响使用）`)
+  }
 
-  // 同步后端（携带原始文件，供外部浏览器阅读原文）放后台执行，不阻塞上传；
-  // 后端同步失败不致命（IndexedDB 已兜底，getAllDocs 会在后端缺失时自动补传），但需记录以便排查
+  // 同步后端（携带原始文件，供外部浏览器阅读原文）放后台执行，不阻塞上传。
+  // 后端同步失败需显式上报：否则用户只会在"总结"时看到莫名其妙的"文档不存在"。
   blobToBase64(blob)
     .then(fileBase64 => {
       if (fileBase64) return postToBackend(stripUrls(doc), fileBase64)
     })
-    .catch(err => console.warn('文档后端同步失败（本地已保留，稍后自动补传）:', err))
+    .catch(err => {
+      console.warn('文档后端同步失败:', err)
+      reportError(`文档「${doc.name}」同步到服务器失败：${(err as Error)?.message || err}。请刷新后重试，或检查管理令牌配置。`)
+    })
 }
 
 /** 更新文档元数据（保留已存的原始文件 Blob；用于 AI 提取/审核状态等更新），并同步后端 */
 export async function saveMeta(doc: KnowledgeDoc): Promise<void> {
-  const db = await getDb()
-  const store = db.transaction(STORE, 'readonly').objectStore(STORE)
-  const existing = await requestResult<StoredDocRecord | undefined>(
-    store.get(doc.id) as IDBRequest<StoredDocRecord | undefined>
-  )
-  const tx = db.transaction(STORE, 'readwrite')
-  tx.objectStore(STORE).put({ id: doc.id, doc: slimDoc(stripUrls(doc)), blob: existing?.blob } as StoredDocRecord)
-  await txDone(tx)
+  // 本地缓存写入失败时不要整体失败：后端才是跨浏览器/跨设备的真相源，
+  // 只要后端写成功，审核/改名等操作就应视为成功（此前本地一挂就弹"审核失败"）。
+  let localErr: unknown = null
+  try {
+    await withDb(async db => {
+      const store = db.transaction(STORE, 'readonly').objectStore(STORE)
+      const existing = await requestResult<StoredDocRecord | undefined>(
+        store.get(doc.id) as IDBRequest<StoredDocRecord | undefined>
+      )
+      const tx = db.transaction(STORE, 'readwrite')
+      tx.objectStore(STORE).put({ id: doc.id, doc: slimDoc(stripUrls(doc)), blob: existing?.blob } as StoredDocRecord)
+      await txDone(tx)
+    })
+  } catch (e) {
+    localErr = e
+    console.error('保存文档元数据到 IndexedDB 失败（将继续同步后端）:', doc.name, e)
+  }
+
+  // 本地与后端都不可用 → 元数据无处落盘，必须让调用方感知
+  if (localErr && !(await checkBackend())) {
+    throw localErr instanceof Error ? localErr : new Error(String(localErr))
+  }
 
   await postToBackend(stripUrls(doc))
+}
+
+/**
+ * 立即把文档（含原始文件）同步到后端，失败时抛错。
+ * 用于"总结"前的兜底补传：后端查不到分片时 /api/summary/start 会返回"文档不存在"，
+ * 此时补传一次即可继续，而不必让用户重新上传文档。
+ */
+export async function syncDocNow(doc: KnowledgeDoc): Promise<void> {
+  if (!(await checkBackend())) throw new Error('后端不可达，无法同步文档')
+  let fileBase64: string | undefined
+  try {
+    const rec = await withDb(async db => {
+      const req = db.transaction(STORE, 'readonly').objectStore(STORE).get(doc.id) as IDBRequest<StoredDocRecord | undefined>
+      return await requestResult<StoredDocRecord | undefined>(req)
+    })
+    if (rec?.blob) fileBase64 = await blobToBase64(rec.blob)
+  } catch { /* 读本地失败时退化为只同步元数据 */ }
+  const res = await fetch(`${BACKEND_BASE}/api/docs`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Admin-Token': getAdminToken() },
+    body: JSON.stringify({ id: doc.id, doc: stripUrls(doc), fileBase64 }),
+  })
+  if (!res.ok) {
+    const data = await res.json().catch(() => null)
+    throw new Error(data?.error || `后端保存失败 (${res.status})`)
+  }
 }
 
 /**
@@ -297,9 +390,10 @@ export async function getDocLogs(): Promise<import('../types').DocLog[]> {
 /** 读取所有持久化文档（合并后端 + 本地 IndexedDB；本地未同步的自动补传） */
 export async function getAllDocs(): Promise<StoredDocRecord[]> {
   // 本地 IndexedDB（始终读取，作为本地真相）
-  const db = await getDb()
-  const req = db.transaction(STORE, 'readonly').objectStore(STORE).getAll() as IDBRequest<StoredDocRecord[]>
-  const local = (await requestResult<StoredDocRecord[]>(req)) || []
+  const local = await withDb(async db => {
+    const req = db.transaction(STORE, 'readonly').objectStore(STORE).getAll() as IDBRequest<StoredDocRecord[]>
+    return (await requestResult<StoredDocRecord[]>(req)) || []
+  })
   const byId = new Map(local.map(r => [r.id, r]))
   const knownIds = new Set<string>() // 后端所有已知 id（含删除墓碑，用于避免复活补传）
 
@@ -345,19 +439,21 @@ export async function getAllDocs(): Promise<StoredDocRecord[]> {
 
 /** 删除本地 IndexedDB 记录 */
 async function localRemove(id: string): Promise<void> {
-  const db = await getDb()
-  const tx = db.transaction(STORE, 'readwrite')
-  tx.objectStore(STORE).delete(id)
-  await txDone(tx)
+  await withDb(async db => {
+    const tx = db.transaction(STORE, 'readwrite')
+    tx.objectStore(STORE).delete(id)
+    await txDone(tx)
+  })
 }
 
 /** 清空本地 IndexedDB 全部文档缓存（管理员清空知识库时，前后端一起清空） */
 async function clearAllLocal(): Promise<void> {
   try {
-    const db = await getDb()
-    const tx = db.transaction(STORE, 'readwrite')
-    tx.objectStore(STORE).clear()
-    await txDone(tx)
+    await withDb(async db => {
+      const tx = db.transaction(STORE, 'readwrite')
+      tx.objectStore(STORE).clear()
+      await txDone(tx)
+    })
   } catch { /* 忽略 */ }
 }
 

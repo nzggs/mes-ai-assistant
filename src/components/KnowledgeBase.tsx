@@ -2,7 +2,7 @@ import { useState, useMemo, useCallback, useRef, useEffect } from 'react'
 import { PdfViewer } from './PdfViewer'
 import { processUploadedDoc, reextractDocMetadata, summarizeDocumentScope, FULL_DOC_SUMMARY_KEY } from '../services/knowledgeService'
 import { getApiKey, getProviderId, resolveModelId, getGroupId } from '../services/llmApi'
-import { saveTableSummary, appendDocLog, getDocLogs, saveUploadedDoc, saveMeta, removeDoc } from '../services/docStore'
+import { saveTableSummary, appendDocLog, getDocLogs, saveUploadedDoc, saveMeta, removeDoc, syncDocNow } from '../services/docStore'
 import { canReviewDoc, type User } from '../services/userService'
 import type { KnowledgeDoc, DocPage, DocLog } from '../types'
 import * as XLSX from 'xlsx'
@@ -155,23 +155,51 @@ export function KnowledgeBase({ documents, currentUser, onDocumentsChange, onReq
       setSummaryScope(sheetName)
       return
     }
+    const payload = {
+      docId: doc.id,
+      sheetName: sheetName || null,
+      providerId: getProviderId(),
+      modelId: resolveModelId(),
+      groupId: getGroupId(),
+    }
+    const startOnce = () => fetch('/api/summary/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Api-Key': apiKey },
+      body: JSON.stringify(payload),
+    })
+
     try {
-      const res = await fetch('/api/summary/start', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'X-Api-Key': apiKey },
-        body: JSON.stringify({
-          docId: doc.id,
-          sheetName: sheetName || null,
-          providerId: getProviderId(),
-          modelId: resolveModelId(),
-          groupId: getGroupId(),
-        }),
-      })
+      let res = await startOnce()
       if (!res.ok) {
-        const e = await res.json().catch(() => ({}))
+        const text = await res.text().catch(() => '')
+        let errMsg = ''
+        try { errMsg = (JSON.parse(text) as any)?.error || '' } catch { /* 非 JSON 响应 */ }
+        // 后端查不到该文档分片（上传时后端同步失败/未完成时会出现）→ 先补传文档再重试一次，
+        // 避免用户必须重新上传才能总结
+        if (res.status === 400 && errMsg.includes('文档不存在')) {
+          try {
+            await syncDocNow(doc)
+            res = await startOnce()
+            if (res.ok) {
+              const retried = await res.json()
+              setDocTasks(prev => ({ ...prev, [doc.id]: retried.id }))
+              setActiveTask({ doc, scope: sheetName, taskId: retried.id })
+              setSummaryDoc(doc)
+              setSummaryScope(sheetName)
+              setSummaryText('')
+              setSummaryError('')
+              setSummarySaved(false)
+              return
+            }
+            const text2 = await res.text().catch(() => '')
+            try { errMsg = (JSON.parse(text2) as any)?.error || '发起总结失败' } catch { errMsg = '发起总结失败' }
+          } catch (e: any) {
+            errMsg = `文档尚未同步到服务器，自动补传失败：${e?.message || e}（请刷新页面后重试）`
+          }
+        }
         setSummaryDoc(doc)
         setSummaryScope(sheetName)
-        setSummaryError(e.error || '发起总结失败')
+        setSummaryError(errMsg || '发起总结失败')
         return
       }
       const task = await res.json()
