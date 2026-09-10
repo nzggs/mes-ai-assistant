@@ -187,6 +187,85 @@ describe('knowledgeService 纯函数', () => {
       expect(ctx).toBe('')
     })
 
+    describe('巨型文档（XML 数据导出，数千条记录）', () => {
+      // 构造 300 条记录：标题为对象编号，正文含唯一标记，用于验证预筛命中
+      const bigPages = Array.from({ length: 300 }, (_, i) => {
+        const no = String(i + 1).padStart(3, '0')
+        return { pageNum: i + 1, title: `OBJ-${no} · 对象${no}`, paragraphs: [`UNIQUE_MARK_${no} 的具体内容`] }
+      })
+      const bigDoc = () => mkDoc({
+        id: 'xml1',
+        name: 'Z_LOGIC.xml',
+        type: 'xml',
+        content: bigPages,
+        textContent: undefined,
+        pages: 300,
+      })
+
+      it('目录只列前 30 个标签页并标注总数，避免撑爆目录预算', () => {
+        const ctx = buildKnowledgeContext([bigDoc()], 'OBJ-250', 60000, 'explore')
+        expect(ctx).toContain('标签页/表（300）')
+        expect(ctx).toContain('OBJ-001')
+        expect(ctx).not.toContain('OBJ-250') // 超出前 30 个的不全列
+        expect(ctx).toContain('等共 300 个')
+      })
+
+      it('按对象名检索可命中靠后的记录（标题预筛）', () => {
+        const ctx = buildKnowledgeContext([bigDoc()], 'OBJ-250 是做什么的', 60000)
+        expect(ctx).toContain('UNIQUE_MARK_250')
+      })
+
+      it('标题未命中时退化为全量扫描，仍能按正文内容检索到', () => {
+        const ctx = buildKnowledgeContext([bigDoc()], 'UNIQUE_MARK_123 的具体内容', 60000)
+        expect(ctx).toContain('UNIQUE_MARK_123')
+      })
+    })
+
+    describe('服务端检索命中注入（超大文档正文不下发的场景）', () => {
+      // contentOmitted：服务端为超大文档剥离正文，列表里只有元数据
+      const omittedDoc = () => mkDoc({
+        id: 'big1',
+        name: 'MES代码库.xml',
+        type: 'xml',
+        content: [],
+        textContent: undefined,
+        contentOmitted: true,
+        pageCount: 4704,
+        pages: 4704,
+      })
+
+      it('无服务端命中时不纳入（正文为空，本地无从检索）', () => {
+        expect(buildKnowledgeContext([omittedDoc()], '查询库存列表')).toBe('')
+      })
+
+      it('传入服务端命中后被纳入，并注入命中页内容', () => {
+        const hits = [
+          { docId: 'big1', docName: 'MES代码库.xml', pageIndex: 42, pageTitle: 'C · 查询库存列表', score: 12.5, text: 'C · 查询库存列表\nSELECT * FROM Z_LOGIC' },
+          { docId: 'big1', docName: 'MES代码库.xml', pageIndex: 77, pageTitle: 'D · 查询库存明细', score: 9.1, text: 'D · 查询库存明细\nSELECT * FROM Z_STOCK' },
+        ]
+        const ctx = buildKnowledgeContext([omittedDoc()], '查询库存列表', 60000, 'detail', hits)
+        expect(ctx).toContain('与问题相关的内容（命中检索）')
+        expect(ctx).toContain('MES代码库.xml')
+        expect(ctx).toContain('C · 查询库存列表')
+        expect(ctx).toContain('SELECT * FROM Z_LOGIC')
+        expect(ctx).toContain('服务端索引命中')
+      })
+
+      it('目录里说明该文档正文未下发，避免模型误判为空', () => {
+        const hits = [
+          { docId: 'big1', docName: 'MES代码库.xml', pageIndex: 0, pageTitle: 'X', score: 1, text: 'X\n内容' },
+        ]
+        const ctx = buildKnowledgeContext([omittedDoc()], '随便', 60000, 'explore', hits)
+        expect(ctx).toContain('4704')
+      })
+
+      it('不传服务端命中时，既有文档行为与历史一致', () => {
+        const withHits = buildKnowledgeContext([mkDoc()], '设备出现异常', 60000, 'detail', [])
+        const without = buildKnowledgeContext([mkDoc()], '设备出现异常', 60000, 'detail')
+        expect(withHits).toBe(without)
+      })
+    })
+
     describe('探索模式（两步提问法·第一步）', () => {
       it('explore 模式仅注入目录与检索引导，不注入命中正文', () => {
         const ctx = buildKnowledgeContext([mkDoc()], 'SAVEPOINT 相关', 60000, 'explore')

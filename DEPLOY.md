@@ -89,9 +89,21 @@ chmod +x deploy.sh && ./deploy.sh
 | `ADMIN_TOKEN` | 服务端管理写操作鉴权（上传/删除/用户管理） |
 | `OLLAMA_BASE` | 宿主机 Ollama 地址，默认 `http://127.0.0.1:11434` |
 | `VITE_BACKEND_URL` | 留空＝前端与 API 同源（后端托管 dist） |
+| `SEARCH_INDEX` | 设 `0` 可关闭服务端倒排索引（默认开启） |
+| `SLIM_PAGE_THRESHOLD` | 文档超过该页数时，列表接口不下发正文（默认 200） |
+| `SLIM_TEXT_THRESHOLD` | 文档正文超过该字符数时不下发（默认 800000） |
+| `MES_IDX_MAX_DF` | 单个词出现在超过该页数即视为停用词丢弃（默认 1500） |
+| `MES_IDX_MAX_POSTINGS` | 倒排表总条目上限，内存兜底（默认 3000000） |
 
 > 两个令牌必须**同一值**，否则管理操作 403。仓库里的令牌经确认可公开，
 > 如需更换见第六节。
+
+> **超大文档（XML 数据导出等）**：正文体量大（常达数十 MB / 数千条记录）时，
+> 文档列表接口不再下发 `content`（响应里带 `contentOmitted: true` 与 `pageCount`），
+> 前端需要时通过 `GET /api/docs/:id/pages` 按需取页；问答检索改由服务端倒排索引
+> `GET /api/search` 承担。这两条正是为了消除「换一台浏览器打开就要先拉几十 MB 正文」的问题。
+> 索引只在**已入库（approved）**文档上构建，重启后后台异步重建（秒级），构建期间
+> 前端自动退回本地检索，功能不降级。
 
 ---
 
@@ -108,6 +120,12 @@ curl -s -m 180 -X POST http://127.0.0.1:3001/api/chat \
   -H 'X-Api-Key: ollama-local' \
   -d '{"messages":[{"role":"user","content":"只回答一个数字：1+1等于几"}],"providerId":"ollama","modelId":"deepseek-r1:1.5b"}' \
   | head -c 400
+
+# 服务端检索索引状态（ready=true 表示倒排索引已就绪）
+curl -s http://127.0.0.1:3001/api/search/status
+
+# 服务端检索（示例：按对象名/业务词检索，返回 Top-K 命中页）
+curl -s 'http://127.0.0.1:3001/api/search?q=查询库存列表&topK=5' | head -c 600
 ```
 
 浏览器打开 `http://<宿主机IP>:3001`，右上角「API 配置」应显示：本地 DeepSeek / DeepSeek-R1 1.5B。
@@ -204,6 +222,9 @@ node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
 | 换机器后连不上 Ollama | 用了 bridge 网络 | 改 `.env` 的 `OLLAMA_BASE` 为宿主机非回环 IP |
 | 日志 / 文件时间比北京时间早 8 小时 | 容器默认 UTC | compose 已设 `TZ: Asia/Shanghai`；`docker exec <容器> date` 应显示 CST |
 | 总结报「文档不存在」 | 该文档只存在于浏览器 IndexedDB，未同步到后端 | 新版本总结前会自动补传；仍失败就重新上传该文档 |
+| 超大 XML 文档「搜不到内容」 | 服务端索引尚未构建完成（刚重启），或该文档未入库（非 approved） | `curl /api/search/status` 看 `ready`；未入库文档本就不参与问答，先点「确认入库」 |
+| 容器内存占用偏高（数百 MB） | 索引与已入库文档正文常驻内存（数万条记录的量级） | 正常；如需收紧可调小 `MES_IDX_MAX_POSTINGS`，或 `SEARCH_INDEX=0` 关闭索引（会退回前端全量检索） |
+| 大文档打开详情较慢 | 正文按需加载（首次打开需从服务端取回） | 预期行为；未下发的正文只在打开文档时才拉取，避免每次打开页面都拉几十 MB |
 
 ---
 
@@ -237,3 +258,4 @@ git checkout archive-2026-09-09 -- src/components/ApiKeyModal.tsx
 | `.env` | 唯一配置（前后端令牌、Ollama 地址） |
 | `deploy.sh` | 一键部署 + 自检脚本 |
 | `shared/providers.js` | 模型提供商单一数据源（前端与后端共用） |
+| `server/searchIndex.js` | 零依赖页级倒排索引（英文标识符+子词 / CJK bigram），超大文档的问答检索通道 |

@@ -52,6 +52,7 @@ export const FILE_MIME = {
   txt: 'text/plain',
   md: 'text/markdown',
   csv: 'text/csv',
+  xml: 'application/xml',
 }
 
 // 校验文档 id 安全：仅允许文件名安全字符，禁止路径分隔符（防路径遍历），并排除 '.' 与 '..'
@@ -134,7 +135,12 @@ export function rebuildIndexSync() {
       updatedAt: doc.updatedAt || doc.approvedDate || 0,
       deleted: !!doc.deleted,
       sizeBytes: Buffer.byteLength(JSON.stringify(rec)),
-      textLen: doc.textContent ? doc.textContent.length : 0,
+      // XML 数据导出只存结构化 content（不存重复的 textContent），此处需回退统计 content 长度
+      textLen: doc.textContent
+        ? doc.textContent.length
+        : (Array.isArray(doc.content)
+            ? doc.content.reduce((s, p) => s + (p.title ? p.title.length : 0) + (Array.isArray(p.paragraphs) ? p.paragraphs.reduce((n, t) => n + String(t).length, 0) : 0), 0)
+            : 0),
     }
   })
   writeFileAtomic(DOCS_INDEX, JSON.stringify(entries))

@@ -16,6 +16,7 @@ import {
 } from './storage.js'
 import { extractPdfTextFromFile } from './pdfExtract.js'
 import { startSummary, getTask, cancelTask, listTasks, recoverSummaryTasks, startTaskCleanup } from './summaryTask.js'
+import { configureSearchIndex, buildIndex, search as searchInIndex, getStatus as getIndexStatus, upsertDocument, removeDocument, hasDocument } from './searchIndex.js'
 
 // 优先加载项目根目录 .env，再用 server/.env 覆盖（server/.env 为后端配置真相源）。
 dotenv.config()
@@ -31,6 +32,54 @@ process.on('uncaughtException', (err) => {
 
 // 确保数据目录存在（默认 server/data，可用 MES_DATA_DIR 环境变量覆盖，便于测试隔离）
 configureStorage()
+// 检索索引用 storage 的分片读取获取页正文
+configureSearchIndex({ fetchDocRecord: (id) => readShardSync(id) })
+
+// ===== 超大文档列表瘦身阈值 =====
+// XML 数据导出常达数千条记录、数十 MB 正文。若每次同步文档列表都全量下发，
+// 新浏览器首次打开就要拉取全部正文（数十 MB）并常驻内存。
+// 超过阈值的文档只下发元数据（contentOmitted），正文改由 GET /api/docs/:id/pages 按需取，
+// 问答检索改由服务端倒排索引 GET /api/search 承担（不受瘦身影响）。
+const SLIM_PAGE_THRESHOLD = Number(process.env.SLIM_PAGE_THRESHOLD || 200)      // 页数超过
+const SLIM_TEXT_THRESHOLD = Number(process.env.SLIM_TEXT_THRESHOLD || 800_000)  // 或正文字符数超过
+
+/**
+ * 估算文档正文字符数（content 结构化分页 / textContent 扁平全文两种形态）。
+ * 注意：巨型文档（数十 MB）不能逐页全量求和（每次列表请求都要多花上百毫秒），
+ * 因此取前若干页做「采样 × 页数」外推，O(采样量) 即可判断量级。
+ */
+function estimateTextLen(doc) {
+  if (!doc) return 0
+  if (typeof doc.textContent === 'string' && doc.textContent.length > 0) return doc.textContent.length
+  if (!Array.isArray(doc.content)) return 0
+  const pages = doc.content
+  if (pages.length <= 20) {
+    let n = 0
+    for (const p of pages) {
+      n += (p && typeof p.title === 'string') ? p.title.length : 0
+      if (p && Array.isArray(p.paragraphs)) {
+        for (const t of p.paragraphs) n += String(t == null ? '' : t).length
+      }
+    }
+    return n
+  }
+  let sample = 0
+  const SAMPLE = 20
+  for (let i = 0; i < SAMPLE; i++) {
+    const p = pages[i]
+    sample += (p && typeof p.title === 'string') ? p.title.length : 0
+    if (p && Array.isArray(p.paragraphs)) {
+      for (const t of p.paragraphs) sample += String(t == null ? '' : t).length
+    }
+  }
+  return Math.round(sample / SAMPLE) * pages.length
+}
+
+/** 是否需要在列表接口里剥离正文 */
+function shouldStripContent(doc) {
+  if (!doc || !Array.isArray(doc.content) || doc.content.length === 0) return false
+  return doc.content.length > SLIM_PAGE_THRESHOLD || estimateTextLen(doc) > SLIM_TEXT_THRESHOLD
+}
 
 const app = express()
 // SSE 响应头（流式聊天接口复用）
@@ -139,17 +188,26 @@ app.get('/api/health', (req, res) => {
 })
 
 // 列出文档（拆分存储适配）
-// - 不带 page 参数：向后兼容，返回完整数组（前端 getAllDocs 用于检索，必须含正文/切片）
+// - 不带 page 参数：向后兼容路径，返回完整数组（前端 getAllDocs 用于检索，必须含正文/切片）。
+//   但超过 SLIM_* 阈值的超大文档（如 XML 数据导出）会剥离正文，改由新增的
+//   GET /api/docs/:id/pages 按需取页 + GET /api/search 服务端检索兜住，
+//   避免「换一台浏览器就要全量拉取数十 MB 正文」；带 includeContent=1 可强制下发全量。
 // - 带 page 参数：分页 + 轻量元数据（不含 textContent/content/summaryChunks），供列表 UI 翻页，降低传输与解析成本
 app.get('/api/docs', (_req, res) => {
   try {
-    const { page, pageSize, status, q } = _req.query
+    const { page, pageSize, status, q, includeContent } = _req.query
     const all = readDocs()
     if (page === undefined) {
       const list = all.map(r => {
         const doc = { ...r.doc }
         delete doc.fileUrl
         delete doc.pdfUrl
+        if (includeContent !== '1' && shouldStripContent(doc)) {
+          doc.content = []
+          if (typeof doc.textContent === 'string') doc.textContent = ''
+          doc.contentOmitted = true
+          doc.pageCount = Array.isArray(r.doc.content) ? r.doc.content.length : 0
+        }
         return { id: r.id, doc }
       })
       return res.json(list)
@@ -166,6 +224,71 @@ app.get('/api/docs', (_req, res) => {
     const start = (p - 1) * ps
     const pageItems = items.slice(start, start + ps).map(r => ({ id: r.id, doc: lightweightDoc(r.doc) }))
     res.json({ items: pageItems, total, page: p, pageSize: ps })
+  } catch (err) {
+    return internalError(res, err)
+  }
+})
+
+// 按需取「某一页范围」的正文（配 /api/docs 的超大文档瘦身使用）。
+// 前端在浏览/预览/构建上下文时才拉取需要的页，避免一次性把数十 MB 正文拉到浏览器。
+app.get('/api/docs/:id/pages', (req, res) => {
+  const { id } = req.params
+  if (!isValidId(id)) return res.status(400).json({ error: '非法的文档 id' })
+  ensureDocsCache()
+  const rec = readDocs().find(r => r.id === id) || readShardSync(id)
+  if (!rec || (rec.doc && rec.doc.deleted)) return res.status(404).json({ error: '文档不存在' })
+  const pages = Array.isArray(rec.doc.content) ? rec.doc.content : []
+  const from = Math.max(0, parseInt(req.query.from, 10) || 0)
+  // 单次最多下发 500 页，防止被一次性拉爆（超大文档应配合 titles/服务端检索定位后再取页）
+  const MAX_RANGE = 500
+  let to = req.query.to !== undefined ? parseInt(req.query.to, 10) : pages.length
+  if (!Number.isFinite(to) || to < from) to = pages.length
+  to = Math.min(to, from + MAX_RANGE)
+  // 标题过滤（精确匹配 SNAPSHOT list）：一次性指定多个 page index 时用 indices=1,2,3
+  let picked = null
+  if (typeof req.query.indices === 'string' && req.query.indices.trim()) {
+    const set = req.query.indices.split(',').map(s => parseInt(s.trim(), 10)).filter(n => Number.isFinite(n) && n >= 0 && n < pages.length)
+    picked = Array.from(new Set(set)).sort((a, b) => a - b).slice(0, MAX_RANGE).map(i => ({ ...pages[i], pageNum: pages[i].pageNum ?? i + 1 }))
+  }
+  res.json({
+    id,
+    total: pages.length,
+    from,
+    to: picked ? pages.length : Math.min(to, pages.length),
+    pages: picked || pages.slice(from, Math.min(to, pages.length)),
+  })
+})
+
+// 页标题清单（体积极小，供超大文档在前端做对象名定位/翻页导航）
+app.get('/api/docs/:id/titles', (req, res) => {
+  const { id } = req.params
+  if (!isValidId(id)) return res.status(400).json({ error: '非法的文档 id' })
+  ensureDocsCache()
+  const rec = readDocs().find(r => r.id === id) || readShardSync(id)
+  if (!rec || (rec.doc && rec.doc.deleted)) return res.status(404).json({ error: '文档不存在' })
+  const pages = Array.isArray(rec.doc.content) ? rec.doc.content : []
+  res.json({ id, total: pages.length, titles: pages.map(p => String(p && p.title || '')) })
+})
+
+// ===== 服务端检索（倒排索引） =====
+// 背景：超大文档正文不再全量下发到浏览器后，前端无法再做本地全量扫文本。
+// 由服务端承担一次检索：给定查询，返回跨文档的 Top-K 命中页（含截断后的正文片段），
+// 前端据此直接组装问答上下文。索引未就绪时返回 ready:false，前端自动退回原有本地检索路径。
+app.get('/api/search/status', (_req, res) => {
+  res.json(getIndexStatus())
+})
+
+app.get('/api/search', (req, res) => {
+  try {
+    const q = String(req.query.q || '').slice(0, 500)
+    const topK = Math.min(Math.max(parseInt(req.query.topK, 10) || 20, 1), 200)
+    const perHitChars = Math.min(Math.max(parseInt(req.query.perHitChars, 10) || 6000, 200), 60000)
+    const docIdsRaw = typeof req.query.docIds === 'string' ? req.query.docIds : null
+    const docIds = docIdsRaw ? docIdsRaw.split(',').filter(Boolean).slice(0, 200) : null
+    const status = getIndexStatus()
+    if (!status.ready) return res.json({ ...status, hits: [], tookMs: 0, total: 0 })
+    const result = searchInIndex(q, { topK, perHitChars, docIds })
+    res.json({ ...result, ...getIndexStatus() })
   } catch (err) {
     return internalError(res, err)
   }
@@ -234,6 +357,10 @@ app.post('/api/docs', requireAdmin, async (req, res) => {
       setDocInCache(id, record) // 更新内存缓存
       writeShardSync(id, record) // 仅写这一篇分片（O(1)，不再重写全量）
       rebuildIndexSync() // 轻量索引很小，整体重写开销可忽略
+      // 同步更新服务端倒排索引：仅在已入索引或本次已入库时刷新，避免巨量文档重复构建
+      if (hasDocument(id) || (record.doc.status === 'approved' && !record.doc.deleted)) {
+        try { upsertDocument(id, record.doc) } catch (e) { console.error('[warn] 检索索引更新失败:', e && e.message) }
+      }
     })
 
     if (typeof fileBase64 === 'string' && fileBase64.length > 0) {
@@ -276,6 +403,8 @@ app.delete('/api/docs/:id', requireAdmin, async (req, res) => {
       setDocInCache(id, tombstone)
       writeShardSync(id, tombstone)
       rebuildIndexSync()
+      // 未入库文档的正文与总结切片都不进问答检索，索引同样应移除（防止已删文档内容被召回）
+      try { removeDocument(id) } catch (e) { console.error('[warn] 检索索引移除失败:', e && e.message) }
     })
     try { fs.unlinkSync(path.join(getPaths().FILES_DIR, id)) } catch { /* 忽略 */ }
     try { fs.unlinkSync(path.join(getPaths().FILES_DIR, id + '.ext')) } catch { /* 忽略 */ }
@@ -785,9 +914,25 @@ if (fs.existsSync(DIST_DIR)) {
 // ===== 启动服务器 =====
 // 仅在直接执行本文件时监听端口（被测试/其他模块 import 时不自动启动）。
 const isMain = import.meta.url === pathToFileURL(process.argv[1] || '').href
+const SEARCH_INDEX_ENABLED = process.env.SEARCH_INDEX !== '0'
 if (isMain) {
   // 服务启动：恢复磁盘上未完成的总结任务（断点续跑）
   try { recoverSummaryTasks() } catch (e) { console.error('[summaryTask] recover failed', e && e.message) }
+  // 后台构建服务端检索倒排索引（不阻塞启动；未就绪期间前端自动退回本地检索）
+  if (SEARCH_INDEX_ENABLED) {
+    setImmediate(() => {
+      const t0 = Date.now()
+      try {
+        ensureDocsCache()
+        const recs = readDocs()
+        buildIndex(recs).then(st => {
+          console.log(`  Search:    倒排索引就绪 ${st.docCount} 篇 / ${st.pageCount} 页 / ${st.termCount} 词（${Date.now() - t0}ms）`)
+        }).catch(e => console.error('[searchIndex] build failed', e && e.message))
+      } catch (e) {
+        console.error('[searchIndex] build start failed', e && e.message)
+      }
+    })
+  }
   // 启动周期性任务清理（删除过期终态任务文件 + 内存视图延迟回收）
   try { startTaskCleanup() } catch (e) { console.error('[summaryTask] cleanup start failed', e && e.message) }
   // 双栈监听 IPv4+IPv6（'::' 为 IPv6 通配符，Node 默认 dual-stack），

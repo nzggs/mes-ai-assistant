@@ -2,7 +2,7 @@ import { useState, useMemo, useCallback, useRef, useEffect } from 'react'
 import { PdfViewer } from './PdfViewer'
 import { processUploadedDoc, reextractDocMetadata, summarizeDocumentScope, FULL_DOC_SUMMARY_KEY } from '../services/knowledgeService'
 import { getApiKey, getProviderId, resolveModelId, getGroupId } from '../services/llmApi'
-import { saveTableSummary, appendDocLog, getDocLogs, saveUploadedDoc, saveMeta, removeDoc, syncDocNow } from '../services/docStore'
+import { saveTableSummary, appendDocLog, getDocLogs, saveUploadedDoc, saveMeta, removeDoc, syncDocNow, fetchAllDocPages } from '../services/docStore'
 import { canReviewDoc, type User } from '../services/userService'
 import type { KnowledgeDoc, DocPage, DocLog } from '../types'
 import * as XLSX from 'xlsx'
@@ -15,6 +15,7 @@ const docTypeConfig = {
   ppt: { label: 'PPT', icon: '📊', color: '#ea580c', bg: '#fff7ed' },
   excel: { label: 'Excel', icon: '📈', color: '#16a34a', bg: '#f0fdf4' },
   pdf: { label: 'PDF', icon: '📕', color: '#dc2626', bg: '#fef2f2' },
+  xml: { label: 'XML', icon: '🗂️', color: '#7c3aed', bg: '#f5f3ff' },
 }
 
 const statusConfig = {
@@ -24,12 +25,13 @@ const statusConfig = {
 }
 
 // 根据文件扩展名判断类型
-function getFileType(filename: string): 'word' | 'ppt' | 'excel' | 'pdf' | null {
+function getFileType(filename: string): 'word' | 'ppt' | 'excel' | 'pdf' | 'xml' | null {
   const ext = filename.toLowerCase().split('.').pop()
   if (ext === 'doc' || ext === 'docx') return 'word'
   if (ext === 'ppt' || ext === 'pptx') return 'ppt'
   if (ext === 'xls' || ext === 'xlsx') return 'excel'
   if (ext === 'pdf') return 'pdf'
+  if (ext === 'xml') return 'xml'
   return null
 }
 
@@ -121,6 +123,33 @@ export function KnowledgeBase({ documents, currentUser, onDocumentsChange, onReq
     onDocumentsChange(prev => prev.map(d => d.id === id ? { ...d, ...updates } : d))
     setSelectedDoc(prev => prev?.id === id ? { ...prev, ...updates } : prev)
   }, [onDocumentsChange])
+
+  // ===== 超大文档的按需补全（第二期） =====
+  // 服务端对页数/体积超阈值的文档（XML 数据导出常达数千条记录、数十 MB）不会随列表下发正文，
+  // 只返回 contentOmitted 标记。列表、卡片、搜索等轻量场景无需正文；
+  // 只有用户真正打开「详情 / 原文阅读」时才按需取回，避免新浏览器一次同步就拉取几十 MB。
+  const deferredLoading = useRef<Set<string>>(new Set())
+  const ensureDocContent = useCallback(async (doc: KnowledgeDoc) => {
+    if (!doc.contentOmitted || (doc.content && doc.content.length > 0)) return
+    if (deferredLoading.current.has(doc.id)) return
+    deferredLoading.current.add(doc.id)
+    try {
+      const pages = await fetchAllDocPages(doc.id)
+      if (pages.length === 0) return
+      const patch = (d: KnowledgeDoc | null) =>
+        d && d.id === doc.id ? { ...d, content: pages, contentOmitted: false } : d
+      onDocumentsChange(prev => prev.map(d => (d.id === doc.id ? { ...d, content: pages, contentOmitted: false } : d)))
+      setSelectedDoc(prev => patch(prev))
+      setReaderDoc(prev => patch(prev))
+    } catch (e) {
+      console.warn('超大文档正文按需加载失败:', e)
+    } finally {
+      deferredLoading.current.delete(doc.id)
+    }
+  }, [onDocumentsChange])
+
+  useEffect(() => { if (selectedDoc) ensureDocContent(selectedDoc) }, [selectedDoc?.id, ensureDocContent])
+  useEffect(() => { if (readerDoc) ensureDocContent(readerDoc) }, [readerDoc?.id, ensureDocContent])
 
   // 记录知识库操作日志（上传/删除/审核/总结 的人员与时间），后端共享、静默失败
   const recordLog = useCallback((
@@ -350,8 +379,9 @@ export function KnowledgeBase({ documents, currentUser, onDocumentsChange, onReq
     let duplicateCount = 0
     let overLimitCount = 0
 
-    // 上传限制：单文件 50MB，文件名 ≤120 字符
+    // 上传限制：单文件 50MB（XML 数据导出可到 60MB，需容纳 base64 膨胀后的请求体），文件名 ≤120 字符
     const MAX_FILE_SIZE = 50 * 1024 * 1024
+    const MAX_XML_FILE_SIZE = 60 * 1024 * 1024
     const MAX_FILENAME_LEN = 120
 
     for (const file of Array.from(files)) {
@@ -362,7 +392,8 @@ export function KnowledgeBase({ documents, currentUser, onDocumentsChange, onReq
       }
 
       // 大小/文件名超限拒绝
-      if (file.size > MAX_FILE_SIZE || file.name.length > MAX_FILENAME_LEN) {
+      const sizeLimit = fileType === 'xml' ? MAX_XML_FILE_SIZE : MAX_FILE_SIZE
+      if (file.size > sizeLimit || file.name.length > MAX_FILENAME_LEN) {
         overLimitCount++
         continue
       }
@@ -381,7 +412,7 @@ export function KnowledgeBase({ documents, currentUser, onDocumentsChange, onReq
       const fileUrl = fileType !== 'pdf' ? objectUrl : undefined
 
       // 获取详细扩展名
-      const ext = file.name.toLowerCase().split('.').pop() as 'docx' | 'doc' | 'pptx' | 'ppt' | 'xlsx' | 'xls' | 'pdf'
+      const ext = file.name.toLowerCase().split('.').pop() as 'docx' | 'doc' | 'pptx' | 'ppt' | 'xlsx' | 'xls' | 'pdf' | 'xml'
 
       // 创建文档初始内容（解析前占位）
       const emptyPages: DocPage[] = fileType !== 'pdf' ? [{
@@ -423,8 +454,9 @@ export function KnowledgeBase({ documents, currentUser, onDocumentsChange, onReq
 
     if (newDocs.length > 0) {
       onDocumentsChange(prev => [...newDocs, ...prev])
-      setUploadStatus(`成功上传 ${newDocs.length} 个文件${rejectedCount > 0 ? `，${rejectedCount} 个不支持的文件已忽略` : ''}${overLimitCount > 0 ? `，${overLimitCount} 个文件超过 50MB 或文件名过长被忽略` : ''}${duplicateCount > 0 ? `，${duplicateCount} 个文件因同名已存在被拒绝` : ''}，AI 正在自动归纳...`)
-      setTimeout(() => setUploadStatus(''), 5000)
+      const hasXml = newDocs.some(d => d.type === 'xml')
+      setUploadStatus(`成功上传 ${newDocs.length} 个文件${rejectedCount > 0 ? `，${rejectedCount} 个不支持的文件已忽略` : ''}${overLimitCount > 0 ? `，${overLimitCount} 个文件超过大小上限或文件名过长被忽略` : ''}${duplicateCount > 0 ? `，${duplicateCount} 个文件因同名已存在被拒绝` : ''}，${hasXml ? '正在解析并入库（XML 数据导出不经过 AI 预处理）' : 'AI 正在自动归纳'}...`)
+      setTimeout(() => setUploadStatus(''), 6000)
 
       // 有限并发触发 AI 提取：一次传太多时若全部同时打向 LLM，厂商限流/网络抖动会让请求挂起（AI解析中卡死）。
       // 这里最多 4 个并行，配合 callLLMNonStream 的 120s 超时，避免批量上传卡死。
@@ -471,7 +503,7 @@ export function KnowledgeBase({ documents, currentUser, onDocumentsChange, onReq
       }
       await Promise.all(Array.from({ length: Math.min(MAX_CONCURRENT_EXTRACT, newDocs.length) }, worker))
     } else if (rejectedCount > 0) {
-      setUploadStatus(`不支持的文件格式，请上传 Word、PPT、Excel 或 PDF 文件`)
+      setUploadStatus(`不支持的文件格式，请上传 Word、PPT、Excel、PDF 或 XML 文件`)
       setTimeout(() => setUploadStatus(''), 5000)
     } else if (duplicateCount > 0) {
       setUploadStatus(`上传失败：${duplicateCount} 个文件与已有文档重名（同名文档已存在）`)
@@ -684,7 +716,7 @@ export function KnowledgeBase({ documents, currentUser, onDocumentsChange, onReq
               ref={fileInputRef}
               type="file"
               multiple
-              accept=".doc,.docx,.ppt,.pptx,.xls,.xlsx,.pdf"
+              accept=".doc,.docx,.ppt,.pptx,.xls,.xlsx,.pdf,.xml"
               onChange={handleFileInputChange}
               className="hidden"
             />
@@ -1602,7 +1634,28 @@ function OriginalDocModal({ doc, onClose }: { doc: KnowledgeDoc; onClose: () => 
         const blob = await res.blob()
         if (cancelled) return
 
-        if (doc.type === 'word') {
+        if (doc.type === 'xml') {
+          // XML 数据导出：以「一条记录一块」的等宽文本展示。
+          // 只渲染前 200 条：完整导出常含数千条记录，全量渲染会卡死页面。
+          const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+          const MAX_PREVIEW_RECORDS = 200
+          const shown = doc.content.slice(0, MAX_PREVIEW_RECORDS)
+          const inner = shown
+            .map(
+              p =>
+                `<div style="margin:0 0 14px;padding:10px 12px;border:1px solid #e5e7eb;border-radius:6px;background:#fafafa;">` +
+                `<div style="font-weight:600;color:#7c3aed;margin-bottom:6px;">第 ${p.pageNum} 条 · ${esc(p.title)}</div>` +
+                `<pre style="margin:0;white-space:pre-wrap;word-break:break-all;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px;line-height:1.55;color:#1f2937;">${esc(
+                  p.paragraphs.join('\n')
+                )}</pre></div>`
+            )
+            .join('')
+          const more =
+            doc.content.length > MAX_PREVIEW_RECORDS
+              ? `<p class="pptx-para">…… 仅预览前 ${MAX_PREVIEW_RECORDS} 条，共 ${doc.content.length} 条记录。完整内容请在问答中检索，或下载原文件查看。</p>`
+              : ''
+          container.innerHTML = inner + more
+        } else if (doc.type === 'word') {
           // Word：docx-preview 渲染原始排版
           await renderDocx(blob, container, undefined, {
             inWrapper: false,
@@ -2002,6 +2055,13 @@ function DocReaderModal({ doc, onClose }: { doc: KnowledgeDoc; onClose: () => vo
                 onSearchResults={handlePdfSearchResults}
                 registerJumpToPage={registerJumpToPage}
               />
+            </div>
+          ) : doc.contentOmitted && doc.content.length === 0 ? (
+            // 超大文档正文未随列表下发：打开阅读器时按需从服务端取回
+            <div className="flex flex-col items-center justify-center h-full py-20 gap-4">
+              <div className="w-12 h-12 border-3 border-purple-400 border-t-transparent rounded-full animate-spin" />
+              <p className="text-sm text-purple-600 font-medium">正在加载文档正文，请稍候...</p>
+              <p className="text-xs text-mes-textTertiary">该文档体量较大（{doc.pageCount ?? 0} 条记录），正文按需加载，问答检索由服务端索引处理</p>
             </div>
           ) : doc.aiExtracting ? (
             <div className="flex flex-col items-center justify-center h-full py-20 gap-4">

@@ -5,6 +5,8 @@ import type { KnowledgeDoc, DocPage, TableSummary } from '../types'
 import { getApiKey, getProvider, resolveModelId, callLLMNonStream, callLLMNonStreamDetailed, buildApiUrl, getGroupId } from './llmApi'
 import { BACKEND_BASE } from './backend'
 import { reportError } from './errorReporter'
+import { parseXmlFile, type XmlParseResult } from './xmlParser'
+import type { ServerSearchHit } from './searchApi'
 import JSZip from 'jszip'
 
 // ===== PDF 文本提取 =====
@@ -741,6 +743,47 @@ async function extractOfficeText(doc: KnowledgeDoc): Promise<ExtractResult> {
   }
 }
 
+// ===== XML 数据导出解析 =====
+
+/**
+ * 解析 XML 数据导出文件（一表一文件、一条 DATA_RECORD 一页）。
+ * 采用分块流式读取，24MB+ 的导出文件也不会把浏览器内存打满。
+ * 注意：不做任何 AI 预处理，解析结果即入库内容。
+ */
+async function extractXmlText(doc: KnowledgeDoc): Promise<XmlParseResult> {
+  if (!doc.fileUrl) throw new Error('文件 URL 不存在')
+  const res = await fetch(doc.fileUrl)
+  if (!res.ok) throw new Error(`读取文件失败: HTTP ${res.status}`)
+  const blob = await res.blob()
+  const file = new File([blob], doc.name, { type: 'application/xml' })
+  return parseXmlFile(file)
+}
+
+/**
+ * 由解析结果直接生成 XML 文档的元信息（不调用 LLM）。
+ * keywords 供检索加权使用：表名、对象编号字段、字段名，以及前若干个对象编号。
+ */
+function buildXmlMetadata(meta: XmlParseResult | null, textLength: number): Partial<KnowledgeDoc> {
+  if (!meta) return {}
+  const tableLabel = meta.rootTag || 'XML 数据导出'
+  const sampleObjects = meta.pages
+    .slice(0, 20)
+    .map(p => (p.title || '').split(' · ')[0])
+    .filter(Boolean)
+  const keywords = Array.from(
+    new Set([meta.rootTag, meta.objectKey, meta.descKey, ...meta.fieldNames.slice(0, 12), ...sampleObjects].filter(Boolean)),
+  ).slice(0, 40)
+
+  return {
+    keywords,
+    background: `来源：数据库表导出（根元素 ${tableLabel}），共 ${meta.recordCount} 条记录，字段 ${meta.fieldNames.length} 个。`,
+    causeAnalysis: '数据导出文件，无需原因分析',
+    solution: '数据导出文件，无需解决方案',
+    summary: `XML 数据导出：${tableLabel}，共 ${meta.recordCount} 条记录（对象编号字段 ${meta.objectKey || '未识别'}），已解析 ${textLength.toLocaleString()} 字符，全文入库、未做截断。`,
+    aiExtracted: true,
+  }
+}
+
 // ===== AI 元数据提取 =====
 
 export interface ExtractedMetadata {
@@ -1036,6 +1079,41 @@ function buildChunksFromPages(
   return chunks
 }
 
+/** 目录里最多展示的标签页/对象数量 */
+const MAX_CATALOG_SHEETS = 30
+/** 页数超过该阈值才启用「标题预筛」 */
+const TITLE_PREFILTER_MIN_PAGES = 200
+/** 标题预筛取前 N 个命中页 */
+const TITLE_PREFILTER_TOP_PAGES = 80
+/** 预筛无命中时的全量兜底上限（普通文档仍为 100 万字符） */
+const BIG_DOC_FULLTEXT_LIMIT = 4_000_000
+
+/**
+ * 构造参与检索的正文。
+ *
+ * 巨型文档（XML 数据导出常达数千条记录、20MB+）若全量拼接后打分，单次问答要扫几千万字符；
+ * 而数据导出恰好「一页 = 一个对象」，页标题就是对象编号/名称，因此先按标题预筛候选页：
+ * - 按对象名提问（主场景）→ 精准命中，扫描量从 24MB 降到约 1MB
+ * - 标题无命中（如按代码内容检索）→ 退化为全量扫描，上限比原先的 100 万字符更宽松
+ * 页数未超过阈值的普通文档（PDF/Office）行为完全不变。
+ */
+function buildSearchableText(pages: DocPage[], keywords: string[]): string {
+  const joinPages = (list: DocPage[]) => list.map(p => `${p.title}\n${p.paragraphs.join('\n')}`).join('\n\n')
+  if (pages.length <= TITLE_PREFILTER_MIN_PAGES) {
+    const text = joinPages(pages)
+    return text.length > 1000000 ? text.slice(0, 1000000) : text
+  }
+  const scored: { i: number; s: number }[] = []
+  for (let i = 0; i < pages.length; i++) {
+    const s = scoreTextWithKeywords(pages[i].title, keywords)
+    if (s > 0) scored.push({ i, s })
+  }
+  const text = scored.length > 0
+    ? joinPages(scored.sort((a, b) => b.s - a.s).slice(0, TITLE_PREFILTER_TOP_PAGES).map(x => pages[x.i]))
+    : joinPages(pages)
+  return text.length > BIG_DOC_FULLTEXT_LIMIT ? text.slice(0, BIG_DOC_FULLTEXT_LIMIT) : text
+}
+
 function retrieveRelevantChunks(
   fullText: string,
   keywords: string[],
@@ -1117,12 +1195,28 @@ export function buildKnowledgeContext(
   userQuery?: string,
   maxTotalLength?: number,
   /** 'detail'（默认）：两阶段检索（目录+命中扩展+全文总结+切片）；'explore'：仅注入目录并引导用户定位具体文档（两步提问法第一步） */
-  mode: 'detail' | 'explore' = 'detail'
+  mode: 'detail' | 'explore' = 'detail',
+  /**
+   * 服务端倒排检索结果（可选）。
+   * 超大 XML 数据导出文档的正文不随列表下发到浏览器（contentOmitted），此时必须通过它才能检索到内容；
+   * 传入后，命中页会按分数注入，且这类文档也会被纳入可用文档集合。
+   * **不传时，行为与历史实现逐字一致**（现有功能零回归）。
+   */
+  serverHits: ServerSearchHit[] | null = null
 ): string {
+  const hitsByDoc = new Map<string, ServerSearchHit[]>()
+  for (const h of serverHits || []) {
+    if (!h || !h.docId) continue
+    const arr = hitsByDoc.get(h.docId)
+    if (arr) arr.push(h)
+    else hitsByDoc.set(h.docId, [h])
+  }
+  for (const arr of hitsByDoc.values()) arr.sort((a, b) => b.score - a.score)
+
   // 只将已审核入库（approved）的文档纳入问答参考，待审核/已拒绝文档不可作为来源
   const usableDocs = documents.filter(d =>
     d.status === 'approved' &&
-    (d.textContent || (d.content && d.content.length > 0))
+    (d.textContent || (d.content && d.content.length > 0) || hitsByDoc.has(d.id))
   )
 
   if (usableDocs.length === 0) {
@@ -1160,7 +1254,18 @@ export function buildKnowledgeContext(
       block += `- 摘要：${doc.summary}\n`
     }
     if (sheetNames.length > 0) {
-      block += `- 标签页/表（${sheetNames.length}）：${sheetNames.join('、')}\n`
+      // 超多标签页（XML 数据导出常达数千条）时只列前若干个：
+      // 全列会撑爆目录预算，把其他文档的目录挤掉，模型也记不住几千个对象名。
+      const shown = sheetNames.slice(0, MAX_CATALOG_SHEETS)
+      const more = sheetNames.length > shown.length
+        ? ` ……等共 ${sheetNames.length} 个（可在提问中直接给出对象名/编号以定位具体条目）`
+        : ''
+      block += `- 标签页/表（${sheetNames.length}）：${shown.join('、')}${more}\n`
+    }
+    // 正文未随列表下发的超大文档（XML 数据导出）：告知体量并说明检索方式，
+    // 避免模型因看不到任何标签页而误判"该文档内容为空"
+    if (doc.contentOmitted) {
+      block += `- 数据量：共 ${doc.pageCount ?? (hitsByDoc.get(doc.id)?.length || 0)} 条/页。**该文档正文体量较大，未随列表下发，提问时由服务端索引按相关度检索后注入下方「与问题相关的内容」**\n`
     }
     block += '\n'
 
@@ -1206,14 +1311,15 @@ export function buildKnowledgeContext(
     if (!userQuery || keywords.length === 0) break
 
     const hasContent = !!(doc.content && doc.content.length > 0)
+    const docServerHits = hitsByDoc.get(doc.id)
     let fullText = ''
     if (hasContent) {
-      fullText = doc.content.map(p => `${p.title}\n${p.paragraphs.join('\n')}`).join('\n\n')
-      if (fullText.length > 1000000) fullText = fullText.slice(0, 1000000)
+      fullText = buildSearchableText(doc.content, keywords)
     } else if (doc.textContent) {
       fullText = doc.textContent
     }
-    if (!fullText.trim()) continue
+    // 本地无正文时不要直接跳过：超大文档（contentOmitted）的正文在服务端，靠项⑧注入
+    if (!fullText.trim() && !(docServerHits && docServerHits.length > 0)) continue
 
     let docUsed = 0
     let summaryUsed = 0 // 整篇/整表总结缓存注入独立预算计数（不挤占正文切片预算）
@@ -1272,11 +1378,35 @@ export function buildKnowledgeContext(
       }
     }
 
+    // 项⑧：服务端倒排检索命中 —— 超大文档（contentOmitted，正文未下发到浏览器）的唯一检索通道。
+    // 命中页由服务端 /api/search 返回（含已截断的页正文），直接按分数注入即可，
+    // 无需本地再次全量扫文本（那正是该文档被瘦身的原因）。
+    if (!focusSheetInjected && keywords.length > 0) {
+      const hits = hitsByDoc.get(doc.id)
+      if (hits && hits.length > 0) {
+        anyRelevant = true
+        // 服务端命中优先：给出一个高于本地 grams 打分的基准，避免被本地噪声压到后面
+        maxScore = Math.max(maxScore, 50000 + (hits[0].score || 0))
+        section += `**【服务端索引命中《${doc.name}》的 ${hits.length} 个对象/页，按相关度排序：】**\n\n`
+        for (const hit of hits) {
+          if (docUsed >= perDocBudget) break
+          const label = hit.pageTitle || `第${hit.pageIndex + 1}页`
+          if (injectedLabels.has(label)) continue
+          injectedLabels.add(label)
+          const remain = Math.max(0, perDocBudget - docUsed)
+          const body = hit.text.length > remain ? hit.text.slice(0, remain) + '\n…（本页过长，已截断）' : hit.text
+          section += `**[${label}]**\n${body}\n\n`
+          docUsed += body.length
+        }
+      }
+    }
+
     // 项⑦：关键词检索命中 —— 从文档中检索与查询最相关的段落（有分页按标签页整段，无分页按子块）
     // 注意：即便项⑤已注入整篇/整表缓存总结，仍要补充正文切片检索——
     // 否则"总结一下关于 ALTER SYSTEM SAVEPOINT"这类"在总结范围内问具体细节"的查询，
     // 会因缓存总结不完整（如只归纳了 DROP）而拿不到正文里确有的 SAVEPOINT 章节。
-    if (!focusSheetInjected && keywords.length > 0 && fullText.length > 2000) {
+    // 注：正文未下发到浏览器的超大文档（contentOmitted）跳过本步，其内容已由项⑧注入。
+    if (!focusSheetInjected && !doc.contentOmitted && keywords.length > 0 && fullText.length > 2000) {
       let relevantChunks: RetrievedChunk[] = []
       if (hasContent) {
         relevantChunks = buildChunksFromPages(doc.content, keywords, 4000)
@@ -1391,10 +1521,16 @@ export async function processUploadedDoc(
     // 提取文本内容
     let textContent = ''
     let extractedPages: DocPage[] | null = null
+    let xmlMeta: XmlParseResult | null = null
 
     if (doc.type === 'pdf' && doc.pdfUrl) {
       // PDF 文件：使用 pdfjs 提取文本
       textContent = await extractPdfText(doc.pdfUrl)
+    } else if (doc.type === 'xml' && doc.fileUrl) {
+      // XML 数据导出：分块流式解析，一条 DATA_RECORD 一页，直接入库（不做 AI 预处理）
+      xmlMeta = await extractXmlText(doc)
+      textContent = xmlMeta.text
+      extractedPages = xmlMeta.pages
     } else if ((doc.type === 'word' || doc.type === 'ppt' || doc.type === 'excel') && (doc.fileUrl || doc.pdfUrl)) {
       // Office 文件（Word/Excel/PPT）：使用 JSZip 提取文本
       const result = await extractOfficeText(doc)
@@ -1412,20 +1548,31 @@ export async function processUploadedDoc(
     }
 
     // 限制提取文本长度，防止超大文档（zip 炸弹/超长 PDF）拖垮内存与检索
-    // 1M 字符足以覆盖正常业务文档（多 sheet Excel 等），同时挡住恶意压缩炸弹
-    const MAX_TEXT_LENGTH = 1000000
-    if (textContent.length > MAX_TEXT_LENGTH) {
-      textContent = textContent.slice(0, MAX_TEXT_LENGTH) + '\n\n[内容过长，已截断显示前 1000000 字符]'
+    // 1M 字符足以覆盖正常业务文档（多 sheet Excel 等），同时挡住恶意压缩炸弹。
+    // XML 数据导出例外：它本身就是需要全量参考的对象定义/代码，截断会让对象缺失，因此不截断。
+    if (doc.type !== 'xml') {
+      const MAX_TEXT_LENGTH = 1000000
+      if (textContent.length > MAX_TEXT_LENGTH) {
+        textContent = textContent.slice(0, MAX_TEXT_LENGTH) + '\n\n[内容过长，已截断显示前 1000000 字符]'
+      }
     }
 
     // 更新文本内容和分页内容
-    const updates: Partial<KnowledgeDoc> = { textContent }
+    // XML：不写 textContent —— 它与 content 内容完全重复（单表可达 24MB），
+    // 而检索、总结、内容哈希都优先使用结构化 content，保留只会让传输与内存翻倍。
+    const updates: Partial<KnowledgeDoc> = doc.type === 'xml' ? {} : { textContent }
     if (extractedPages && extractedPages.length > 0) {
       updates.content = extractedPages
       updates.pages = extractedPages.length
       updates.chunks = Math.max(1, Math.ceil(textContent.length / 4096))
     }
     onUpdate(updates)
+
+    // XML 数据导出：元信息由解析结果直接生成，不走 LLM（无需归纳、也避免把几十 MB 代码发给模型）
+    if (doc.type === 'xml') {
+      onUpdate(buildXmlMetadata(xmlMeta, textContent.length))
+      return
+    }
 
     // 调用 AI 提取元数据
     const apiKey = getApiKey()
@@ -1498,6 +1645,15 @@ export async function reextractDocMetadata(
 ): Promise<void> {
   onUpdate({ aiExtracting: true })
   try {
+    // XML 数据导出：元信息由解析结果生成，重新归纳无意义（且会把几十 MB 代码发给模型）
+    if (doc.type === 'xml') {
+      onUpdate({
+        aiExtracting: false,
+        aiExtracted: true,
+        summary: doc.summary || 'XML 数据导出文件，元信息由解析结果自动生成，无需 AI 归纳。',
+      })
+      return
+    }
     const apiKey = getApiKey()
     if (!apiKey) {
       onUpdate({
@@ -1797,6 +1953,27 @@ async function callLLMDetailedWithRetry(
   return last
 }
 
+/**
+ * 按需从服务端取回某篇被"瘦身"文档的全部分页（每次最多 500 页，循环直到取完）。
+ * 仅在总结等确实需要全文的场景使用；问答检索走服务端倒排索引，不需要拉全文。
+ */
+async function fetchAllPagesFromServer(docId: string): Promise<DocPage[]> {
+  const out: DocPage[] = []
+  const STEP = 500
+  let from = 0
+  for (let guard = 0; guard < 2000; guard++) {
+    const res = await fetch(`${BACKEND_BASE}/api/docs/${docId}/pages?from=${from}&to=${from + STEP}`)
+    if (!res.ok) break
+    const data = await res.json()
+    const pages: DocPage[] = Array.isArray(data?.pages) ? data.pages : []
+    out.push(...pages)
+    const total = Number(data?.total) || 0
+    from += pages.length
+    if (pages.length === 0 || from >= total) break
+  }
+  return out
+}
+
 export async function summarizeDocumentScope(opts: SummarizeScopeOptions): Promise<string | null> {
   const { sheetName, instruction, onProgress, modelId } = opts
   let doc = opts.doc
@@ -1829,6 +2006,15 @@ export async function summarizeDocumentScope(opts: SummarizeScopeOptions): Promi
       if (fresh && fresh.trim()) {
         doc = { ...doc, textContent: fresh, content: buildPagesFromText(fresh) }
       }
+    } catch { /* 落到下方空判断 */ }
+  }
+
+  // 0b) 超大文档自愈：服务端 /api/docs 会对页数/体积超阈值的文档剥离正文（contentOmitted），
+  // 列表里只带元数据。总结必须拿到全文，这里按需从 /api/docs/:id/pages 分段取回。
+  if ((!doc.content || doc.content.length === 0) && doc.contentOmitted && !doc.textContent?.trim()) {
+    try {
+      const pages = await fetchAllPagesFromServer(doc.id)
+      if (pages.length > 0) doc = { ...doc, content: pages, contentOmitted: false }
     } catch { /* 落到下方空判断 */ }
   }
 

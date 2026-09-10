@@ -15,7 +15,7 @@ export type ContentType =
 /** 来源引用 */
 export interface SourceCitation {
   docName: string
-  docType: 'word' | 'ppt' | 'excel' | 'pdf' | 'web' | 'mes'
+  docType: 'word' | 'ppt' | 'excel' | 'pdf' | 'web' | 'mes' | 'xml'
   page?: string
   section?: string
   uploader: string
@@ -101,7 +101,7 @@ export interface Conversation {
 export interface KnowledgeDoc {
   id: string
   name: string
-  type: 'word' | 'ppt' | 'excel' | 'pdf'
+  type: 'word' | 'ppt' | 'excel' | 'pdf' | 'xml'
   size: string
   uploadDate: string
   uploader: string
@@ -120,9 +120,16 @@ export interface KnowledgeDoc {
   pdfUrl?: string // PDF 文件的 URL（仅 pdf 类型）
   fileUrl?: string // 非 PDF 文件的 Object URL（word/ppt/excel）
   textContent?: string // 提取的全文文本（用于AI检索引用）
+  /**
+   * 正文被服务端剥离（超大文档，如 XML 数据导出）：列表接口不下发 content，
+   * 仅在需要时由 GET /api/docs/:id/pages 按需取页，问答检索改由服务端倒排索引承担。
+   */
+  contentOmitted?: boolean
+  /** contentOmitted 时的总页数（服务端下发，用于 UI 展示与翻页） */
+  pageCount?: number
   aiExtracting?: boolean // AI 正在提取元数据
   aiExtracted?: boolean // AI 已完成提取
-  fileType?: 'docx' | 'doc' | 'pptx' | 'ppt' | 'xlsx' | 'xls' | 'pdf' // 详细文件格式
+  fileType?: 'docx' | 'doc' | 'pptx' | 'ppt' | 'xlsx' | 'xls' | 'pdf' | 'xml' // 详细文件格式
   /** 整表/整文档 AI 总结缓存（map-reduce 生成并持久化；contentHash 用于内容变更失效） */
   tableSummaries?: { [sheetKey: string]: TableSummary }
   /** 总结生成的可检索切片（整表/整文档总结落库时自动切分生成，纳入普通检索，使总结内容可被常规问答召回） */

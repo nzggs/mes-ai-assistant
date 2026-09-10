@@ -12,7 +12,8 @@ import { generateResponse, initialConversations, presetQuestions } from './data/
 import { streamChat, hasApiKey, getProvider, getReasoningModelId, summarizeHistory, type ChatMessageDto } from './services/llmApi'
 import { buildKnowledgeContext, detectSummaryIntent, detectMentionedSheet, getCachedSummary, FULL_DOC_SUMMARY_KEY, summarizeDocumentScope } from './services/knowledgeService'
 import { ensureSuperAdminSeeded, syncUsersFromBackend, canAccessUserManagement } from './services/userService'
-import { getAllDocs, restoreDocsFromRecords, syncLocalToBackend, saveTableSummary } from './services/docStore'
+import { getAllDocs, restoreDocsFromRecords, syncLocalToBackend, saveTableSummary, fetchAllDocPages } from './services/docStore'
+import { resolveServerHits, type ServerSearchHit } from './services/searchApi'
 import type { Conversation, ChatMessage, SidebarView, KnowledgeDoc } from './types'
 import { APP_VERSION } from './version'
 
@@ -49,6 +50,8 @@ export default function App() {
   useEffect(() => { conversationsRef.current = conversations }, [conversations])
   // 整表总结后台生成防重：同一「文档+标签页」只启动一次
   const summaryInflight = useRef<Set<string>>(new Set())
+  // 超大文档（contentOmitted，正文未随列表下发）按需补全防重：同一文档只拉一次
+  const deferredFilled = useRef<Set<string>>(new Set())
 
   // 应用启动时确保超级管理员账户存在，并从后端同步用户表（跨浏览器共享）
   useEffect(() => {
@@ -240,7 +243,44 @@ export default function App() {
       d.status === 'approved' &&
       (text.includes(d.name.replace(/\.[^.]+$/, '')) || detectMentionedSheet(text, d))
     ) ? 'detail' : 'explore'
-    const knowledgeContext = kbEnabled ? buildKnowledgeContext(documents, text, kbContextLimit, effectiveMode) : ''
+
+    // ===== 服务端检索（第二阶段）：超大文档的正文不常驻浏览器，只能由服务端倒排索引检索 =====
+    // 结果直接喂给 buildKnowledgeContext（可选参数），索引未就绪时返回空数组 → 自动走本地既有路径。
+    let serverHits: ServerSearchHit[] = []
+    if (kbEnabled) {
+      serverHits = await resolveServerHits(text, documents, {
+        topK: kbContextLimit >= 80000 ? 30 : 15,
+        perHitChars: 6000,
+        timeoutMs: 5000,
+      })
+    }
+
+    // 兜底：服务端索引不可用（未构建完成 / 旧版本后端）且存在「正文剥离」的超大文档时，
+    // 按需把正文拉取回来，使本地检索恢复到改造前的能力（每篇文档仅拉取一次）。
+    let docsForContext = documents
+    if (kbEnabled && serverHits.length === 0) {
+      const deferred = documents.filter(d =>
+        d.status === 'approved' && d.contentOmitted && !deferredFilled.current.has(d.id)
+      )
+      if (deferred.length > 0) {
+        try {
+          const patches = await Promise.all(deferred.map(async d => {
+            deferredFilled.current.add(d.id)
+            const pages = await fetchAllDocPages(d.id)
+            return { id: d.id, patch: { ...d, content: pages, contentOmitted: false } }
+          }))
+          if (patches.length > 0) {
+            const map = new Map(patches.map(p => [p.id, p.patch]))
+            setDocuments(prev => prev.map(d => map.get(d.id) || d))
+            docsForContext = documents.map(d => map.get(d.id) || d)
+          }
+        } catch (e) {
+          console.warn('超大文档正文按需补全失败（将继续使用已有内容）:', e)
+        }
+      }
+    }
+
+    const knowledgeContext = kbEnabled ? buildKnowledgeContext(docsForContext, text, kbContextLimit, effectiveMode, serverHits) : ''
 
     // 项⑤：整体归纳意图自动触发整表总结（优先用已缓存，否则后台生成并持久化）
     // 效果：用户问"总结2026履历/分析整个XX文档"时，自动走 map-reduce 全量总结；

@@ -11,6 +11,7 @@ const docTypeConfig: Record<SourceCitation['docType'], { label: string; icon: st
   pdf: { label: 'PDF', icon: '📕', color: '#dc2626', bg: '#fef2f2' },
   web: { label: '网页', icon: '🌐', color: '#7c3aed', bg: '#faf5ff' },
   mes: { label: 'MES', icon: '🗄️', color: '#0891b2', bg: '#ecfeff' },
+  xml: { label: 'XML', icon: '🗂️', color: '#7c3aed', bg: '#f5f3ff' },
 }
 
 export function SourceListView({ sources }: SourceListViewProps) {

@@ -4,7 +4,7 @@
  * - 后端 server（3001）作为跨浏览器/跨设备持久化（外部浏览器也能看到）
  * - 读取优先后端，后端不可达时回退 IndexedDB
  */
-import type { KnowledgeDoc, TableSummary, SummaryChunk } from '../types'
+import type { KnowledgeDoc, DocPage, TableSummary, SummaryChunk } from '../types'
 import { BACKEND_BASE, getAdminToken } from './backend'
 import { reportError } from './errorReporter'
 
@@ -387,6 +387,56 @@ export async function getDocLogs(): Promise<import('../types').DocLog[]> {
   }
 }
 
+/**
+ * 按需拉取某篇文档的指定页范围（配后端的超大文档瘦身使用）。
+ * 超出阈值的 XML 数据导出文档不会随列表下发正文，浏览/预览/总结前用本函数补齐。
+ * @param from 起始页下标（含）
+ * @param to 结束页下标（不含）；单次最多 500 页，超出会由服务端截断，需要连续翻页时请分段调用
+ */
+export async function fetchDocPages(
+  id: string,
+  from = 0,
+  to?: number
+): Promise<{ pages: DocPage[]; total: number }> {
+  if (!(await checkBackend())) throw new Error('后端不可达，无法读取文档正文')
+  const qs = `from=${Math.max(0, from | 0)}${to !== undefined ? `&to=${Math.max(0, to | 0)}` : ''}`
+  const res = await fetch(`${BACKEND_BASE}/api/docs/${id}/pages?${qs}`)
+  if (!res.ok) throw new Error(`读取文档正文失败 (${res.status})`)
+  const data = await res.json()
+  return { pages: Array.isArray(data?.pages) ? data.pages : [], total: Number(data?.total) || 0 }
+}
+
+/**
+ * 按需拉取某篇文档的全部正文（自动分段，每段 500 页）。
+ * 仅用于确实需要全量正文的场景（如整篇总结、预览前若干条）；问答检索应走服务端索引。
+ */
+export async function fetchAllDocPages(id: string, maxPages = Infinity): Promise<DocPage[]> {
+  const first = await fetchDocPages(id, 0)
+  const total = Math.min(first.total, maxPages)
+  const pages = first.pages.slice(0, total)
+  if (pages.length >= total) return pages
+  const STEP = 500
+  for (let from = pages.length; from < total; from += STEP) {
+    const chunk = await fetchDocPages(id, from, Math.min(from + STEP, total))
+    if (!chunk.pages.length) break
+    pages.push(...chunk.pages.slice(0, Math.max(0, total - pages.length)))
+  }
+  return pages
+}
+
+/** 拉取页标题清单（体积极小，仅用于对象名导航/计数展示） */
+export async function fetchDocTitles(id: string): Promise<string[]> {
+  if (!(await checkBackend())) return []
+  try {
+    const res = await fetch(`${BACKEND_BASE}/api/docs/${id}/titles`)
+    if (!res.ok) return []
+    const data = await res.json()
+    return Array.isArray(data?.titles) ? data.titles : []
+  } catch {
+    return []
+  }
+}
+
 /** 读取所有持久化文档（合并后端 + 本地 IndexedDB；本地未同步的自动补传） */
 export async function getAllDocs(): Promise<StoredDocRecord[]> {
   // 本地 IndexedDB（始终读取，作为本地真相）
@@ -475,7 +525,7 @@ export function restoreDocsFromRecords(records: StoredDocRecord[]): KnowledgeDoc
         summary: typeof raw.summary === 'string' ? raw.summary : '',
         keywords: Array.isArray(raw.keywords) ? raw.keywords : [],
         content: Array.isArray(raw.content) ? raw.content : [],
-        type: (['word', 'ppt', 'excel', 'pdf'].includes(raw.type as string) ? raw.type : 'pdf') as KnowledgeDoc['type'],
+        type: (['word', 'ppt', 'excel', 'pdf', 'xml'].includes(raw.type as string) ? raw.type : 'pdf') as KnowledgeDoc['type'],
         status: (['pending', 'approved', 'rejected'].includes(raw.status as string) ? raw.status : 'pending') as KnowledgeDoc['status'],
       }
       if (r.blob) {
