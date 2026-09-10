@@ -455,7 +455,7 @@ export function KnowledgeBase({ documents, currentUser, onDocumentsChange, onReq
     if (newDocs.length > 0) {
       onDocumentsChange(prev => [...newDocs, ...prev])
       const hasXml = newDocs.some(d => d.type === 'xml')
-      setUploadStatus(`成功上传 ${newDocs.length} 个文件${rejectedCount > 0 ? `，${rejectedCount} 个不支持的文件已忽略` : ''}${overLimitCount > 0 ? `，${overLimitCount} 个文件超过大小上限或文件名过长被忽略` : ''}${duplicateCount > 0 ? `，${duplicateCount} 个文件因同名已存在被拒绝` : ''}，${hasXml ? '正在解析并入库（XML 数据导出不经过 AI 预处理）' : 'AI 正在自动归纳'}...`)
+      setUploadStatus(`成功上传 ${newDocs.length} 个文件${rejectedCount > 0 ? `，${rejectedCount} 个不支持的文件已忽略` : ''}${overLimitCount > 0 ? `，${overLimitCount} 个文件超过大小上限或文件名过长被忽略` : ''}${duplicateCount > 0 ? `，${duplicateCount} 个文件因同名已存在被拒绝` : ''}，${hasXml ? '正在解析并入库' : 'AI 正在自动归纳'}...`)
       setTimeout(() => setUploadStatus(''), 6000)
 
       // 有限并发触发 AI 提取：一次传太多时若全部同时打向 LLM，厂商限流/网络抖动会让请求挂起（AI解析中卡死）。
@@ -767,6 +767,7 @@ export function KnowledgeBase({ documents, currentUser, onDocumentsChange, onReq
                   <span className="text-xs px-2 py-0.5 rounded bg-orange-50 text-orange-600 font-medium">📊 PPT (.pptx)</span>
                   <span className="text-xs px-2 py-0.5 rounded bg-green-50 text-green-600 font-medium">📈 Excel (.xlsx)</span>
                   <span className="text-xs px-2 py-0.5 rounded bg-red-50 text-red-600 font-medium">📕 PDF (.pdf)</span>
+                  <span className="text-xs px-2 py-0.5 rounded bg-cyan-50 text-cyan-600 font-medium">🗄️ XML (.xml)</span>
                 </div>
                 <div className="flex items-center gap-2">
                   <button

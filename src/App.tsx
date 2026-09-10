@@ -10,7 +10,7 @@ import { ChangePasswordModal } from './components/ChangePasswordModal'
 import ErrorToasts from './components/ErrorToasts'
 import { generateResponse, initialConversations, presetQuestions } from './data/mockData'
 import { streamChat, hasApiKey, getProvider, getReasoningModelId, summarizeHistory, type ChatMessageDto } from './services/llmApi'
-import { buildKnowledgeContext, detectSummaryIntent, detectMentionedSheet, getCachedSummary, FULL_DOC_SUMMARY_KEY, summarizeDocumentScope } from './services/knowledgeService'
+import { buildKnowledgeContext, decideRetrievalMode, detectSummaryIntent, getCachedSummary, FULL_DOC_SUMMARY_KEY, summarizeDocumentScope } from './services/knowledgeService'
 import { ensureSuperAdminSeeded, syncUsersFromBackend, canAccessUserManagement } from './services/userService'
 import { getAllDocs, restoreDocsFromRecords, syncLocalToBackend, saveTableSummary, fetchAllDocPages } from './services/docStore'
 import { resolveServerHits, type ServerSearchHit } from './services/searchApi'
@@ -236,14 +236,6 @@ export default function App() {
     // 模型输出仍占窗口，但系统提示/历史消息不通过本限值注入，80% 是安全上界（minimax 200k→160k、deepseek 64k→52k）
     const kbContextLimit = Math.min(160000, Math.round((getProvider().contextWindow || 65536) * 0.8))
 
-    // 两步提问法：自动触发，无需手动选择检索模式。
-    // 若用户问题点名了某篇已入库文档名或具体标签页/标题，则走「详解」定位切片与全文总结作答；
-    // 否则走「探索」列出相关文档并引导用户指定具体文档。
-    const effectiveMode: 'explore' | 'detail' = documents.some(d =>
-      d.status === 'approved' &&
-      (text.includes(d.name.replace(/\.[^.]+$/, '')) || detectMentionedSheet(text, d))
-    ) ? 'detail' : 'explore'
-
     // ===== 服务端检索（第二阶段）：超大文档的正文不常驻浏览器，只能由服务端倒排索引检索 =====
     // 结果直接喂给 buildKnowledgeContext（可选参数），索引未就绪时返回空数组 → 自动走本地既有路径。
     let serverHits: ServerSearchHit[] = []
@@ -279,6 +271,12 @@ export default function App() {
         }
       }
     }
+
+    // 两步提问法：自动触发，无需手动选择检索模式。
+    // 已收窄：只有用户「明确在问知识库里有哪些资料」时才走探索（只列目录、让用户挑一篇）；
+    // 其余问题一律走详解——服务端倒排索引已能把相关对象/正文取回来，再让用户先挑文档属于多此一举。
+    // （旧逻辑是「没点名文档就走探索」，导致「开发 XX 功能」这类问题只回一串文档名，拿不到正文。）
+    const effectiveMode = decideRetrievalMode(text, documents)
 
     const knowledgeContext = kbEnabled ? buildKnowledgeContext(docsForContext, text, kbContextLimit, effectiveMode, serverHits) : ''
 

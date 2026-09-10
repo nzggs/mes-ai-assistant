@@ -1188,6 +1188,37 @@ function splitIntoChunks(text: string, size: number): string[] {
   return chunks.filter(c => c.length > 20)
 }
 
+// ===== 检索模式判定（两步提问法·自动触发） =====
+
+/** 「目录浏览」意图：用户明确在问知识库里有哪些资料，此时才值得只列目录让用户挑。
+ *  注意不能只匹配「有哪些」——「转序时间设置**有哪些**字段」是内容问题，不是目录问题，
+ *  因此每条分支都要求语句里同时出现「文档/文件/资料/知识库」这类载体词。 */
+const CATALOG_INTENT_RE = new RegExp([
+  '(知识库|资料库|文档库)(里|中|内)?[^。？！,，]{0,10}(有(哪些|什么|多少)|都有(哪些|什么)|能问|可以问|支持)',
+  '(有哪些|哪些|列出|罗列|查看|显示|看看)[^。？！,，]{0,8}(文档|文件|资料|知识库)',
+  '(能|可以)(问|回答|查)什么',
+].join('|'))
+
+/**
+ * 决定本次提问用哪种检索模式。
+ *
+ * 历史逻辑是「用户没点名文档 → 探索模式（只注入目录，不下发正文）」，结果是
+ * 「开发一个 XX 功能」这类问题只会回一串文档名、拿不到任何可用的正文。
+ * 现在服务端倒排索引已能按相关度把正文取回来，探索模式只在真正需要时使用：
+ * ① 问题点名了某篇文档名 / 具体标签页 → 详解（精确定位）；
+ * ② 否则，只有明确在问「知识库里有哪些资料」才走探索；
+ * ③ 其余一切（含开发、分析、查询类需求）一律详解。
+ */
+export function decideRetrievalMode(text: string, documents: KnowledgeDoc[]): 'explore' | 'detail' {
+  const q = text || ''
+  const namedTarget = documents.some(d =>
+    d.status === 'approved' &&
+    (q.includes(d.name.replace(/\.[^.]+$/, '')) || detectMentionedSheet(q, d))
+  )
+  if (namedTarget) return 'detail'
+  return CATALOG_INTENT_RE.test(q) ? 'explore' : 'detail'
+}
+
 // ===== 构建知识上下文（注入系统提示词） =====
 
 export function buildKnowledgeContext(
@@ -1496,6 +1527,7 @@ export function buildKnowledgeContext(
   context += '4. 不要编造文档中不存在的内容\n'
   context += '5. 引用页码时，只能使用上下文中出现的 [第X页] 标记里的页码，严禁自行推算或引用文档中未出现的页码\n'
   context += '6. 多个结论来自不同文档时，应分别标注各自的来源\n'
+  context += '7. 当用户提出「开发 / 实现 / 新增某功能、查询、页面」等开发类需求时，必须基于上方检索到的对象定义、业务逻辑与界面组件**直接给出实现方案**（涉及的对象/表、关键字段、处理步骤、可复用的 SQL/逻辑代码、界面组件），并逐条标注出处；**禁止只罗列相关文档让用户自己挑**\n'
 
   return context
 }

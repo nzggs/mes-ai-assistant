@@ -3,6 +3,7 @@ import {
   buildKnowledgeContext,
   extractSheetName,
   computeContentHash,
+  decideRetrievalMode,
   detectSummaryIntent,
   detectMentionedSheet,
   getCachedSummary,
@@ -263,6 +264,38 @@ describe('knowledgeService 纯函数', () => {
         const withHits = buildKnowledgeContext([mkDoc()], '设备出现异常', 60000, 'detail', [])
         const without = buildKnowledgeContext([mkDoc()], '设备出现异常', 60000, 'detail')
         expect(withHits).toBe(without)
+      })
+    })
+
+    describe('decideRetrievalMode（检索模式判定）', () => {
+      const xmlDoc = () => mkDoc({
+        id: 'x1',
+        name: 'Z_LOGIC_202609101240.xml',
+        type: 'xml',
+        content: [{ title: 'query.ce.md.time.set · 工序间转序时间设置查询', paragraphs: ['SELECT * FROM CE_MD_TIME_SET'] }],
+        textContent: '',
+      })
+
+      it('开发类需求不再降级为探索（否则只回一串文档名、拿不到正文）', () => {
+        expect(decideRetrievalMode('开发一个显示转序时间设置日志查询的功能', [xmlDoc()])).toBe('detail')
+      })
+      it('内容型提问即使含「有哪些」也走详解', () => {
+        expect(decideRetrievalMode('转序时间设置有哪些字段', [xmlDoc()])).toBe('detail')
+      })
+      it('明确在问知识库有哪些资料时才走探索', () => {
+        expect(decideRetrievalMode('知识库里有哪些文档', [xmlDoc()])).toBe('explore')
+        expect(decideRetrievalMode('列出所有文档', [xmlDoc()])).toBe('explore')
+        expect(decideRetrievalMode('你能问什么', [xmlDoc()])).toBe('explore')
+      })
+      it('点名文档名 / 标签页时走详解', () => {
+        expect(decideRetrievalMode('不良分析报告里 2026履历 的数据', [mkDoc()])).toBe('detail')
+      })
+      it('点名具体文档后，即便问「有哪些」也不降级为探索', () => {
+        expect(decideRetrievalMode('不良分析报告里有哪些字段', [mkDoc()])).toBe('detail')
+      })
+      it('普通提问（含空知识库）一律走详解', () => {
+        expect(decideRetrievalMode('怎么排查注液量偏低', [])).toBe('detail')
+        expect(decideRetrievalMode('', [mkDoc()])).toBe('detail')
       })
     })
 
