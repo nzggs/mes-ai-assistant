@@ -870,6 +870,12 @@ app.post('/api/summary/start', async (req, res) => {
     // 文档必须存在，避免为不存在的文档落盘孤儿任务文件
     const shard = readShardSync(docId)
     if (!shard || !shard.doc || shard.doc.deleted) return res.status(400).json({ error: '文档不存在' })
+    // XML 数据导出（一表一文件、一条 DATA_RECORD 一个对象）不支持总结：
+    // 其检索由服务端页级倒排索引直接命中；而 map-reduce 对上万条记录要发起上万次模型调用，
+    // 且必然撞上 25 分钟上限被强制中断，只会得到残缺结果并白白消耗算力。前端同样有拦截。
+    if (shard.doc.type === 'xml') {
+      return res.status(400).json({ error: 'XML 数据导出无需 AI 总结，请在问答中直接检索对象编号或功能描述' })
+    }
     // 仅允许已入库（审核通过）的文档总结：
     // 未入库文档的正文与其总结切片都不会进入问答检索（buildKnowledgeContext 只取 approved），
     // 此时生成总结既浪费算力又会被误认为"已入库可用"，故直接拒绝。

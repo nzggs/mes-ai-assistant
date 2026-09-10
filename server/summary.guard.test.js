@@ -23,11 +23,11 @@ afterEach(() => {
 // vitest 会加载根目录 .env，ADMIN_TOKEN 可能已设置；带令牌以兼容两种情况
 const ADMIN = process.env.ADMIN_TOKEN || ''
 
-async function createDoc(id, status) {
+async function createDoc(id, status, type = 'pdf') {
   const res = await request(app)
     .post('/api/docs')
     .set('X-Admin-Token', ADMIN)
-    .send({ id, doc: { id, name: 't.pdf', type: 'pdf', status, textContent: 'hello world '.repeat(50) } })
+    .send({ id, doc: { id, name: `t.${type}`, type, status, textContent: 'hello world '.repeat(50) } })
   expect(res.status).toBe(200)
 }
 
@@ -58,5 +58,20 @@ describe('POST /api/summary/start 准入校验', () => {
     const res = await startSummary('upload-deleted-1')
     expect(res.status).toBe(400)
     expect(res.body.error).toContain('文档不存在')
+  })
+
+  it('XML 数据导出（已入库）也禁止总结：无需总结，直接检索即可', async () => {
+    await createDoc('upload-xml-1', 'approved', 'xml')
+    const res = await startSummary('upload-xml-1')
+    expect(res.status).toBe(400)
+    expect(res.body.error).toContain('XML')
+    expect(res.body.error).toContain('无需')
+  })
+
+  it('校验顺序：类型判断在入库判断之前，未入库的 XML 也按 XML 提示拒绝', async () => {
+    await createDoc('upload-xml-2', 'pending', 'xml')
+    const res = await startSummary('upload-xml-2')
+    expect(res.status).toBe(400)
+    expect(res.body.error).toContain('XML')
   })
 })

@@ -24,6 +24,13 @@ const statusConfig = {
   rejected: { label: '已拒绝', color: '#ef4444', bg: '#fef2f2' },
 }
 
+// XML 数据导出（一表一文件、一条 DATA_RECORD 一个对象）不支持也不需要 AI 总结：
+// 其检索精度由服务端页级倒排索引直接保证（按对象编号/字段/代码命中），
+// 而 map-reduce 总结对上万条记录要发起上万次模型调用、且会在 25 分钟上限处被强制中断，
+// 既得不到完整结果又白白消耗算力。此处文案在「点击校验」与「面板提示」两处复用。
+const XML_NO_SUMMARY_HINT =
+  'XML 数据导出为逐条结构化记录，检索已由服务端索引直接命中，无需进行 AI 总结。如需查找某个对象，直接在问答中输入对象编号或功能描述即可（例如「PM1CEMD029」或「转序时间设置」）。'
+
 // 根据文件扩展名判断类型
 function getFileType(filename: string): 'word' | 'ppt' | 'excel' | 'pdf' | 'xml' | null {
   const ext = filename.toLowerCase().split('.').pop()
@@ -170,6 +177,15 @@ export function KnowledgeBase({ documents, currentUser, onDocumentsChange, onReq
 
   // 发起/订阅后台总结任务：任务在后端运行，关闭窗口/刷新浏览器后仍继续，可断点续跑
   const runSummary = useCallback(async (doc: KnowledgeDoc, sheetName?: string) => {
+    // 校验①：XML 数据导出无需总结（放在最前，连 API Key 都不必先配）
+    // 全文总结与按标签页总结共用本函数，因此这一处校验同时覆盖两个入口。
+    if (doc.type === 'xml') {
+      setSummaryDoc(doc)
+      setSummaryScope(sheetName)
+      setSummaryError(XML_NO_SUMMARY_HINT)
+      reportError(`「${doc.name}」为 XML 数据导出，无需进行 AI 总结`)
+      return
+    }
     const apiKey = getApiKey()
     if (!apiKey) {
       setSummaryDoc(doc)
@@ -1413,7 +1429,11 @@ function DocDetailModal({
                     <path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 4.96.44 2.5 2.5 0 0 0 2.96-3.08 3 3 0 0 0 .34-5.58 2.5 2.5 0 0 0-1.32-4.24 2.5 2.5 0 0 0-1.98-3A2.5 2.5 0 0 0 14.5 2Z" />
                   </svg>
                   <span className="text-xs font-medium text-purple-700">AI 整篇总结</span>
-                  <span className="text-xs text-mes-textTertiary">（用于对知识密度极高文档的归纳提取，如字典手册类文档）</span>
+                  <span className="text-xs text-mes-textTertiary">
+                    {doc.type === 'xml'
+                      ? '（XML 数据导出无需总结，检索由服务端索引直接命中）'
+                      : '（用于对知识密度极高文档的归纳提取，如字典手册类文档）'}
+                  </span>
                 </div>
                 <div className="flex items-center gap-2 flex-wrap">
                   <button
@@ -1463,6 +1483,10 @@ function DocDetailModal({
                     </div>
                   )}
                 </div>
+                {/* XML 数据导出：面板内直接说明，避免用户反复点按钮试（点击时也会再拦一次） */}
+                {doc.type === 'xml' && (
+                  <p className="mt-2 text-[11px] leading-relaxed text-purple-700/80">{XML_NO_SUMMARY_HINT}</p>
+                )}
               </div>
             </div>
             )}

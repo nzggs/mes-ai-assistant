@@ -288,7 +288,10 @@ export default function App() {
     let scopeSummaryBlock = ''
     // 探索模式（第一步）只做目录引导，不触发整篇/整表总结生成
     if (kbEnabled && effectiveMode === 'detail') {
-      const intentDoc = documents.filter(d => d.status === 'approved').find(d => detectSummaryIntent(text, d))
+      // XML 数据导出不参与整篇总结（与「总结」按钮入口校验保持一致）：
+      // 其检索由服务端页级倒排索引直接命中，而上万条记录的 map-reduce 必然撞 25 分钟上限中断，
+      // 自动触发只会白烧算力。
+      const intentDoc = documents.filter(d => d.status === 'approved' && d.type !== 'xml').find(d => detectSummaryIntent(text, d))
       if (intentDoc) {
         const intent = detectSummaryIntent(text, intentDoc)!
         const cacheKey = intent.full ? FULL_DOC_SUMMARY_KEY : intent.sheetName!

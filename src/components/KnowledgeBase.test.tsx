@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen } from '@testing-library/react'
+import { render, screen, fireEvent } from '@testing-library/react'
 import { KnowledgeBase } from './KnowledgeBase'
 import type { KnowledgeDoc } from '../types'
 
@@ -68,5 +68,42 @@ describe('KnowledgeBase', () => {
     ]
     renderKB(docs, { username: 'admin', displayName: '管理员', department: 'IT部', role: 'admin' })
     expect(screen.getByText('测试文档.docx')).toBeInTheDocument()
+  })
+
+  it('XML 数据导出：点击「总结整个文档」被拦截，不会发起总结任务', () => {
+    const xmlDoc: KnowledgeDoc = {
+      id: 'x1', name: 'Z_LOGIC_202609101240.xml', type: 'xml', status: 'approved',
+      summary: '', keywords: [], content: [], chunks: 0, pages: 2035,
+      tableSummaries: {}, summaryChunks: [],
+      uploadDate: '2026-09-10', approvedDate: '2026-09-10', uploader: 'admin',
+    } as any
+    renderKB([xmlDoc], { username: 'admin', displayName: '管理员', department: 'IT部', role: 'admin' })
+
+    // 打开详情面板：面板内已有「无需总结」的说明
+    fireEvent.click(screen.getByText('Z_LOGIC_202609101240.xml'))
+    expect(screen.getAllByText(/无需进行 AI 总结/)).toHaveLength(1)
+
+    // 点击总结按钮 → 校验拦下：弹窗给出拒绝说明，且没有调用 /api/summary/start
+    fireEvent.click(screen.getByText(/总结整个文档/))
+    expect(screen.getAllByText(/无需进行 AI 总结/).length).toBeGreaterThan(1)
+    expect(screen.getByText('可复制以上总结内容使用')).toBeInTheDocument()
+    const calls = (global.fetch as any).mock.calls.map((c: any[]) => String(c[0] ?? ''))
+    expect(calls.some(u => u.includes('/api/summary/start'))).toBe(false)
+  })
+
+  it('普通文档（非 XML）不受该校验影响：仍会发起总结请求', () => {
+    const pdfDoc: KnowledgeDoc = {
+      id: 'p1', name: '手册.pdf', type: 'pdf', status: 'approved',
+      summary: '', keywords: [], content: [], chunks: 0, pages: 10,
+      tableSummaries: {}, summaryChunks: [],
+      uploadDate: '2026-09-10', approvedDate: '2026-09-10', uploader: 'admin',
+    } as any
+    renderKB([pdfDoc], { username: 'admin', displayName: '管理员', department: 'IT部', role: 'admin' })
+
+    fireEvent.click(screen.getByText('手册.pdf'))
+    fireEvent.click(screen.getByText(/总结整个文档/))
+    // 无 API Key 时走既有的「请先配置 API Key」分支，不应出现 XML 提示
+    expect(screen.getByText(/请先在设置中配置 API Key/)).toBeInTheDocument()
+    expect(screen.queryByText(/无需进行 AI 总结/)).not.toBeInTheDocument()
   })
 })

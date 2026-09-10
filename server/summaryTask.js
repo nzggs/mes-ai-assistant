@@ -318,6 +318,8 @@ async function runTask(task) {
     if (rec0.doc && rec0.doc.deleted) throw new Error('文档已被删除')
     // 仅已入库文档可总结（与 /api/summary/start 校验一致，防止任务恢复后绕过）
     if ((rec0.doc?.status || 'pending') !== 'approved') throw new Error('文档尚未入库，无法总结')
+    // XML 数据导出无需总结（与 /api/summary/start 校验一致，防止任务恢复/历史任务绕过）
+    if ((rec0.doc?.type || '') === 'xml') throw new Error('XML 数据导出无需 AI 总结')
     let doc = rec0.doc || rec0
 
     if ((!doc.content || doc.content.length === 0) && !doc.textContent?.trim() && doc.pdfUrl) {
