@@ -148,6 +148,13 @@ export function KnowledgeBase({ documents, currentUser, onDocumentsChange, onReq
       setSummaryError('请先在设置中配置 API Key 后再进行总结')
       return
     }
+    // 未入库（未审核通过）的文档禁止总结：其正文与总结切片都不进问答检索，生成无意义
+    if (doc.status !== 'approved') {
+      setSummaryDoc(doc)
+      setSummaryScope(sheetName)
+      setSummaryError('该文档尚未入库，请先点击「确认入库」后再进行总结。')
+      return
+    }
     // 若该文档已有活动任务，直接打开弹窗订阅，不重复发起
     if (docTasks[doc.id]) {
       setActiveTask({ doc, scope: sheetName, taskId: docTasks[doc.id] })
@@ -597,6 +604,9 @@ export function KnowledgeBase({ documents, currentUser, onDocumentsChange, onReq
     // 删除前先记录日志（文档名 + 操作人 + 时间），删除后日志仍保留在后端
     const doc = documents.find(d => d.id === id)
     if (doc) recordLog('delete', doc.name)
+    // 删除文档时取消该文档正在跑的总结任务：任务跑完会落库总结，
+    // 若不取消会往已删除的分片写回内容（后端另有 deleted 复查兜底）
+    if (docTasks[id]) cancelSummary(id)
     // 释放 Object URL 防止内存泄漏
     onDocumentsChange(prev => {
       const doc = prev.find(d => d.id === id)
@@ -611,7 +621,7 @@ export function KnowledgeBase({ documents, currentUser, onDocumentsChange, onReq
     setSelectedDoc(prev => prev?.id === id ? null : prev)
     setReaderDoc(prev => prev?.id === id ? null : prev)
     setDeleteConfirm(null)
-  }, [onDocumentsChange, documents, recordLog])
+  }, [onDocumentsChange, documents, recordLog, docTasks, cancelSummary])
 
   // "阅读原文"：在应用内模态框打开上传的原始文档（PDF 原生预览 / Office 下载）
   // 无原始文件（如内置样例文档）时回退到文本阅读器

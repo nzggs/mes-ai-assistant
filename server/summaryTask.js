@@ -229,9 +229,10 @@ async function callLLMDetailedWithRetry(messages, opts, maxRetries = 3, batch = 
     if (attempt < maxRetries) {
       const isRate = /速率限制|rate.?limit|429|too many|频率|过于频繁|请稍后|overload|过载|busy|请求过快|控制请求频率/.test(reason)
       const isTimeout = /timeout|timed out|timedout|abort|signal|超时|etimedout|econnreset|socket|network|网络/.test(reason)
-      const wait = batch
-        ? 0
-        : (isRate ? 3000 : isTimeout ? 5000 : 2000) * Math.pow(2, attempt) + Math.random() * 800
+      // batch（map 并发）模式下也退避：原先 wait=0 会让"模型繁忙"立刻重试再次撞墙，
+      // 最终被判失败而丢页；这里给一个较短但非零的退避。
+      const base = isRate ? 3000 : isTimeout ? 5000 : 2000
+      const wait = (batch ? Math.min(base, 1500) : base) * Math.pow(2, attempt) + Math.random() * 800
       // 限流类失败：推宽闸门
       if (isRate) notifyRateLimited()
       if (wait > 0) await sleep(wait)
@@ -273,6 +274,8 @@ function listTaskFiles() {
 function saveSummaryToDoc(docId, sheetKey, text) {
   const rec = readShardSync(docId)
   if (!rec || !rec.doc) return false
+  // 文档已被删除（分片是墓碑）：不得写回，否则会给墓碑挂上总结内容
+  if (rec.doc.deleted) return false
   const doc = rec.doc
   const contentHash = contentHashOf(doc)
   const entry = { text, updatedAt: Date.now(), contentHash }
@@ -311,6 +314,10 @@ async function runTask(task) {
     // 0) 取文档内容（分片结构为 { id, doc: {...} }；优先 doc.content/textContent，缺失则自愈从 files 提取）
     const rec0 = readShardSync(docId)
     if (!rec0) throw new Error('文档不存在')
+    // 文档已被删除（墓碑分片）：不要再消耗算力，直接终止任务
+    if (rec0.doc && rec0.doc.deleted) throw new Error('文档已被删除')
+    // 仅已入库文档可总结（与 /api/summary/start 校验一致，防止任务恢复后绕过）
+    if ((rec0.doc?.status || 'pending') !== 'approved') throw new Error('文档尚未入库，无法总结')
     let doc = rec0.doc || rec0
 
     if ((!doc.content || doc.content.length === 0) && !doc.textContent?.trim() && doc.pdfUrl) {
@@ -421,7 +428,18 @@ async function runTask(task) {
     const sysPrompt = '你是针对知识密度极高的参考类文档（如字典、手册、术语表、规范、参数表）的逐条信息抽取助手。请对下面这段内容做【逐条信息抽取】：把其中出现的每一个有意义的条目（术语/字段/命令/参数/代号/步骤/条目/条目项等）及其关键属性（定义、取值/范围、用途、默认值、单位、关联关系等）都提取出来，尽量保留原词、原数值与层级关系；宁可多提、不可遗漏；不要编造；若本段确无实质信息，回复"无实质内容"。'
     let nextTask = prefilled
     let done = prefilled
-    const CONCURRENCY = 3
+    // 本地模型（Ollama）一次只能串行处理一个请求，并发 3 会直接返回"模型繁忙"→ 整页丢失；
+    // 云端模型才用并发提速。
+    const providerCfg = PROVIDERS[providerId] || {}
+    const isLocalProvider = /ollama/i.test(String(providerId || '')) || /11434/.test(String(providerCfg.apiUrl || ''))
+    const CONCURRENCY = isLocalProvider ? 1 : 3
+    // 失败段索引：主循环只登记、不写死失败文本，交由补跑阶段重试，避免"跳过该页继续"造成丢页
+    const failedIdx = new Set()
+    const joinPartials = () => partials.filter(p => p && p.trim()).join('\n\n')
+    const buildMapMessages = (t) => ([
+      { role: 'system', content: sysPrompt },
+      { role: 'user', content: `【所属：${t.title}】\n\n${t.chunk}` },
+    ])
 
     const mapWorker = async () => {
       while (nextTask < tasks.length) {
@@ -431,29 +449,72 @@ async function runTask(task) {
         // 续跑：已完成的段直接跳过
         if (partials[i] && partials[i].trim()) {
           done++
-          report(done, tasks.length, 'map', partials.filter(p => p && p.trim()).join('\n\n'))
+          report(done, tasks.length, 'map', joinPartials())
           continue
         }
         const t = tasks[i]
-        const userContent = `【所属：${t.title}】\n\n${t.chunk}`
         await paceForRateLimit()
         if (task.cancelled) break
         const r = await callLLMDetailedWithRetry(
-          [
-            { role: 'system', content: sysPrompt },
-            { role: 'user', content: userContent },
-          ],
+          buildMapMessages(t),
           { apiKey, providerId, modelId, groupId, maxTokens: 4096, timeoutMs: 30000 },
-          1, true,
+          2, true,
         )
-        partials[i] = r.content && r.content.trim()
-          ? r.content.trim()
-          : (r.failed ? `⚠AI调用失败（${r.reason || '模型接口不可用'}）` : '无实质内容')
+        if (r.content && r.content.trim()) {
+          partials[i] = r.content.trim()
+        } else {
+          // 留空（非空串会让续跑误判为"已完成"而永久跳过该页）
+          failedIdx.add(i)
+        }
         done++
-        report(done, tasks.length, 'map', partials.filter(p => p && p.trim()).join('\n\n'))
+        report(done, tasks.length, 'map', joinPartials())
       }
     }
     await Promise.all(Array.from({ length: Math.min(CONCURRENCY, tasks.length) }, () => mapWorker()))
+
+    // 3.5) 失败段补跑：串行 + 逐轮拉长退避，把"繁忙/限流"导致的丢页找回来
+    const RETRY_ROUNDS = [
+      { waitMs: 5000, maxRetries: 2 },
+      { waitMs: 15000, maxRetries: 3 },
+      { waitMs: 40000, maxRetries: 3 },
+    ]
+    for (const round of RETRY_ROUNDS) {
+      if (task.cancelled || task._aborted || failedIdx.size === 0) break
+      // 预留收尾时间，避免补跑把整个任务拖到超时
+      if (Date.now() - task.startedAt > MAX_SUMMARY_MS * 0.85) { task._aborted = true; break }
+      task.retrying = failedIdx.size
+      task.updatedAt = Date.now()
+      persist(task)
+      await sleep(round.waitMs)
+      for (const i of [...failedIdx]) {
+        if (task.cancelled || task._aborted) break
+        if (Date.now() - task.startedAt > MAX_SUMMARY_MS) { task._aborted = true; break }
+        const t = tasks[i]
+        await paceForRateLimit()
+        const r = await callLLMDetailedWithRetry(
+          buildMapMessages(t),
+          { apiKey, providerId, modelId, groupId, maxTokens: 4096, timeoutMs: 45000 },
+          round.maxRetries, false,
+        )
+        if (r.content && r.content.trim()) {
+          partials[i] = r.content.trim()
+          failedIdx.delete(i)
+          task.retrying = failedIdx.size
+          report(done, tasks.length, 'map', joinPartials())
+        }
+      }
+    }
+    task.retrying = 0
+    // 补跑后仍失败的段：明确标注缺失位置（再次总结时这些段为空，会被自动重试补齐）
+    if (failedIdx.size > 0) {
+      task.failedChunks = [...failedIdx].map(i => ({ index: i, title: tasks[i].title }))
+      for (const i of failedIdx) {
+        if (!partials[i] || !partials[i].trim()) {
+          partials[i] = `⚠AI调用失败（第 ${i + 1} 段：${tasks[i].title}）：该部分本次未生成，请稍后重新点击总结以补齐（已完成段落会自动复用）`
+        }
+      }
+      report(done, tasks.length, 'map', joinPartials())
+    }
 
     if (task.cancelled) {
       task.status = 'cancelled'
@@ -495,15 +556,14 @@ async function runTask(task) {
         const joinedBatch = batch.join('\n\n')
         await paceForRateLimit()
         if (task.cancelled) return joinedBatch
-        const out = await callProviderOnce({
-          apiKey, providerId, modelId, groupId,
-          messages: [
+        const out = await callLLMDetailedWithRetry(
+          [
             { role: 'system', content: REDUCE_SYS },
             { role: 'user', content: `请将下面 ${batch.length} 组分段抽取结果合并为一份【覆盖全部内容、不截断、不遗漏】的归纳（保留全部条目与关键属性，按原层级组织），这是对${scopeDesc}的第 ${levelNo} 级部分归纳：${userExtra}\n\n${joinedBatch}` },
           ],
-          maxTokens: SUMMARY_MERGE_MAX_TOKENS,
-          timeoutMs: SUMMARY_LLM_TIMEOUT_MS,
-        })
+          { apiKey, providerId, modelId, groupId, maxTokens: SUMMARY_MERGE_MAX_TOKENS, timeoutMs: SUMMARY_LLM_TIMEOUT_MS },
+          1, false,
+        )
         const merged = out && out.content && out.content.trim() ? out.content.trim() : joinedBatch
         return merged.length > MAX_BATCH_INPUT_CHARS
           ? merged.slice(0, MAX_BATCH_INPUT_CHARS) + '\n…（内容过长已截断）'
@@ -519,7 +579,11 @@ async function runTask(task) {
     let finalSummary = levelItems[0]?.replace(/【第\d+级·组\d+】\n?/g, '').trim() || null
     if (!finalSummary || !finalSummary.trim()) finalSummary = null
     if (finalSummary && finalSummary.includes('⚠AI调用失败')) {
-      finalSummary = '⚠ 提示：本次整篇总结中部分内容因 AI 模型接口调用失败未能生成（通常为 API Key 无效、额度耗尽或网络异常）。请检查模型设置后重试。\n\n' + finalSummary
+      const missing = Array.isArray(task.failedChunks) ? task.failedChunks.length : 0
+      const where = missing > 0
+        ? `共 ${missing} 段未生成（${task.failedChunks.slice(0, 10).map(c => c.title).join('、')}${missing > 10 ? ' 等' : ''}）`
+        : '部分内容未能生成'
+      finalSummary = `⚠ 提示：本次总结${where}，通常为模型繁忙/限流或网络异常所致。请稍后重新点击总结——已完成的段落会自动复用，只补跑缺失部分。\n\n` + finalSummary
     }
     if (task._aborted) {
       finalSummary = finalSummary

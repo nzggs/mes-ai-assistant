@@ -725,7 +725,14 @@ app.post('/api/summary/start', async (req, res) => {
     const { docId, sheetName, instruction, providerId, modelId, groupId } = req.body || {}
     if (!docId || !isValidId(docId)) return res.status(400).json({ error: 'docId 无效' })
     // 文档必须存在，避免为不存在的文档落盘孤儿任务文件
-    if (!readShardSync(docId)) return res.status(400).json({ error: '文档不存在' })
+    const shard = readShardSync(docId)
+    if (!shard || !shard.doc || shard.doc.deleted) return res.status(400).json({ error: '文档不存在' })
+    // 仅允许已入库（审核通过）的文档总结：
+    // 未入库文档的正文与其总结切片都不会进入问答检索（buildKnowledgeContext 只取 approved），
+    // 此时生成总结既浪费算力又会被误认为"已入库可用"，故直接拒绝。
+    if ((shard.doc.status || 'pending') !== 'approved') {
+      return res.status(400).json({ error: '文档尚未入库，请先点击「确认入库」后再进行总结' })
+    }
     const apiKey = req.headers['x-api-key'] || process.env.LLM_API_KEY
     if (!apiKey || apiKey.length < 10) return res.status(400).json({ error: '未提供 API Key' })
     const task = startSummary({ docId, sheetName: sheetName || null, instruction: instruction || '', providerId: providerId || 'deepseek', modelId: modelId || null, groupId: groupId || null, apiKey })
