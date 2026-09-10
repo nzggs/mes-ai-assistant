@@ -190,6 +190,16 @@ export function readDocs() {
   return Array.from(docsCache.values())
 }
 
+/**
+ * 按 id 取单篇文档记录（命中内存缓存，O(1)）。
+ * 供检索索引在返回命中页正文时使用——不能走 readShardSync，
+ * 那会每次把整篇分片（超大文档可达数十 MB）从磁盘读入并 JSON.parse。
+ */
+export function getDocRecord(id) {
+  ensureDocsCache()
+  return docsCache.get(id) || null
+}
+
 // 写入/更新内存缓存中的单篇文档记录（供路由在 withDocsWrite 回调内调用）
 export function setDocInCache(id, record) {
   docsCache.set(id, record)

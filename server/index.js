@@ -11,7 +11,7 @@ import { PROVIDERS } from '../shared/providers.js'
 import {
   configureStorage, resetStorageCache, getPaths,
   isValidId, writeShardSync, readShardSync, rebuildIndexSync, ensureDocsCache, setDocInCache,
-  readDocs, withDocsWrite, withUsersWrite, readUsers, writeUsers,
+  readDocs, getDocRecord, withDocsWrite, withUsersWrite, readUsers, writeUsers,
   readLogs, appendLog, writeFileSafe, LOG_ACTIONS, lightweightDoc, FILE_MIME,
 } from './storage.js'
 import { extractPdfTextFromFile } from './pdfExtract.js'
@@ -32,8 +32,10 @@ process.on('uncaughtException', (err) => {
 
 // 确保数据目录存在（默认 server/data，可用 MES_DATA_DIR 环境变量覆盖，便于测试隔离）
 configureStorage()
-// 检索索引用 storage 的分片读取获取页正文
-configureSearchIndex({ fetchDocRecord: (id) => readShardSync(id) })
+// 检索索引用 storage 的分片读取获取页正文。
+// 关键：必须走**内存缓存**（docsCache）而不是 readShardSync —— 后者每次都会把整篇文档分片
+// 从磁盘读入并 JSON.parse（超大 XML 分片可达数十 MB），一次检索要取多页，会把响应拖到秒级。
+configureSearchIndex({ fetchDocRecord: (id) => getDocRecord(id) })
 
 // ===== 超大文档列表瘦身阈值 =====
 // XML 数据导出常达数千条记录、数十 MB 正文。若每次同步文档列表都全量下发，
