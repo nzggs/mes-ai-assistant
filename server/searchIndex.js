@@ -40,6 +40,66 @@ const state = {
 /** 取完整文档记录（默认走 storage 分片；单测可用 configureSearchIndex 覆盖） */
 let fetchDocRecord = (id) => readShardSync(id)
 
+// ===== 统一「页」视图 =====
+// 索引与取页必须使用同一套切分，否则 pageIdx 会对不上。
+// 文档有两种形态：
+//   1) content: DocPage[]（PDF/Office/XML 解析后结构化分页）—— 直接用
+//   2) 只有 textContent（早期上传的 PDF 等：扁平全文、无分页数组）—— 按页标记切分，
+//      无标记则按固定字符数切片。**不能只处理形态 1**，否则这类已入库文档在服务端检索里整篇消失。
+const PAGE_MARKER_RE = /(---\s*第([\dIVXLC]+)页\s*---)|(===\s*(.+?)\s*===)/g
+const FLAT_SLICE_CHARS = 4000
+
+export function splitFlatText(text, docName = '') {
+  const pages = []
+  const markers = []
+  PAGE_MARKER_RE.lastIndex = 0
+  let m
+  while ((m = PAGE_MARKER_RE.exec(text)) !== null) {
+    markers.push({ label: m[1] ? `第${m[2]}页` : (m[3] || '').trim(), index: m.index })
+  }
+  if (markers.length > 0) {
+    for (let i = 0; i < markers.length; i++) {
+      const start = markers[i].index
+      const end = i + 1 < markers.length ? markers[i + 1].index : text.length
+      const body = text.slice(start, end).trim()
+      if (body) pages.push({ pageNum: pages.length + 1, title: markers[i].label, paragraphs: [body] })
+    }
+    return pages
+  }
+  const name = String(docName || '').replace(/\.[^.]+$/, '')
+  for (let s = 0; s < text.length; s += FLAT_SLICE_CHARS) {
+    const body = text.slice(s, s + FLAT_SLICE_CHARS).trim()
+    if (body) pages.push({ pageNum: pages.length + 1, title: `${name} 片段${pages.length + 1}`, paragraphs: [body] })
+  }
+  return pages
+}
+
+/** 把文档记录统一成「页数组」视图 */
+export function pagesOfDoc(doc) {
+  if (!doc) return []
+  if (Array.isArray(doc.content) && doc.content.length > 0) return doc.content
+  const text = typeof doc.textContent === 'string' ? doc.textContent : ''
+  if (!text.trim()) return []
+  return splitFlatText(text, doc.name)
+}
+
+// 扁平全文切分结果的缓存（避免每次取命中页都重新切分整篇；仅保留最近数篇）
+const flatCache = new Map()
+function pagesOfRecord(rec) {
+  const doc = rec && rec.doc
+  if (!doc) return []
+  if (Array.isArray(doc.content) && doc.content.length > 0) return doc.content
+  const text = typeof doc.textContent === 'string' ? doc.textContent : ''
+  if (!text.trim()) return []
+  const key = rec.id
+  const cached = flatCache.get(key)
+  if (cached && cached.len === text.length) return cached.pages
+  const pages = splitFlatText(text, doc.name)
+  if (flatCache.size > 8) flatCache.clear()
+  flatCache.set(key, { len: text.length, pages })
+  return pages
+}
+
 /**
  * 注入文档读取器（单测 / 数据目录隔离用途）。
  */
@@ -122,6 +182,7 @@ function evictDoc(docId) {
   if (state.totalPostings < 0) state.totalPostings = 0
   state.docs.delete(docId)
   state.docIds[target] = null
+  flatCache.delete(docId)
   pruneDocSlots()
 }
 
@@ -145,7 +206,7 @@ export function upsertDocument(docId, doc) {
   evictDoc(docId)
   if (doc.deleted === true) return false
   if ((doc.status || 'pending') !== 'approved') return false
-  const pages = Array.isArray(doc.content) ? doc.content : []
+  const pages = pagesOfDoc(doc)
   if (pages.length === 0) return false
 
   const docIdx = allocDocIdx()
@@ -204,6 +265,7 @@ export function resetIndex() {
   state.totalPostings = 0
   state.ready = false
   state.building = false
+  flatCache.clear()
 }
 
 // ===== 全量构建 =====
@@ -254,12 +316,12 @@ export function getStatus() {
 
 // ===== 检索 =====
 
-/** 取一页正文（从 storage 分片读取，读不到则不返回正文） */
+/** 取一页正文（从 storage 分片读取；与建索引使用同一套页切分） */
 function readPage(docId, pageIdx) {
   let rec = null
   try { rec = fetchDocRecord(docId) } catch { rec = null }
   if (!rec || !rec.doc || rec.doc.deleted) return null
-  const pages = Array.isArray(rec.doc.content) ? rec.doc.content : []
+  const pages = pagesOfRecord(rec)
   const page = pages[pageIdx]
   if (!page) return null
   const head = String(page.title || '')

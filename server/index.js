@@ -16,7 +16,7 @@ import {
 } from './storage.js'
 import { extractPdfTextFromFile } from './pdfExtract.js'
 import { startSummary, getTask, cancelTask, listTasks, recoverSummaryTasks, startTaskCleanup } from './summaryTask.js'
-import { configureSearchIndex, buildIndex, search as searchInIndex, getStatus as getIndexStatus, upsertDocument, removeDocument, hasDocument } from './searchIndex.js'
+import { configureSearchIndex, buildIndex, search as searchInIndex, getStatus as getIndexStatus, upsertDocument, removeDocument, hasDocument, pagesOfDoc } from './searchIndex.js'
 
 // 优先加载项目根目录 .env，再用 server/.env 覆盖（server/.env 为后端配置真相源）。
 dotenv.config()
@@ -77,8 +77,19 @@ function estimateTextLen(doc) {
 
 /** 是否需要在列表接口里剥离正文 */
 function shouldStripContent(doc) {
-  if (!doc || !Array.isArray(doc.content) || doc.content.length === 0) return false
-  return doc.content.length > SLIM_PAGE_THRESHOLD || estimateTextLen(doc) > SLIM_TEXT_THRESHOLD
+  if (!doc) return false
+  const hasContent = Array.isArray(doc.content) && doc.content.length > 0
+  if (hasContent) return doc.content.length > SLIM_PAGE_THRESHOLD || estimateTextLen(doc) > SLIM_TEXT_THRESHOLD
+  // 仅有扁平全文的文档（早期上传的 PDF 等）：同样按字符数上限判断
+  const textLen = typeof doc.textContent === 'string' ? doc.textContent.length : 0
+  return textLen > SLIM_TEXT_THRESHOLD
+}
+
+/** 剥离后的页数估值（避免为了算页数而全量切分正文） */
+function approxPageCount(doc) {
+  if (Array.isArray(doc.content) && doc.content.length > 0) return doc.content.length
+  const textLen = typeof doc.textContent === 'string' ? doc.textContent.length : 0
+  return textLen > 0 ? Math.max(1, Math.ceil(textLen / 4000)) : 0
 }
 
 const app = express()
@@ -206,7 +217,7 @@ app.get('/api/docs', (_req, res) => {
           doc.content = []
           if (typeof doc.textContent === 'string') doc.textContent = ''
           doc.contentOmitted = true
-          doc.pageCount = Array.isArray(r.doc.content) ? r.doc.content.length : 0
+          doc.pageCount = approxPageCount(r.doc)
         }
         return { id: r.id, doc }
       })
@@ -237,7 +248,8 @@ app.get('/api/docs/:id/pages', (req, res) => {
   ensureDocsCache()
   const rec = readDocs().find(r => r.id === id) || readShardSync(id)
   if (!rec || (rec.doc && rec.doc.deleted)) return res.status(404).json({ error: '文档不存在' })
-  const pages = Array.isArray(rec.doc.content) ? rec.doc.content : []
+  // 与索引使用同一套页视图：仅有 textContent 的文档（早期上传的 PDF 等）也能按需取页
+  const pages = pagesOfDoc(rec.doc)
   const from = Math.max(0, parseInt(req.query.from, 10) || 0)
   // 单次最多下发 500 页，防止被一次性拉爆（超大文档应配合 titles/服务端检索定位后再取页）
   const MAX_RANGE = 500
@@ -266,7 +278,7 @@ app.get('/api/docs/:id/titles', (req, res) => {
   ensureDocsCache()
   const rec = readDocs().find(r => r.id === id) || readShardSync(id)
   if (!rec || (rec.doc && rec.doc.deleted)) return res.status(404).json({ error: '文档不存在' })
-  const pages = Array.isArray(rec.doc.content) ? rec.doc.content : []
+  const pages = pagesOfDoc(rec.doc)
   res.json({ id, total: pages.length, titles: pages.map(p => String(p && p.title || '')) })
 })
 

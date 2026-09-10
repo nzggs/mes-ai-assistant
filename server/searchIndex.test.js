@@ -155,6 +155,45 @@ describe('buildIndex 全量构建', () => {
   })
 })
 
+describe('仅扁平全文（无分页数组）的文档', () => {
+  it('按页标记切分并可被检索（早期上传的 PDF 形态）', async () => {
+    STORE.clear()
+    const rec = {
+      id: 'flat1',
+      doc: {
+        id: 'flat1', name: 'SAP HANA数据库SQL参考手册.pdf', status: 'approved',
+        textContent: '--- 第1页 ---\nALTER SYSTEM SAVEPOINT 保存点\n--- 第2页 ---\nDROP SAVEPOINT 删除保存点',
+      },
+    }
+    STORE.set(rec.id, rec)
+    await buildIndex([rec])
+    expect(hasDocument('flat1')).toBe(true)
+    expect(indexedPageCount('flat1')).toBe(2)
+    const res = search('SAVEPOINT')
+    expect(res.hits.length).toBeGreaterThan(0)
+    expect(res.hits[0].pageTitle).toBe('第1页')
+    expect(res.hits[0].text).toContain('ALTER SYSTEM SAVEPOINT')
+  })
+
+  it('无页标记时按固定长度切片，标题带文档名', async () => {
+    STORE.clear()
+    const body = 'x'.repeat(500) + ' 关键标记 MARKER_ZZZ ' + 'y'.repeat(9000)
+    const rec = { id: 'flat2', doc: { id: 'flat2', name: '无标记文档.pdf', status: 'approved', textContent: body } }
+    STORE.set(rec.id, rec)
+    await buildIndex([rec])
+    expect(indexedPageCount('flat2')).toBeGreaterThan(1)
+    const res = search('MARKER_ZZZ')
+    expect(res.hits.length).toBeGreaterThan(0)
+    expect(res.hits[0].pageTitle).toContain('无标记文档')
+  })
+
+  it('既无 content 也无 textContent 的文档不入索引', () => {
+    upsertDocument('empty1', { id: 'empty1', name: '空.pdf', status: 'approved' })
+    STORE.clear()
+    expect(hasDocument('empty1')).toBe(false)
+  })
+})
+
 describe('超大文档内存保护', () => {
   it('高频模板词被裁掉，不再进索引', () => {
     STORE.clear()
