@@ -41,6 +41,8 @@ services:
     network_mode: host
     # 不写 env_file：docker compose 会自动加载同目录 .env（变量替换 + 注入容器）
     environment:
+      # 容器默认 UTC，日志与文件时间戳会比北京时间早 8 小时，排查时易误判
+      TZ: Asia/Shanghai
       PORT: 3001
       # host 模式下监听 IPv4 通配符，局域网可访问
       HOST: 0.0.0.0

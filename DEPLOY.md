@@ -202,6 +202,8 @@ node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
 | 上传/删除文档 403 | 前后端令牌不一致或未重建 | 确认 `.env` 两处一致后 `docker compose up -d --build` |
 | 数据"丢失" | 目录改名导致新建卷 | `docker volume ls` 找回旧卷，或改回目录名 |
 | 换机器后连不上 Ollama | 用了 bridge 网络 | 改 `.env` 的 `OLLAMA_BASE` 为宿主机非回环 IP |
+| 日志 / 文件时间比北京时间早 8 小时 | 容器默认 UTC | compose 已设 `TZ: Asia/Shanghai`；`docker exec <容器> date` 应显示 CST |
+| 总结报「文档不存在」 | 该文档只存在于浏览器 IndexedDB，未同步到后端 | 新版本总结前会自动补传；仍失败就重新上传该文档 |
 
 ---
 
