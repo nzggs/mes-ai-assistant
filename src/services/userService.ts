@@ -299,9 +299,11 @@ export function canAccessUserManagement(user: User | null): boolean {
   return !!user && user.department === 'IT部' && user.role === 'admin'
 }
 
-/** 是否可访问数据库管理模块（仅 IT 部管理员；数据库连接与查询限制属公用敏感配置） */
+/** 是否可访问数据库管理模块（超级管理员或 IT 部管理员；数据库连接与查询限制属公用敏感配置） */
 export function canAccessDatabaseManagement(user: User | null): boolean {
-  return !!user && user.department === 'IT部' && user.role === 'admin'
+  if (!user) return false
+  if (isSuperAdmin(user)) return true
+  return user.department === 'IT部' && user.role === 'admin'
 }
 
 /** 查询上传人所属部门 */
