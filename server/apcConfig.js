@@ -36,6 +36,17 @@ const CONFIG_VERSION = 1
 export const DB_SLOTS = ['db1', 'db2']
 export const DB_DEFAULT_NAMES = { db1: '数据库系统 1', db2: '数据库系统 2' }
 
+/**
+ * 监测项目：每个项目自带一套「用哪个数据库 + 用哪个 SQL 模板取数 + 参数怎么设」。
+ * 数据库连接（怎么连）与查询限制（怎么限）是公用配置，在「数据库管理」页维护；
+ * 项目只引用数据库槽位（dbSlot），不重复存连接信息。
+ * 历史的单目录配置（catalog.queries / catalog.params）自动迁移为「默认项目」。
+ */
+export const DEFAULT_PROJECT_ID = 'p_default'
+export const DEFAULT_PROJECT_NAME = '默认项目'
+/** 问答环节直查行数上限的默认值（可在「数据库管理」页调整） */
+export const DEFAULT_CHAT_ROWS = 100
+
 // ===== 路径 =====
 
 function dataDir() {
@@ -126,7 +137,7 @@ export function getConfigRevision() {
 }
 
 function emptyConfig() {
-  return { version: CONFIG_VERSION, updatedAt: null, database: {}, catalog: {} }
+  return { version: CONFIG_VERSION, updatedAt: null, databases: {}, meta: {}, limits: {}, projects: {} }
 }
 
 /** 读取配置文件（带缓存；文件损坏时降级为空配置并记录原因，不阻断服务启动） */
@@ -143,13 +154,40 @@ export function readConfig(force = false) {
         let databases = {}
         if (parsed.databases && typeof parsed.databases === 'object') databases = parsed.databases
         else if (parsed.database && typeof parsed.database === 'object') databases = { db1: parsed.database }
-        const activeDatabase = DB_SLOTS.includes(parsed.activeDatabase) ? parsed.activeDatabase : DB_SLOTS[0]
+        // 项目模型（v2）：projects 各自带 queries/params；历史全局 catalog 自动迁移为默认项目
+        let projects = {}
+        let meta = {}
+        let limits = {}
+        const legacyCatalog = parsed.catalog && typeof parsed.catalog === 'object' ? parsed.catalog : {}
+        if (parsed.projects && typeof parsed.projects === 'object') {
+          projects = parsed.projects
+        } else if ((legacyCatalog.queries || legacyCatalog.params) && !parsed.projects) {
+          projects = {
+            [DEFAULT_PROJECT_ID]: {
+              id: DEFAULT_PROJECT_ID,
+              name: DEFAULT_PROJECT_NAME,
+              description: '由历史单目录配置自动迁移',
+              dbSlot: 'db1',
+              queries: legacyCatalog.queries || null,
+              params: Array.isArray(legacyCatalog.params) ? legacyCatalog.params : [],
+              createdAt: parsed.updatedAt || null,
+              updatedAt: parsed.updatedAt || null,
+            },
+          }
+        }
+        // 全局 meta：优先读顶层 meta；历史上平铺在 catalog 里的四个键迁移过来
+        const metaSrc = parsed.meta && typeof parsed.meta === 'object' ? parsed.meta : legacyCatalog
+        for (const k of ['station', 'sampleIntervalSec', 'defaultWindowMinutes', 'deadbandPctDefault']) {
+          if (metaSrc[k] !== undefined) meta[k] = metaSrc[k]
+        }
+        if (parsed.limits && typeof parsed.limits === 'object') limits = parsed.limits
         raw = {
           version: Math.round(num(parsed.version, CONFIG_VERSION)),
           updatedAt: parsed.updatedAt || null,
           databases,
-          activeDatabase,
-          catalog: parsed.catalog && typeof parsed.catalog === 'object' ? parsed.catalog : {},
+          meta,
+          limits,
+          projects,
         }
       }
     }
@@ -244,10 +282,10 @@ export function normalizeDatabase(input) {
 }
 
 /** 合并后的生效数据库配置：页面保存值 > 环境变量 > 内置默认
- * @param {string} [id] 数据库槽位（db1/db2）；缺省取当前「正在使用」的槽位
+ * @param {string} [id] 数据库槽位（db1/db2）；缺省取 db1
  */
 export function getEffectiveHanaConfig(id) {
-  const slotId = id && DB_SLOTS.includes(id) ? id : getActiveDatabaseId()
+  const slotId = id && DB_SLOTS.includes(id) ? id : DB_SLOTS[0]
   const env = getEnvHanaConfig()
   const saved = (readConfig().databases || {})[slotId] || {}
   const out = { ...env }
@@ -281,23 +319,22 @@ export function getDatabaseIds() {
   return [...DB_SLOTS]
 }
 
-/** 当前「正在使用」的数据库槽位 id（缺省 db1） */
-export function getActiveDatabaseId() {
-  const cur = readConfig().activeDatabase
-  return DB_SLOTS.includes(cur) ? cur : DB_SLOTS[0]
-}
-
 /** 是否已完成数据源配置（host + user 齐备即视为已配置）
- * @param {string} [id] 数据库槽位；缺省取当前「正在使用」的槽位
+ * @param {string} [id] 数据库槽位；缺省指 db1。传任意槽位可分别判断
  */
 export function isDataSourceConfigured(id) {
   const c = getEffectiveHanaConfig(id)
   return Boolean(c.host && c.user)
 }
 
-/** 哪些数据库配置项来自页面保存（用于界面标注） */
+/** 是否至少有一个数据库槽位已完成配置（供「是否回退仿真源」判断） */
+export function isAnyDatabaseConfigured() {
+  return DB_SLOTS.some((id) => isDataSourceConfigured(id))
+}
+
+/** 哪些数据库配置项来自页面保存（用于界面标注）；无调用方，仅保留兼容 */
 export function savedDatabaseKeys() {
-  return Object.keys(readConfig().database || {})
+  return Object.keys(readConfig().databases || {})
 }
 
 /** 保存某个数据库槽位（id: db1/db2） */
@@ -314,16 +351,6 @@ export function saveDatabase(id, input) {
   return getEffectiveHanaConfig(id)
 }
 
-/** 切换「正在使用」的数据库槽位（下次取数 / 测试均走该槽位） */
-export function setActiveDatabase(id) {
-  if (!DB_SLOTS.includes(id)) throw configError(`不支持的数据库槽位：${id || '(空)'}（可选：${DB_SLOTS.join(' / ')}）`)
-  const cur = readConfig(true)
-  if (cur.activeDatabase === id) return id
-  const next = { ...cur, activeDatabase: id }
-  persist(next)
-  return id
-}
-
 /** 清空某个数据库槽位（保留槽位名，连接字段全部回到未配置） */
 export function resetDatabase(id) {
   if (!DB_SLOTS.includes(id)) throw configError(`不支持的数据库槽位：${id || '(空)'}（可选：${DB_SLOTS.join(' / ')}）`)
@@ -335,10 +362,14 @@ export function resetDatabase(id) {
   return getConfigForClient()
 }
 
-// ===== catalog 段（queries / params / meta）=====
+// ===== meta / limits / projects 段 =====
 
-function savedCatalog() {
-  return readConfig().catalog || {}
+function savedMeta() {
+  return readConfig().meta || {}
+}
+
+function savedLimits() {
+  return readConfig().limits || {}
 }
 
 /** 读取种子文件原文（只读一次磁盘，错误包装成可读信息） */
@@ -351,30 +382,153 @@ function readSeedRaw() {
   }
 }
 
-/** 用「种子 + 指定覆盖」拼出待校验的目录，不落盘（保存前预校验用） */
-function rawCatalogWith(overrides) {
-  const seedRaw = readSeedRaw()
-  if (isCatalogFileLocked()) return seedRaw
-  return { ...seedRaw, ...(overrides || {}) }
+// ===== 项目（监测项目）=====
+
+const PROJECT_NAME_MAX = 64
+const PROJECT_DESC_MAX = 200
+
+function projectIdError(message) {
+  const err = new Error(message)
+  err.code = 'EAPCCONFIG'
+  err.status = 400
+  return err
 }
 
-/** 合并后的原始目录（种子文件 + 页面覆盖） */
-export function getRawCatalog() {
-  return rawCatalogWith(savedCatalog())
+function genProjectId() {
+  return `p_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`
+}
+
+function projectsMap() {
+  const raw = readConfig().projects || {}
+  return raw && typeof raw === 'object' ? raw : {}
+}
+
+/** 项目列表（按创建时间先后），不含密码等敏感字段（项目本身不含） */
+export function listProjects() {
+  return Object.values(projectsMap())
+    .filter(p => p && typeof p === 'object' && p.id)
+    .sort((a, b) => String(a.createdAt || '').localeCompare(String(b.createdAt || '')))
+}
+
+/** 读取单个项目（不存在返回 null） */
+export function getProject(id) {
+  const p = projectsMap()[String(id || '')]
+  return p && typeof p === 'object' ? p : null
+}
+
+/** 校验并规范化项目（部分字段可缺省，便于增量保存） */
+function normalizeProject(input, { partial = false } = {}) {
+  if (!input || typeof input !== 'object') throw projectIdError('项目配置格式非法（应为对象）')
+  const out = {}
+
+  if (input.name !== undefined || !partial) {
+    const name = String(input.name == null ? '' : input.name).trim()
+    if (!name) throw projectIdError('项目名称不能为空')
+    out.name = name.slice(0, PROJECT_NAME_MAX)
+  }
+  if (input.description !== undefined) {
+    out.description = String(input.description == null ? '' : input.description).trim().slice(0, PROJECT_DESC_MAX)
+  }
+  if (input.dbSlot !== undefined) {
+    if (!DB_SLOTS.includes(input.dbSlot)) {
+      throw projectIdError(`项目绑定的数据库槽位非法：${input.dbSlot || '(空)'}（可选：${DB_SLOTS.join(' / ')}）`)
+    }
+    out.dbSlot = input.dbSlot
+  }
+  if (input.queries !== undefined) {
+    // null 表示清空取数模板（项目暂不取数，回退仿真）
+    out.queries = input.queries === null ? null : normalizeQueries(input.queries)
+  }
+  if (input.params !== undefined) {
+    if (!Array.isArray(input.params)) throw projectIdError('项目参数应为数组')
+    // 参数未显式填工艺死区时继承全局默认值（宽表列名校验在目录级 validateCatalog 做）
+    const globalDeadband = (() => {
+      try {
+        const m = savedMeta()
+        return m.deadbandPctDefault !== undefined ? m.deadbandPctDefault : 10
+      } catch { return 10 }
+    })()
+    const params = normalizeParams(input.params, { deadbandPctDefault: globalDeadband })
+    // 项目绑定数据库：所有参数的 dbSlot 统一为项目槽位（保持逐参数路由逻辑可用）
+    const slot = out.dbSlot || input._projectDbSlot
+    out.params = slot ? params.map(p => ({ ...p, dbSlot: slot })) : params
+  }
+  return out
+}
+
+/** 新建监测项目，返回创建后的项目 */
+export function createProject(input) {
+  const patch = normalizeProject(input, { partial: false })
+  if (!patch.dbSlot) patch.dbSlot = 'db1'
+  const cur = readConfig(true)
+  const projects = { ...(cur.projects || {}) }
+  const id = genProjectId()
+  const now = new Date().toISOString()
+  projects[id] = { id, ...patch, createdAt: now, updatedAt: now }
+  persist({ ...cur, projects })
+  return projects[id]
+}
+
+/** 更新监测项目（只覆盖传入的字段），返回更新后的项目 */
+export function updateProject(id, input) {
+  const cur = readConfig(true)
+  const projects = { ...(cur.projects || {}) }
+  const existing = projects[String(id || '')]
+  if (!existing || typeof existing !== 'object') throw projectIdError(`监测项目不存在：${id || '(空)'}`)
+  const slotForParams = input && input.dbSlot !== undefined ? input.dbSlot : existing.dbSlot
+  const patch = normalizeProject(
+    { ...input, _projectDbSlot: slotForParams },
+    { partial: true }
+  )
+  projects[existing.id] = { ...existing, ...patch, id: existing.id, updatedAt: new Date().toISOString() }
+  persist({ ...cur, projects })
+  return projects[existing.id]
+}
+
+/** 删除监测项目（默认项目不可删除，只能清空内容） */
+export function deleteProject(id) {
+  const cur = readConfig(true)
+  const projects = { ...(cur.projects || {}) }
+  const key = String(id || '')
+  if (key === DEFAULT_PROJECT_ID) throw projectIdError('默认项目不可删除（可在项目内清空参数与模板）')
+  if (!projects[key]) throw projectIdError(`监测项目不存在：${key || '(空)'}`)
+  delete projects[key]
+  persist({ ...cur, projects })
+  return listProjects()
+}
+
+/** 用「种子 + 全局 meta + 项目内容」拼出待校验目录（不落盘）；overrides 可预览保存后的效果 */
+function rawCatalogFor(projectId, overrides) {
+  const seedRaw = readSeedRaw()
+  if (isCatalogFileLocked()) return seedRaw
+  const project = { ...(getProject(projectId) || {}), ...(overrides || {}) }
+  const meta = { ...(savedMeta()) }
+  const seedParams = Array.isArray(seedRaw.params) ? seedRaw.params : []
+  return {
+    ...seedRaw,
+    ...meta,
+    queries: project.queries !== undefined ? project.queries : seedRaw.queries,
+    params: project.params !== undefined ? project.params : seedParams,
+  }
 }
 
 let catalogCache = null
 let catalogCacheKey = ''
 
-/** 校验并返回生效的参数目录（带缓存） */
-export function getEffectiveCatalog(force = false) {
-  const key = `${seedFilePath()}|${configFilePath()}|${revision}`
+/** 校验并返回某个项目的生效目录（带缓存） */
+export function getCatalogForProject(projectId = DEFAULT_PROJECT_ID, force = false) {
+  const key = `${seedFilePath()}|${configFilePath()}|${revision}|${projectId}`
   if (!force && catalogCache && catalogCacheKey === key) return catalogCache
-  const raw = getRawCatalog()
+  const raw = rawCatalogFor(projectId)
   const catalog = validateCatalog(raw, isCatalogFileLocked() ? seedFilePath() : configFilePath())
   catalogCache = catalog
   catalogCacheKey = key
   return catalog
+}
+
+/** 校验并返回生效的参数目录（默认项目；兼容历史调用签名 getEffectiveCatalog(force)） */
+export function getEffectiveCatalog(force = false) {
+  return getCatalogForProject(DEFAULT_PROJECT_ID, force)
 }
 
 /** 参数目录来源：env-file（环境变量指定文件） | saved（页面保存/种子+覆盖） */
@@ -382,45 +536,67 @@ export function getCatalogOrigin() {
   return isCatalogFileLocked() ? 'env-file' : 'saved'
 }
 
-/** 保存 queries 段 */
-export function saveQueries(input) {
+/** 保存某个项目的 queries 段（projectId 缺省 = 默认项目，兼容历史调用） */
+export function saveQueries(input, projectId = DEFAULT_PROJECT_ID) {
   if (isCatalogFileLocked()) {
     throw configError('当前由 APC_CATALOG_FILE 指定参数目录文件，页面保存不生效；请先移除该环境变量')
   }
   const queries = normalizeQueries(input)
+  // 先按「保存后」的目录整体校验（例如宽表而参数未配列名时立即拦下），再落盘
+  validateCatalog(rawCatalogFor(projectId, { queries }), configFilePath())
   const cur = readConfig(true)
-  const catalog = { ...(cur.catalog || {}), queries }
-  // 先按「合并后」的目录整体校验（例如种子是宽表而参数未配列名时立即拦下），再落盘
-  validateCatalog(rawCatalogWith(catalog), configFilePath())
-  persist({ ...cur, catalog })
+  const projects = { ...(cur.projects || {}) }
+  const existing = projects[projectId] || {
+    id: projectId, name: DEFAULT_PROJECT_NAME, dbSlot: 'db1', createdAt: new Date().toISOString(),
+  }
+  projects[projectId] = { ...existing, queries, updatedAt: new Date().toISOString() }
+  persist({ ...cur, projects })
   catalogCache = null
   return queries
 }
 
-/** 保存 params 段 */
-export function saveParams(input) {
+/** 保存某个项目的 params 段（projectId 缺省 = 默认项目，兼容历史调用） */
+export function saveParams(input, projectId = DEFAULT_PROJECT_ID) {
   if (isCatalogFileLocked()) {
     throw configError('当前由 APC_CATALOG_FILE 指定参数目录文件，页面保存不生效；请先移除该环境变量')
   }
-  let mode = 'long'
-  let deadbandPctDefault = 10
-  try {
-    const eff = getEffectiveCatalog()
-    deadbandPctDefault = eff.deadbandPctDefault
-    if (eff.queries && eff.queries.mode) mode = eff.queries.mode
-  } catch { /* 现有目录不合法时按窄表校验，下面整体校验会给出准确报错 */ }
+  const project = getProject(projectId)
+  const mode = (() => {
+    try {
+      const q = project && project.queries ? project.queries : (input && input.queries) || null
+      if (q && q.mode) return q.mode
+      const eff = getEffectiveCatalog()
+      if (eff.queries && eff.queries.mode) return eff.queries.mode
+    } catch { /* 现有目录不合法时按窄表校验，下面整体校验会给出准确报错 */ }
+    return 'long'
+  })()
+  const deadbandPctDefault = (() => {
+    try { return getEffectiveCatalog().deadbandPctDefault } catch { return 10 }
+  })()
 
   // 参数未显式填工艺死区时，要继承目录级默认值，避免保存一次就被重置成 10%
   const params = normalizeParams(Array.isArray(input) ? input : [], { mode, deadbandPctDefault })
   const cur = readConfig(true)
-  const catalog = { ...(cur.catalog || {}), params }
-  validateCatalog(rawCatalogWith(catalog), configFilePath())
-  persist({ ...cur, catalog })
+  const projects = { ...(cur.projects || {}) }
+  const existing = projects[projectId] || {
+    id: projectId, name: DEFAULT_PROJECT_NAME, dbSlot: 'db1', createdAt: new Date().toISOString(),
+  }
+  // 项目绑定数据库：参数的 dbSlot 统一为项目槽位
+  const slot = existing.dbSlot || 'db1'
+  const slotParams = params.map(p => ({ ...p, dbSlot: slot }))
+  // 先按「保存后」的目录整体校验（例如宽表而参数未配列名时立即拦下），再落盘
+  validateCatalog(rawCatalogFor(projectId, { params: slotParams }), configFilePath())
+  projects[projectId] = {
+    ...existing,
+    params: slotParams,
+    updatedAt: new Date().toISOString(),
+  }
+  persist({ ...cur, projects })
   catalogCache = null
-  return params
+  return projects[projectId].params
 }
 
-/** 保存 meta（装置名 / 采样间隔 / 默认窗口 / 默认死区） */
+/** 保存 meta（装置名 / 采样间隔 / 默认窗口 / 默认死区）——全局公用，不属于任何项目 */
 export function saveMeta(input) {
   if (isCatalogFileLocked()) {
     throw configError('当前由 APC_CATALOG_FILE 指定参数目录文件，页面保存不生效；请先移除该环境变量')
@@ -445,10 +621,34 @@ export function saveMeta(input) {
   }
   if (Object.keys(patch).length === 0) throw configError('没有可保存的目录元信息')
   const cur = readConfig(true)
-  const next = { ...cur, catalog: { ...(cur.catalog || {}), ...patch } }
+  const next = { ...cur, meta: { ...(cur.meta || {}), ...patch } }
   persist(next)
   catalogCache = null
   return patch
+}
+
+/** 保存问答/取数公用限制（chatRows：问答直查行数上限） */
+export function saveLimits(input) {
+  if (!input || typeof input !== 'object') throw configError('限制配置格式非法（应为对象）')
+  const patch = {}
+  if (input.chatRows !== undefined) {
+    const v = Math.round(num(input.chatRows, NaN))
+    if (!Number.isFinite(v) || v < 1 || v > 5000) throw configError('问答直查行数上限需在 1 ~ 5000 行之间')
+    patch.chatRows = v
+  }
+  if (Object.keys(patch).length === 0) throw configError('没有可保存的限制配置项')
+  const cur = readConfig(true)
+  const next = { ...cur, limits: { ...(cur.limits || {}), ...patch } }
+  persist(next)
+  return next.limits
+}
+
+/** 生效的问答直查限制（页面保存值 > 默认） */
+export function getEffectiveLimits() {
+  const saved = savedLimits()
+  return {
+    chatRows: Math.max(1, Math.round(num(saved.chatRows, DEFAULT_CHAT_ROWS))),
+  }
 }
 
 // ===== 整体视图（给页面用）=====
@@ -463,7 +663,6 @@ export function getConfigForClient() {
   const catalogError = getConfigFileError()
 
   const databases = getDatabases()
-  const activeId = getActiveDatabaseId()
   const slots = DB_SLOTS.map(id => {
     const eff = getEffectiveHanaConfig(id)
     const slotSaved = (readConfig().databases || {})[id] || {}
@@ -497,6 +696,18 @@ export function getConfigForClient() {
   }
   envValues.passwordSet = Boolean(env.password)
 
+  // 项目摘要列表（不含 queries/params 全文，详情走 /api/apc/projects）
+  const projects = listProjects().map(p => ({
+    id: p.id,
+    name: p.name,
+    description: p.description || '',
+    dbSlot: p.dbSlot || 'db1',
+    paramCount: Array.isArray(p.params) ? p.params.length : 0,
+    hasQueries: Boolean(p.queries && p.queries.history),
+    createdAt: p.createdAt || null,
+    updatedAt: p.updatedAt || null,
+  }))
+
   return {
     configFile: file,
     configFileExists: fs.existsSync(file),
@@ -505,7 +716,7 @@ export function getConfigForClient() {
     catalogFileLocked: isCatalogFileLocked(),
     seedFile: seedFilePath(),
     database: {
-      activeId,
+      /** 连接按槽位保存（公用配置，在「数据库管理」页维护） */
       slots,
       envConfigured: Boolean(env.host && env.user),
       envValues,
@@ -519,6 +730,8 @@ export function getConfigForClient() {
         useLimit: true,
       },
     },
+    limits: getEffectiveLimits(),
+    projects,
     queries: catalog ? catalog.queries : null,
     params: catalog ? catalog.params : [],
     meta: catalog
@@ -535,16 +748,17 @@ export function getConfigForClient() {
 
 // ===== 重置 =====
 
-export const RESET_SECTIONS = ['database', 'queries', 'params', 'meta']
+export const RESET_SECTIONS = ['database', 'queries', 'params', 'meta', 'limits']
 
-/** meta 段在配置文件里是平铺存放的（saveMeta 直接把键合进 catalog） */
+/** meta 段的四个键（存放在顶层 meta 里） */
 const META_KEYS = ['station', 'sampleIntervalSec', 'defaultWindowMinutes', 'deadbandPctDefault']
 
 /** 把某一段恢复为「种子文件 / 环境变量」提供的默认值
  * @param {string} section
  * @param {string} [databaseId] 仅 reset 'database' 时有效：指定清空某个槽位；缺省清空全部槽位
+ * @param {string} [projectId] 仅 reset 'queries'/'params' 时有效：指定项目；缺省 = 默认项目
  */
-export function resetSection(section, databaseId) {
+export function resetSection(section, databaseId, projectId = DEFAULT_PROJECT_ID) {
   const key = String(section || '').trim()
   if (!RESET_SECTIONS.includes(key)) {
     throw configError(`不支持重置的配置段：${key || '(空)'}（可选：${RESET_SECTIONS.join(' / ')}）`)
@@ -562,12 +776,21 @@ export function resetSection(section, databaseId) {
     } else {
       next.databases = {}
     }
+  } else if (key === 'meta') {
+    // meta 四个键要一起删，否则重置后装置名/采样间隔仍停留在页面取值
+    const meta = { ...(cur.meta || {}) }
+    for (const k of META_KEYS) delete meta[k]
+    next.meta = meta
+  } else if (key === 'limits') {
+    next.limits = {}
   } else {
-    const catalog = { ...(cur.catalog || {}) }
-    // meta 平铺：四个键要一起删，否则重置后装置名/采样间隔仍停留在页面取值
-    const targets = key === 'meta' ? META_KEYS : [key]
-    for (const k of targets) delete catalog[k]
-    next.catalog = catalog
+    // queries / params：清空指定项目（缺省默认项目）的对应段
+    const projects = { ...(cur.projects || {}) }
+    const existing = projects[projectId] || {
+      id: projectId, name: DEFAULT_PROJECT_NAME, dbSlot: 'db1', createdAt: new Date().toISOString(),
+    }
+    projects[projectId] = { ...existing, [key]: key === 'params' ? [] : null, updatedAt: new Date().toISOString() }
+    next.projects = projects
   }
   persist(next)
   catalogCache = null

@@ -148,6 +148,13 @@ export function normalizeParam(p, index, opts = {}) {
 
   const deadbandDefault = num(opts.deadbandPctDefault, 10)
 
+  // 该参数的数据取自哪个数据库系统（db1 / db2）。
+  // 不再使用全局「当前使用」开关——每个参数项各自绑定数据源，允许一部分参数取自 db1、另一部分取自 db2。
+  const dbSlot = p.dbSlot == null || p.dbSlot === '' ? 'db1' : String(p.dbSlot)
+  if (dbSlot !== 'db1' && dbSlot !== 'db2') {
+    throw configError(`参数 ${code} 的使用数据库非法（应为 db1 或 db2）：${dbSlot}`)
+  }
+
   return {
     code,
     name: String(p.name == null || p.name === '' ? code : p.name),
@@ -166,6 +173,7 @@ export function normalizeParam(p, index, opts = {}) {
     processGain: num(p.processGain, 1) || 1,
     // 宽表模式下的取值列名；窄表模式留空（由 columns.code 决定分组）
     column: p.column ? assertIdent(p.column, `参数 ${code} 的数据列名`) : '',
+    dbSlot,
     sim: p.sim && typeof p.sim === 'object' ? p.sim : {},
   }
 }

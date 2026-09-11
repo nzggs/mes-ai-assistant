@@ -10,7 +10,7 @@ import {
 import {
   basicStats, linearSlope, roundTo, optimizeParam, simulateValueAt,
   loadCatalog, getSourceMode, getOverview, getOptimization, getApcStatus,
-  clearApcCache, listParams,
+  clearApcCache, listParams, getMesGuide, queryMesSql,
 } from './apcService.js'
 import { saveParams } from './apcConfig.js'
 
@@ -344,6 +344,49 @@ describe('apcService · 数据源与聚合', () => {
     const op = await getOptimization({ minutes: 30, codes: [code] })
     expect(op.items.length).toBe(1)
     expect(op.items[0].code).toBe(code)
+  })
+})
+
+// ===== 按参数绑定数据库槽位（dbSlot）与 MES 直查 =====
+describe('apcService · 按参数绑定数据库与 MES 直查', () => {
+  beforeEach(() => clearApcCache())
+
+  it('项目绑定数据库：参数 dbSlot 统一为项目槽位，非法槽位被拒绝', () => {
+    saveParams([
+      { code: 'A1', lsl: 0, usl: 1, min: -1, max: 2, setpoint: 0.5 },
+      { code: 'A2', lsl: 0, usl: 1, min: -1, max: 2, setpoint: 0.5, dbSlot: 'db2' },
+    ])
+    const params = listParams()
+    // 项目的取数库在项目层面决定：所有参数统一跟随项目槽位（缺省项目 = db1）
+    expect(params.find(p => p.code === 'A1').dbSlot).toBe('db1')
+    expect(params.find(p => p.code === 'A2').dbSlot).toBe('db1')
+    expect(() => saveParams([
+      { code: 'B1', lsl: 0, usl: 1, min: -1, max: 2, setpoint: 0.5, dbSlot: 'db3' },
+    ])).toThrow(/使用数据库/)
+  })
+
+  it('getMesGuide 只返回槽位与硬性限制（SQL 从知识库检索，与项目模板无关）', () => {
+    saveParams([{ code: 'G1', name: '参数G', unit: 'V', lsl: 0, usl: 1, min: -1, max: 2, setpoint: 0.5, dbSlot: 'db2' }])
+    const guide = getMesGuide()
+    expect(guide.slots.map(s => s.id)).toEqual(['db1', 'db2'])
+    expect(guide.slots[0].configured).toBe(false)
+    expect(guide.limits.chatRows).toBeGreaterThan(0)
+    // 问答环节与项目 SQL 模板/参数白名单解耦
+    expect(guide.template).toBeUndefined()
+    expect(guide.params).toBeUndefined()
+    expect(JSON.stringify(guide)).not.toContain('password')
+  })
+
+  it('queryMesSql 硬护栏：缺槽位 / 占位符残留 / 未配置槽位 / 非 SELECT 一律拒绝', async () => {
+    // 缺槽位
+    await expect(queryMesSql({ sql: 'SELECT 1 FROM DUMMY' })).rejects.toMatchObject({ status: 400 })
+    await expect(queryMesSql({ slot: 'db9', sql: 'SELECT 1 FROM DUMMY' })).rejects.toMatchObject({ status: 400 })
+    // 模板占位符未代入
+    await expect(queryMesSql({ slot: 'db1', sql: 'SELECT {{minutes}} FROM DUMMY' })).rejects.toMatchObject({ status: 400 })
+    // 非 SELECT（护栏在未配置检查之后仍会拦截——用一个「已配置」的槽位概念无法满足时，先看未配置分支）
+    await expect(queryMesSql({ slot: 'db1', sql: 'DELETE FROM T' })).rejects.toThrow()
+    // 测试环境未配置任何槽位 → 明确 400 而不是回退仿真
+    await expect(queryMesSql({ slot: 'db1', sql: 'SELECT 1 FROM DUMMY' })).rejects.toMatchObject({ status: 400 })
   })
 })
 

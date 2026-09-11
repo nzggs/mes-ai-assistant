@@ -19,11 +19,16 @@
  * 驱动为 hdb（SAP 官方纯 JS 实现），动态 require，未安装时不影响服务启动。
  */
 import { createRequire } from 'module'
-import { getEffectiveHanaConfig, isDataSourceConfigured } from './apcConfig.js'
+import { getEffectiveHanaConfig, isDataSourceConfigured, isAnyDatabaseConfigured } from './apcConfig.js'
 import { assertReadOnlySql, applyRowLimit, stripSqlComments } from './sqlGuard.js'
 
 // 只读护栏与模板工具统一放在 sqlGuard.js（纯函数，零依赖），此处再导出以保持既有引用可用
 export { assertReadOnlySql, applyRowLimit, stripSqlComments, maskSql } from './sqlGuard.js'
+// 槽位级「是否已配置」判断来自 apcConfig，这里再导出供 apcService 等既有引用使用
+export { isDataSourceConfigured } from './apcConfig.js'
+
+/** 数据库槽位列表（与 apcConfig 保持一致：两个数据库系统） */
+const DB_SLOTS = ['db1', 'db2']
 
 const require = createRequire(import.meta.url)
 
@@ -65,37 +70,55 @@ export function getHanaConfig(id) {
   return getEffectiveHanaConfig(id)
 }
 
-/** 是否已完成 HANA 连接配置（host + user 齐备即视为已配置） */
-export function isHanaConfigured() {
-  return isDataSourceConfigured()
+/** 是否已完成 HANA 连接配置（任一槽位 host + user 齐备即视为已配置）
+ * @param {string} [id] 传槽位 id 则只判断该槽位
+ */
+export function isHanaConfigured(id) {
+  if (id) return isDataSourceConfigured(id)
+  return isAnyDatabaseConfigured()
 }
 
 // ===== SQL 只读护栏 =====
 // 已统一迁移到 server/sqlGuard.js（assertReadOnlySql / applyRowLimit / stripSqlComments / maskSql）。
 // 本文件在顶部 import 使用，并原样再导出以兼容既有引用；新增取数 SQL 也必须过同一层护栏。
 // ===== 连接与执行 =====
+// 每个数据库槽位（db1/db2）各自维护一条共享连接 + 独立串行队列：
+// 两个系统的连接互不阻塞，同一槽位内仍然同时只允许一条查询在飞。
 
-let client = null
-let connecting = null
-let queue = Promise.resolve()
-
-const state = {
-  connected: false,
-  connecting: false,
-  lastError: '',
-  lastConnectAt: 0,
-  lastQueryAt: 0,
-  lastQueryMs: 0,
-  queryCount: 0,
-  abortedCount: 0,
+function newSlotState() {
+  return {
+    client: null,
+    connectPromise: null,
+    queue: Promise.resolve(),
+    connected: false,
+    connecting: false,
+    lastError: '',
+    lastConnectAt: 0,
+    lastQueryAt: 0,
+    lastQueryMs: 0,
+    queryCount: 0,
+    abortedCount: 0,
+  }
 }
 
-/** 销毁当前连接（超时/异常时调用，确保服务端会话被释放） */
-function destroyClient(reason) {
-  const c = client
-  client = null
-  state.connected = false
-  if (reason) state.lastError = String(reason)
+const slots = new Map()
+
+function slotEntry(id) {
+  const key = DB_SLOTS.includes(id) ? id : 'db1'
+  let entry = slots.get(key)
+  if (!entry) {
+    entry = newSlotState()
+    slots.set(key, entry)
+  }
+  return entry
+}
+
+/** 销毁某个槽位的连接（超时/异常时调用，确保服务端会话被释放） */
+function destroyClient(entry, reason) {
+  const c = entry.client
+  entry.client = null
+  entry.connected = false
+  if (reason) entry.lastError = String(reason)
   if (!c) return
   try {
     if (typeof c.destroy === 'function') c.destroy(new Error(reason || 'reset'))
@@ -103,10 +126,10 @@ function destroyClient(reason) {
   } catch { /* 忽略关闭异常 */ }
 }
 
-/** 队列串行化：同一时刻只有一条查询在飞，避免并发压垮数据源 */
-function withLock(task) {
-  const run = queue.then(task, task)
-  queue = run.then(() => undefined, () => undefined)
+/** 队列串行化：同一槽位同一时刻只有一条查询在飞，避免并发压垮数据源 */
+function withLock(entry, task) {
+  const run = entry.queue.then(task, task)
+  entry.queue = run.then(() => undefined, () => undefined)
   return run
 }
 
@@ -127,32 +150,33 @@ function buildClientOptions(cfg) {
   return opts
 }
 
-async function ensureConnected() {
-  if (client && state.connected) return client
-  if (connecting) {
-    await connecting
-    if (client && state.connected) return client
+async function ensureConnected(id) {
+  const entry = slotEntry(id)
+  if (entry.client && entry.connected) return entry.client
+  if (entry.connectPromise) {
+    await entry.connectPromise
+    if (entry.client && entry.connected) return entry.client
   }
-  if (!isHanaConfigured()) throw new Error('未配置 HANA 数据源（缺少 HANA_HOST / HANA_USER）')
+  const cfg = getHanaConfig(id)
+  if (!cfg.host || !cfg.user) throw new Error(`数据库系统（${id || 'db1'}）未配置连接（缺少地址 / 用户名）`)
 
-  const cfg = getHanaConfig()
   const hdb = loadHdb()
   const opts = buildClientOptions(cfg)
 
   const c = hdb.createClient(opts)
   c.on('error', (err) => {
-    state.connected = false
-    state.lastError = String((err && err.message) || err)
+    entry.connected = false
+    entry.lastError = String((err && err.message) || err)
   })
-  client = c
-  state.connecting = true
+  entry.client = c
+  entry.connecting = true
 
-  connecting = new Promise((resolve, reject) => {
+  entry.connectPromise = new Promise((resolve, reject) => {
     let settled = false
     const timer = setTimeout(() => {
       if (settled) return
       settled = true
-      destroyClient('连接 HANA 超时')
+      destroyClient(entry, '连接 HANA 超时')
       reject(new Error(`连接 HANA 超时（>${cfg.connectTimeoutMs}ms）`))
     }, cfg.connectTimeoutMs)
     if (typeof timer.unref === 'function') timer.unref()
@@ -162,45 +186,47 @@ async function ensureConnected() {
       settled = true
       clearTimeout(timer)
       if (err) {
-        destroyClient((err && err.message) || err)
+        destroyClient(entry, (err && err.message) || err)
         reject(err)
         return
       }
-      state.connected = true
-      state.lastConnectAt = Date.now()
-      state.lastError = ''
+      entry.connected = true
+      entry.lastConnectAt = Date.now()
+      entry.lastError = ''
       resolve()
     })
   })
 
   try {
-    await connecting
+    await entry.connectPromise
   } finally {
-    connecting = null
-    state.connecting = false
+    entry.connectPromise = null
+    entry.connecting = false
   }
-  return client
+  return entry.client
 }
 
 /**
  * 执行一条只读查询。
  * @param {string} sql 必须是 SELECT/WITH 单语句
- * @param {{maxRows?:number, timeoutMs?:number, injectLimit?:boolean}} [opts]
+ * @param {{slotId?:string, maxRows?:number, timeoutMs?:number, injectLimit?:boolean}} [opts]
  * @returns {Promise<{rows:object[], truncated:boolean, sql:string}>}
  */
 export async function queryReadOnly(sql, opts = {}) {
-  const cfg = getHanaConfig()
+  const slotId = DB_SLOTS.includes(opts.slotId) ? opts.slotId : 'db1'
+  const entry = slotEntry(slotId)
+  const cfg = getHanaConfig(slotId)
   const safeSql = assertReadOnlySql(sql)
   const maxRows = Number.isFinite(opts.maxRows) ? opts.maxRows : cfg.maxRows
   const injectLimit = opts.injectLimit === undefined ? cfg.useLimit : Boolean(opts.injectLimit)
   const finalSql = applyRowLimit(safeSql, maxRows, injectLimit)
   const timeoutMs = Number.isFinite(opts.timeoutMs) ? opts.timeoutMs : cfg.statementTimeoutMs
 
-  return withLock(async () => {
+  return withLock(entry, async () => {
     const started = Date.now()
     let c
     try {
-      c = await ensureConnected()
+      c = await ensureConnected(slotId)
     } catch (err) {
       throw new Error(`HANA 连接失败：${(err && err.message) || err}`)
     }
@@ -210,8 +236,8 @@ export async function queryReadOnly(sql, opts = {}) {
       const timer = setTimeout(() => {
         if (settled) return
         settled = true
-        state.abortedCount++
-        destroyClient('查询超时，已强制断开连接')
+        entry.abortedCount++
+        destroyClient(entry, '查询超时，已强制断开连接')
         reject(new Error(`HANA 查询超时（>${timeoutMs}ms），已主动中止以免长期占用数据库`))
       }, timeoutMs)
       if (typeof timer.unref === 'function') timer.unref()
@@ -226,9 +252,9 @@ export async function queryReadOnly(sql, opts = {}) {
     })
 
     const elapsed = Date.now() - started
-    state.lastQueryAt = Date.now()
-    state.lastQueryMs = elapsed
-    state.queryCount++
+    entry.lastQueryAt = Date.now()
+    entry.lastQueryMs = elapsed
+    entry.queryCount++
 
     // 客户端二次硬截断：即使驱动返回超出上限，也不会把超量数据带出本模块
     const capped = Number.isFinite(maxRows) && maxRows > 0 ? rows.slice(0, maxRows) : rows
@@ -247,33 +273,42 @@ export function pickColumn(row, name) {
   return undefined
 }
 
-/** 连接/运行动态，供 /api/apc/status 展示（不含任何凭据） */
+/** 连接/运行动态，供 /api/apc/status 展示（不含任何凭据）。返回每个槽位各自的状态 */
 export function getHanaStatus() {
-  const cfg = getHanaConfig()
   return {
-    configured: isHanaConfigured(),
-    connected: state.connected,
-    connecting: state.connecting,
-    host: cfg.host || '',
-    port: cfg.port,
-    database: cfg.databaseName || '',
-    schema: cfg.schema || '',
-    useTLS: cfg.useTLS,
-    maxRows: cfg.maxRows,
-    statementTimeoutMs: cfg.statementTimeoutMs,
-    lastError: state.lastError,
-    lastConnectAt: state.lastConnectAt || null,
-    lastQueryAt: state.lastQueryAt || null,
-    lastQueryMs: state.lastQueryMs || null,
-    queryCount: state.queryCount,
-    abortedCount: state.abortedCount,
+    configured: isAnyDatabaseConfigured(),
+    slots: DB_SLOTS.map((id) => {
+      const entry = slotEntry(id)
+      const cfg = getHanaConfig(id)
+      return {
+        id,
+        configured: Boolean(cfg.host && cfg.user),
+        connected: entry.connected,
+        connecting: entry.connecting,
+        host: cfg.host || '',
+        port: cfg.port,
+        database: cfg.databaseName || '',
+        schema: cfg.schema || '',
+        useTLS: cfg.useTLS,
+        maxRows: cfg.maxRows,
+        statementTimeoutMs: cfg.statementTimeoutMs,
+        lastError: entry.lastError,
+        lastConnectAt: entry.lastConnectAt || null,
+        lastQueryAt: entry.lastQueryAt || null,
+        lastQueryMs: entry.lastQueryMs || null,
+        queryCount: entry.queryCount,
+        abortedCount: entry.abortedCount,
+      }
+    }),
   }
 }
 
-/** 连通性探测：最轻量的一条只读语句 */
-export async function pingHana() {
-  const cfg = getHanaConfig()
+/** 连通性探测：最轻量的一条只读语句（slotId 指定探测哪个数据库系统） */
+export async function pingHana(slotId) {
+  const id = DB_SLOTS.includes(slotId) ? slotId : 'db1'
+  const cfg = getHanaConfig(id)
   await queryReadOnly('SELECT 1 AS "OK" FROM DUMMY', {
+    slotId: id,
     maxRows: 1,
     timeoutMs: Math.min(cfg.statementTimeoutMs, 8000),
     // 探测语句不注入 LIMIT（部分老版本 HANA 不支持 LIMIT），仅靠客户端硬截断
@@ -282,11 +317,14 @@ export async function pingHana() {
   return true
 }
 
-/** 主动断开连接（进程退出 / 配置变更后重连） */
-export function closeHana() {
-  connecting = null
-  destroyClient('')
-  state.lastError = ''
+/** 主动断开连接（进程退出 / 配置变更后重连）；slotId 缺省时断开全部槽位 */
+export function closeHana(slotId) {
+  const targets = slotId && DB_SLOTS.includes(slotId) ? [slotEntry(slotId)] : [...slots.values()]
+  for (const entry of targets) {
+    entry.connectPromise = null
+    entry.connecting = false
+    destroyClient(entry, '')
+  }
   return Promise.resolve()
 }
 

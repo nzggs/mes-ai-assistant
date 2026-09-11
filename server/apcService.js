@@ -18,10 +18,10 @@
  * 「整数」与「目录内白名单参数编码」，不接受任何客户端传入的裸 SQL。
  */
 import fs from 'fs'
-import { isHanaConfigured, queryReadOnly, getHanaStatus, pickColumn } from './hanaClient.js'
+import { isHanaConfigured, isDataSourceConfigured, queryReadOnly, getHanaStatus, pickColumn } from './hanaClient.js'
 import * as apcConfig from './apcConfig.js'
 import { CODE_RE, normalizeQueries, normalizeParams, queryTemplateWarnings } from './apcCatalog.js'
-import { quoteIdent, renderSqlTemplate, assertIdent } from './sqlGuard.js'
+import { quoteIdent, renderSqlTemplate, assertIdent, assertReadOnlySql, applyRowLimit } from './sqlGuard.js'
 
 // ===== 通用工具 =====
 
@@ -118,11 +118,11 @@ function catalogFile() {
   return apcConfig.isCatalogFileLocked() ? apcConfig.seedFilePath() : apcConfig.configFilePath()
 }
 
-/** 读取参数目录（带缓存；force=true 强制重载，供测试与热更新使用） */
-export function loadCatalog(force = false) {
+/** 读取参数目录（带缓存；force=true 强制重载；projectId 指定监测项目，缺省默认项目） */
+export function loadCatalog(force = false, projectId = apcConfig.DEFAULT_PROJECT_ID) {
   catalogError = ''
   try {
-    return apcConfig.getEffectiveCatalog(force)
+    return apcConfig.getCatalogForProject(projectId, force)
   } catch (err) {
     catalogError = String((err && err.message) || err)
     throw new Error(`加载 APC 参数目录失败：${catalogError}`)
@@ -137,20 +137,21 @@ export function isApcEnabled() {
   return toBool(process.env.APC_ENABLED, true)
 }
 
-/** 当前数据源模式：配置了 HANA 且有取数模板 → hana，否则 simulated */
-export function getSourceMode() {
-  const cat = loadCatalog()
+/** 当前数据源模式：项目配了取数模板且目标库已配置 → hana，否则 simulated。
+ * 全局口径：任一槽位已配置即视为 hana（个别参数绑定的槽位未配置时，该参数自动回退仿真）。 */
+export function getSourceMode(projectId = apcConfig.DEFAULT_PROJECT_ID) {
+  const cat = loadCatalog(false, projectId)
   const hasTemplate = Boolean(cat.queries && cat.queries.history)
   return isHanaConfigured() && hasTemplate ? 'hana' : 'simulated'
 }
 
-export function listParams() {
-  return loadCatalog().params
+export function listParams(projectId = apcConfig.DEFAULT_PROJECT_ID) {
+  return loadCatalog(false, projectId).params
 }
 
-export function findParam(code) {
+export function findParam(code, projectId = apcConfig.DEFAULT_PROJECT_ID) {
   const target = String(code || '').trim()
-  return loadCatalog().params.find((p) => p.code === target) || null
+  return loadCatalog(false, projectId).params.find((p) => p.code === target) || null
 }
 
 // ===== SQL 模板拼装（占位符仅接受整数与白名单标识符）=====
@@ -214,8 +215,9 @@ export function buildHistorySql(cat, { minutes, limit, codes, params }) {
  *
  * @param {{queries?:object, params?:object[], minutes?:number, maxRows?:number}} input
  */
-export async function previewQuery({ queries, params, minutes, maxRows } = {}) {
+export async function previewQuery({ queries, params, minutes, maxRows, slot } = {}) {
   const cat = loadCatalog()
+  const slotId = slot === 'db2' ? 'db2' : 'db1'
   // 先做纯文本校验（只读护栏 / 占位符 / 列名 / 参数结构）——这些不需要连库，
   // 因此在「还没配好数据库」时也能先帮使用者把 SQL 本身的问题挑出来，
   // 而不是一律回「未配置连接」把真正的原因盖掉。
@@ -230,8 +232,8 @@ export async function previewQuery({ queries, params, minutes, maxRows } = {}) {
     ? normalizeParams(params, { mode: draftQueries.mode })
     : cat.params
 
-  if (!isHanaConfigured()) {
-    const err = new Error('尚未配置只读数据库连接，无法试运行 SQL；请先在「数据库登录」窗口填写连接信息并保存')
+  if (!isDataSourceConfigured(slotId)) {
+    const err = new Error(`数据库系统（${slotId === 'db2' ? '2' : '1'}）尚未配置连接，无法试运行 SQL；请先在侧边栏「数据库管理」填写连接信息并保存`)
     err.status = 400
     throw err
   }
@@ -248,7 +250,7 @@ export async function previewQuery({ queries, params, minutes, maxRows } = {}) {
   const sqlText = renderSqlTemplate(draftQueries.history, vars)
 
   const started = Date.now()
-  const { rows, truncated } = await queryReadOnly(sqlText, { maxRows: cap })
+  const { rows, truncated } = await queryReadOnly(sqlText, { maxRows: cap, slotId })
   return {
     ok: true,
     mode: draftQueries.mode,
@@ -369,7 +371,8 @@ function normalizeWideSeries(rows, tsColumn, params) {
  * @returns {Promise<{mode:string, series:Map<string,{t:number,v:number}[]>, meta:object}>}
  */
 export async function fetchProcessSeries(options = {}) {
-  const cat = loadCatalog()
+  const projectId = options.project || apcConfig.DEFAULT_PROJECT_ID
+  const cat = loadCatalog(false, projectId)
   const now = Date.now()
   const minutes = Math.max(1, Math.round(num(options.minutes, cat.defaultWindowMinutes)))
   const requested = Array.isArray(options.codes) && options.codes.length > 0
@@ -378,7 +381,7 @@ export async function fetchProcessSeries(options = {}) {
   // 只允许目录内已定义的编码，杜绝任意编码进入 SQL
   const codes = requested.filter((c) => CODE_RE.test(c) && cat.params.some((p) => p.code === c))
 
-  const mode = getSourceMode()
+  const mode = getSourceMode(projectId)
 
   if (mode === 'simulated') {
     const series = new Map()
@@ -401,12 +404,44 @@ export async function fetchProcessSeries(options = {}) {
 
   const maxRows = Math.max(50, Math.round(num(options.maxRows, Number(process.env.HANA_MAX_ROWS || 2000))))
   const selectedParams = cat.params.filter(p => codes.includes(p.code))
-  const sql = buildHistorySql(cat, { minutes, limit: maxRows, codes, params: selectedParams })
-  const { rows, truncated } = await queryReadOnly(sql, { maxRows })
+
+  // 按参数各自绑定的数据库槽位分组取数：dbSlot 缺省视为 db1。
+  // 每个槽位独立一条连接 + 串行队列，两个系统的查询互不阻塞。
+  // 某参数绑定的槽位未配置连接时，该参数回退仿真值（其余参数照常走库）。
+  const bySlot = new Map()
+  for (const p of selectedParams) {
+    const slotId = p.dbSlot === 'db2' ? 'db2' : 'db1'
+    if (!bySlot.has(slotId)) bySlot.set(slotId, [])
+    bySlot.get(slotId).push(p)
+  }
+
   const cols = (cat.queries && cat.queries.columns) || {}
-  const series = cat.queries && cat.queries.mode === 'wide'
-    ? normalizeWideSeries(rows, cols.ts || 'TS', selectedParams)
-    : normalizeSeries(rows, cols.code || 'PARAM_CODE', cols.ts || 'TS', cols.value || 'VALUE')
+  const series = new Map()
+  let totalRows = 0
+  let truncated = false
+  const skippedSlots = []
+  const usedSlots = []
+
+  for (const [slotId, slotParams] of bySlot) {
+    if (!isDataSourceConfigured(slotId)) {
+      skippedSlots.push(slotId)
+      for (const p of slotParams) {
+        series.set(p.code, simulateSeries(p, { minutes, sampleIntervalSec: cat.sampleIntervalSec, now }))
+      }
+      continue
+    }
+    usedSlots.push(slotId)
+    const slotCodes = slotParams.map(p => p.code)
+    const sql = buildHistorySql(cat, { minutes, limit: maxRows, codes: slotCodes, params: slotParams })
+    const { rows, truncated: t } = await queryReadOnly(sql, { maxRows, slotId })
+    totalRows += rows.length
+    truncated = truncated || t
+    const part = cat.queries && cat.queries.mode === 'wide'
+      ? normalizeWideSeries(rows, cols.ts || 'TS', slotParams)
+      : normalizeSeries(rows, cols.code || 'PARAM_CODE', cols.ts || 'TS', cols.value || 'VALUE')
+    for (const [code, points] of part) series.set(code, points)
+  }
+
   return {
     mode,
     series,
@@ -414,8 +449,10 @@ export async function fetchProcessSeries(options = {}) {
     meta: {
       windowMinutes: minutes,
       sampleIntervalSec: cat.sampleIntervalSec,
-      rowCount: rows.length,
+      rowCount: totalRows,
       truncated,
+      usedSlots,
+      skippedSlots,
     },
   }
 }
@@ -684,15 +721,18 @@ function cacheTtl() {
 // ===== 对外聚合接口 =====
 
 /** 参数概览：当前值、统计量、趋势、状态（含压缩曲线） */
-export async function getOverview({ minutes } = {}) {
-  const cat = loadCatalog()
+export async function getOverview({ minutes, project } = {}) {
+  const projectId = project || apcConfig.DEFAULT_PROJECT_ID
+  const cat = loadCatalog(false, projectId)
   const ttl = cacheTtl()
-  const key = `overview:${minutes || 'default'}`
+  const key = `overview:${projectId}:${minutes || 'default'}`
   const loader = async () => {
     const started = Date.now()
-    const { mode, series, meta } = await fetchProcessSeries({ minutes })
+    const { mode, series, meta } = await fetchProcessSeries({ minutes, project: projectId })
     const params = cat.params.map((p) => optimizeParam(p, series.get(p.code) || [], { sparkPoints: 60 }))
     return {
+      project: projectId,
+      projectName: (apcConfig.getProject(projectId) || {}).name || '',
       station: cat.station,
       mode,
       generatedAt: new Date().toISOString(),
@@ -710,12 +750,13 @@ export async function getOverview({ minutes } = {}) {
 }
 
 /** 优化建议：按紧急度排序，只返回需要动作或需要关注的项 */
-export async function getOptimization({ minutes, codes } = {}) {
-  const cat = loadCatalog()
+export async function getOptimization({ minutes, codes, project } = {}) {
+  const projectId = project || apcConfig.DEFAULT_PROJECT_ID
+  const cat = loadCatalog(false, projectId)
   const ttl = cacheTtl()
-  const key = `optimize:${minutes || 'default'}:${(codes || []).join(',')}`
+  const key = `optimize:${projectId}:${minutes || 'default'}:${(codes || []).join(',')}`
   const loader = async () => {
-    const { mode, series, meta } = await fetchProcessSeries({ minutes, codes })
+    const { mode, series, meta } = await fetchProcessSeries({ minutes, codes, project: projectId })
     const all = cat.params.map((p) => optimizeParam(p, series.get(p.code) || [], { sparkPoints: 72 }))
     const order = { high: 0, medium: 1, low: 2, none: 3 }
     const items = all
@@ -726,6 +767,8 @@ export async function getOptimization({ minutes, codes } = {}) {
         return (b.recommendation.confidence - a.recommendation.confidence)
       })
     return {
+      project: projectId,
+      projectName: (apcConfig.getProject(projectId) || {}).name || '',
       station: cat.station,
       mode,
       generatedAt: new Date().toISOString(),
@@ -749,17 +792,18 @@ export async function getOptimization({ minutes, codes } = {}) {
 }
 
 /** 单个参数的历史曲线（供详情面板） */
-export async function getHistory({ code, minutes } = {}) {
-  const param = findParam(code)
+export async function getHistory({ code, minutes, project } = {}) {
+  const projectId = project || apcConfig.DEFAULT_PROJECT_ID
+  const param = findParam(code, projectId)
   if (!param) {
     const err = new Error(`未找到参数：${code}`)
     err.status = 404
     throw err
   }
   const ttl = cacheTtl()
-  const key = `history:${param.code}:${minutes || 'default'}`
+  const key = `history:${projectId}:${param.code}:${minutes || 'default'}`
   const loader = async () => {
-    const { mode, series, meta } = await fetchProcessSeries({ minutes, codes: [param.code] })
+    const { mode, series, meta } = await fetchProcessSeries({ minutes, codes: [param.code], project: projectId })
     const points = series.get(param.code) || []
     const values = points.map((p) => p.v)
     const stats = basicStats(values)
@@ -801,19 +845,24 @@ export async function getHistory({ code, minutes } = {}) {
 function describeSource(mode, meta) {
   if (mode === 'hana') {
     const wide = meta && meta.queryMode === 'wide'
+    const skipped = Array.isArray(meta && meta.skippedSlots) ? meta.skippedSlots : []
+    const skippedNote = skipped.length > 0
+      ? `（数据库系统 ${skipped.map((s) => s.replace('db', '')).join('、')} 未配置连接，绑定这些系统的参数展示仿真数据）`
+      : ''
     return {
-      label: `SAP HANA（只读 · ${wide ? '宽表取数' : '窄表取数'}）`,
+      label: `SAP HANA（只读 · ${wide ? '宽表取数' : '窄表取数'} · 按参数绑定数据库系统）`,
       note:
-        '实时读取 HANA 中记录的过程数据列值；仅执行 SELECT，单次读取行数与执行时间均受服务端限制。' +
-        `当前取数模式：${wide ? '宽表（一行一个时间戳，各参数各占一列）' : '窄表（一行一个参数值，按编码列分组）'}。`,
+        '实时读取 HANA 中记录的过程数据列值；每个参数项各自绑定使用数据库系统 1 或 2，仅执行 SELECT，' +
+        '单次读取行数与执行时间均受服务端限制。' +
+        `当前取数模式：${wide ? '宽表（一行一个时间戳，各参数各占一列）' : '窄表（一行一个参数值，按编码列分组）'}。${skippedNote}`,
       simulated: false,
     }
   }
   return {
     label: '内置仿真数据源',
     note:
-      '未检测到可用的数据库配置，当前展示内置仿真过程数据（仅用于功能验证与演示）。' +
-      '可在「数据源配置 → 数据库登录」窗口中直接填写连接信息并保存，保存后立即生效，无需重启服务。',
+      '未检测到可用的数据库配置或项目未配置取数模板，当前展示内置仿真过程数据（仅用于功能验证与演示）。' +
+      '可在侧边栏「数据库管理」填写连接信息，或在项目的「SQL 模板」中配置取数语句，保存后立即生效，无需重启服务。',
     simulated: true,
   }
 }
@@ -826,12 +875,21 @@ export function getApcStatus() {
   } catch (err) {
     catalogError = String((err && err.message) || err)
   }
+  const projects = apcConfig.listProjects().map(p => ({
+    id: p.id,
+    name: p.name,
+    description: p.description || '',
+    dbSlot: p.dbSlot || 'db1',
+    paramCount: Array.isArray(p.params) ? p.params.length : 0,
+    hasQueries: Boolean(p.queries && p.queries.history),
+  }))
   return {
     enabled: isApcEnabled(),
     mode: cat ? getSourceMode() : 'unavailable',
     station: cat ? cat.station : '',
     paramCount: cat ? cat.params.length : 0,
     queryMode: cat && cat.queries ? cat.queries.mode : null,
+    projects,
     catalogFile: catalogFile(),
     catalogOrigin: apcConfig.getCatalogOrigin(),
     catalogFileLocked: apcConfig.isCatalogFileLocked(),
@@ -840,5 +898,110 @@ export function getApcStatus() {
     configFileExists: fs.existsSync(apcConfig.configFilePath()),
     configFileError: apcConfig.getConfigFileError(),
     hana: getHanaStatus(),
+  }
+}
+
+// ===== 问答（聊天）中的 MES 数据直查 =====
+//
+// 用户在问答栏选择「数据库1 / 数据库2」后，模型可以输出一个 ```mes-sql 代码块（推荐 SQL），
+// 前端把它提交到 /api/mes/query，由服务端按「数据库管理」里的硬性要求执行：
+//   ① 只允许单条 SELECT / WITH（assertReadOnlySql，拦截一切 DML/DDL/多语句）
+//   ② 行数硬上限（chatRows 可在「数据库管理」配置，且不超过槽位 maxRows）
+//   ③ 连接超时 / 语句超时均取槽位配置，超时即销毁会话
+//   ④ 未配置的槽位直接拒绝（不回退仿真——聊天要的是真实数据，仿真会误导）
+// 问答环节与监测项目的 SQL 模板无关：SQL 由模型从知识库上下文中检索/改写得到。
+
+/** 聊天场景行数上限的兜底默认值（实际生效值在 apcConfig.getEffectiveLimits().chatRows） */
+const MES_CHAT_MAX_ROWS = 100
+
+/** 供前端构建 MES 直查指引与下拉菜单的非敏感信息（不含任何凭据） */
+export function getMesGuide() {
+  const databases = apcConfig.getDatabases()
+  const slots = apcConfig.getDatabaseIds().map((id) => ({
+    id,
+    name: databases[id].name || id,
+    configured: isDataSourceConfigured(id),
+  }))
+  const limits = apcConfig.getEffectiveLimits()
+  return {
+    slots,
+    limits: {
+      maxRows: 2000,
+      chatRows: limits.chatRows,
+    },
+    // 注意：问答环节与监测项目的 SQL 模板无关——SQL 从知识库检索获得（由模型结合
+    // 知识库上下文改写），这里只下发可用槽位与硬性限制。
+  }
+}
+
+/**
+ * 在问答环节执行模型推荐的只读 SQL（服务端硬护栏）。
+ * @param {{slot?:string, sql?:string}} input
+ * @returns {Promise<{ok:boolean, slot:string, slotName:string, columns:string[], rows:object[],
+ *   rowCount:number, truncated:boolean, elapsedMs:number, sql:string}>}
+ */
+export async function queryMesSql(input = {}) {
+  const slotId = input.slot === 'db2' ? 'db2' : (input.slot === 'db1' ? 'db1' : '')
+  if (!slotId) {
+    const err = new Error('缺少目标数据库系统（应为 db1 或 db2）')
+    err.status = 400
+    throw err
+  }
+  const databases = apcConfig.getDatabases()
+  const slotName = databases[slotId].name || slotId
+
+  const rawSql = String(input.sql || '')
+  if (!rawSql.trim()) {
+    const err = new Error('缺少要执行的 SQL')
+    err.status = 400
+    throw err
+  }
+  // 模板占位符必须由模型代入具体值后才能提交，不允许把 {{...}} 直接打给数据库
+  if (/\{\{\s*\w+\s*\}\}/.test(rawSql)) {
+    const err = new Error('SQL 仍包含未代入的模板占位符 {{...}}，请先代入具体值（分钟数 / 行数 / 参数编码）')
+    err.status = 400
+    throw err
+  }
+
+  if (!isDataSourceConfigured(slotId)) {
+    const err = new Error(`数据库系统「${slotName}」尚未配置连接，无法查询；请先在侧边栏「数据库管理」完成配置`)
+    err.status = 400
+    throw err
+  }
+
+  const cfg = apcConfig.getEffectiveHanaConfig(slotId)
+  // 硬性要求 ①：只读护栏（剥注释/屏蔽字面量/单条 SELECT/WITH/整词拦截 DML+DDL）
+  const safeSql = assertReadOnlySql(rawSql)
+  // 硬性要求 ②：行数硬上限（取「数据库管理」配置的 chatRows 与槽位 maxRows 的较小值）
+  const chatRows = apcConfig.getEffectiveLimits().chatRows
+  const chatCap = Math.max(1, Math.min(chatRows, Math.round(cfg.maxRows) || chatRows))
+  const finalSql = applyRowLimit(safeSql, chatCap, cfg.useLimit)
+
+  const started = Date.now()
+  try {
+    // 硬性要求 ③：连接/语句超时均走槽位配置（queryReadOnly 内部超时即销毁会话）
+    const { rows, truncated, sql } = await queryReadOnly(finalSql, {
+      slotId,
+      maxRows: chatCap,
+      timeoutMs: cfg.statementTimeoutMs,
+    })
+    const sanitized = rows.map(sanitizeRow)
+    return {
+      ok: true,
+      slot: slotId,
+      slotName,
+      columns: sanitized.length > 0 ? Object.keys(sanitized[0]) : [],
+      rows: sanitized,
+      rowCount: sanitized.length,
+      truncated,
+      elapsedMs: Date.now() - started,
+      sql,
+    }
+  } catch (err) {
+    // 连接失败 / 超时的报错统一加上槽位名，便于用户区分是哪个系统的问题
+    const msg = String((err && err.message) || err)
+    const wrapped = new Error(`数据库系统「${slotName}」查询失败：${msg}`)
+    wrapped.status = err && err.status ? err.status : 502
+    throw wrapped
   }
 }

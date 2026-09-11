@@ -17,11 +17,12 @@ import {
 import { extractPdfTextFromFile } from './pdfExtract.js'
 import { startSummary, getTask, cancelTask, listTasks, recoverSummaryTasks, startTaskCleanup } from './summaryTask.js'
 import { configureSearchIndex, buildIndex, search as searchInIndex, listObjects as listObjectsInIndex, getStatus as getIndexStatus, upsertDocument, removeDocument, hasDocument, pagesOfDoc } from './searchIndex.js'
-import { getApcStatus, getOverview, getOptimization, getHistory, isApcEnabled, clearApcCache, previewQuery } from './apcService.js'
+import { getApcStatus, getOverview, getOptimization, getHistory, isApcEnabled, clearApcCache, previewQuery, getMesGuide, queryMesSql } from './apcService.js'
 import { pingHana, closeHana, getHanaStatus, testHanaConnection } from './hanaClient.js'
 import {
-  getConfigForClient, saveDatabase, saveQueries, saveParams, saveMeta,
-  resetSection, RESET_SECTIONS, setActiveDatabase, DB_SLOTS,
+  getConfigForClient, saveDatabase, saveQueries, saveParams, saveMeta, saveLimits,
+  resetSection, RESET_SECTIONS, DB_SLOTS,
+  listProjects, getProject, createProject, updateProject, deleteProject,
 } from './apcConfig.js'
 import { registerDocIndexRoutes } from './docIndexRoute.js'
 
@@ -1013,11 +1014,11 @@ app.get('/api/apc/status', apcEnabledGuard, (_req, res) => {
   }
 })
 
-/** 参数概览：实时值 + 统计量 + 趋势 */
+/** 参数概览：实时值 + 统计量 + 趋势（?project=<id> 指定监测项目，缺省默认项目） */
 app.get('/api/apc/overview', apcEnabledGuard, apcRateLimit, async (req, res) => {
   try {
     if (boolParam(req.query.refresh)) clearApcCache()
-    res.json(await getOverview({ minutes: parseWindowMinutes(req.query.minutes) }))
+    res.json(await getOverview({ minutes: parseWindowMinutes(req.query.minutes), project: req.query.project }))
   } catch (err) {
     return fail(res, err)
   }
@@ -1029,7 +1030,7 @@ app.get('/api/apc/history', apcEnabledGuard, apcRateLimit, async (req, res) => {
     const code = String(req.query.code || '').trim()
     if (!code) return res.status(400).json({ error: 'code 为必填' })
     if (boolParam(req.query.refresh)) clearApcCache()
-    res.json(await getHistory({ code, minutes: parseWindowMinutes(req.query.minutes) }))
+    res.json(await getHistory({ code, minutes: parseWindowMinutes(req.query.minutes), project: req.query.project }))
   } catch (err) {
     return fail(res, err)
   }
@@ -1042,7 +1043,88 @@ app.get('/api/apc/optimize', apcEnabledGuard, apcRateLimit, async (req, res) => 
       ? req.query.codes.split(',').map(s => s.trim()).filter(Boolean).slice(0, 50)
       : undefined
     if (Boolean(req.query.refresh)) clearApcCache()
-    res.json(await getOptimization({ minutes: parseWindowMinutes(req.query.minutes), codes }))
+    res.json(await getOptimization({ minutes: parseWindowMinutes(req.query.minutes), codes, project: req.query.project }))
+  } catch (err) {
+    return fail(res, err)
+  }
+})
+
+// ===== 监测项目管理（仅管理员）=====
+// 每个项目自带「用哪个数据库 + 用哪个 SQL 模板取数 + 参数怎么设」；
+// 数据库连接与查询限制是公用配置，在「数据库管理」页维护。
+
+/** 项目列表（摘要，不含 queries/params 全文） */
+app.get('/api/apc/projects', apcEnabledGuard, apcRateLimit, (_req, res) => {
+  try {
+    res.json({ projects: listProjects() })
+  } catch (err) {
+    return internalError(res, err)
+  }
+})
+
+/** 项目详情（含 queries/params 全文；给项目编辑器用） */
+app.get('/api/apc/projects/:id', apcEnabledGuard, apcRateLimit, (req, res) => {
+  try {
+    const project = getProject(req.params.id)
+    if (!project) return res.status(404).json({ error: `监测项目不存在：${req.params.id}` })
+    res.json({ project })
+  } catch (err) {
+    return internalError(res, err)
+  }
+})
+
+/** 新建项目（仅管理员） */
+app.post('/api/apc/projects', requireAdmin, apcProbeRateLimit, (req, res) => {
+  try {
+    const project = createProject(req.body && typeof req.body === 'object' ? req.body : {})
+    clearApcCache()
+    res.status(201).json({ ok: true, project, projects: listProjects() })
+  } catch (err) {
+    return fail(res, err)
+  }
+})
+
+/** 更新项目（仅管理员；只覆盖传入字段） */
+app.put('/api/apc/projects/:id', requireAdmin, apcProbeRateLimit, (req, res) => {
+  try {
+    const project = updateProject(req.params.id, req.body && typeof req.body === 'object' ? req.body : {})
+    clearApcCache()
+    res.json({ ok: true, project, projects: listProjects() })
+  } catch (err) {
+    return fail(res, err)
+  }
+})
+
+/** 删除项目（仅管理员；默认项目不可删） */
+app.delete('/api/apc/projects/:id', requireAdmin, apcProbeRateLimit, (req, res) => {
+  try {
+    const projects = deleteProject(req.params.id)
+    clearApcCache()
+    res.json({ ok: true, projects })
+  } catch (err) {
+    return fail(res, err)
+  }
+})
+
+// ===== 问答（聊天）中的 MES 数据直查 =====
+// 问答栏选择「数据库1 / 数据库2」后：模型输出 ```mes-sql 推荐查询 → 前端提交到这里执行。
+// 与 APC 取数共用同一套硬性要求：只读护栏（仅 SELECT）、行数硬上限、连接/语句超时；
+// 按槽位走各自连接；未配置的槽位直接拒绝（聊天要的是真实数据，不回退仿真）。
+
+/** MES 直查指引：槽位清单（含显示名/是否已配置）、推荐 SQL 模板、参数编码白名单、硬性限制 */
+app.get('/api/mes/guide', apcEnabledGuard, apcRateLimit, (_req, res) => {
+  try {
+    res.json(getMesGuide())
+  } catch (err) {
+    return internalError(res, err)
+  }
+})
+
+/** 执行模型推荐的只读 SQL（硬护栏：仅 SELECT / 行数上限 / 超时销毁会话） */
+app.post('/api/mes/query', apcEnabledGuard, apcRateLimit, async (req, res) => {
+  const body = req.body && typeof req.body === 'object' ? req.body : {}
+  try {
+    res.json(await queryMesSql({ slot: body.slot, sql: body.sql }))
   } catch (err) {
     return fail(res, err)
   }
@@ -1072,11 +1154,12 @@ setInterval(() => {
   }
 }, 5 * 60 * 1000).unref()
 
-/** HANA 连通性探测（仅管理员：会产生一次真实连库动作） */
-app.get('/api/apc/ping', requireAdmin, apcProbeRateLimit, async (_req, res) => {
+/** HANA 连通性探测（仅管理员：会产生一次真实连库动作）；?slot=db1/db2 指定探测哪个系统 */
+app.get('/api/apc/ping', requireAdmin, apcProbeRateLimit, async (req, res) => {
+  const slot = req.query.slot === 'db2' ? 'db2' : (req.query.slot === 'db1' ? 'db1' : undefined)
   const started = Date.now()
   try {
-    await pingHana()
+    await pingHana(slot)
     res.json({ ...getHanaStatus(), ok: true, elapsedMs: Date.now() - started })
   } catch (err) {
     res.status(502).json({ ...getHanaStatus(), ok: false, error: String((err && err.message) || err) })
@@ -1118,7 +1201,8 @@ app.get('/api/apc/config', requireAdmin, (_req, res) => {
   }
 })
 
-/** 保存配置：body 可含 databases（按槽位）/ activeDatabase / queries / params / meta 任意组合 */
+/** 保存配置：body 可含 databases（按槽位）/ queries / params / meta / limits 任意组合。
+ * queries/params 可带 projectId 指定项目（缺省默认项目）。 */
 app.put('/api/apc/config', requireAdmin, async (req, res) => {
   const body = req.body && typeof req.body === 'object' ? req.body : {}
   const saved = new Set()
@@ -1127,9 +1211,11 @@ app.put('/api/apc/config', requireAdmin, async (req, res) => {
     if (body.database !== undefined && body.databases === undefined) {
       body.databases = { db1: body.database }
     }
+    const projectId = typeof body.projectId === 'string' && body.projectId.trim() ? body.projectId.trim() : undefined
     if (body.meta !== undefined) { saveMeta(body.meta); saved.add('meta') }
-    if (body.queries !== undefined) { saveQueries(body.queries); saved.add('queries') }
-    if (body.params !== undefined) { saveParams(body.params); saved.add('params') }
+    if (body.limits !== undefined) { saveLimits(body.limits); saved.add('limits') }
+    if (body.queries !== undefined) { saveQueries(body.queries, projectId); saved.add('queries') }
+    if (body.params !== undefined) { saveParams(body.params, projectId); saved.add('params') }
     if (body.databases !== undefined && body.databases && typeof body.databases === 'object') {
       for (const id of Object.keys(body.databases)) {
         if (!DB_SLOTS.includes(id)) continue
@@ -1137,12 +1223,8 @@ app.put('/api/apc/config', requireAdmin, async (req, res) => {
         saved.add('database')
       }
     }
-    if (body.activeDatabase !== undefined) {
-      setActiveDatabase(body.activeDatabase)
-      saved.add('database')
-    }
     if (saved.size === 0) {
-      return res.status(400).json({ error: '没有可保存的配置段（可用：database / queries / params / meta）' })
+      return res.status(400).json({ error: '没有可保存的配置段（可用：database / queries / params / meta / limits）' })
     }
     await applyConfigChange()
     res.json({ ok: true, saved: [...saved], config: getConfigForClient() })
@@ -1160,7 +1242,8 @@ app.post('/api/apc/config/reset', requireAdmin, async (req, res) => {
     })
   }
   try {
-    const config = resetSection(section, req.body && req.body.databaseId)
+    const projectId = req.body && typeof req.body.projectId === 'string' ? req.body.projectId : undefined
+    const config = resetSection(section, req.body && req.body.databaseId, projectId)
     await applyConfigChange()
     res.json({ ok: true, section, config })
   } catch (err) {
@@ -1179,7 +1262,7 @@ app.post('/api/apc/config/test-db', requireAdmin, apcProbeRateLimit, async (req,
   }
 })
 
-/** 试运行取数 SQL：返回列名与前 N 行，供页面确认字段映射（不落盘） */
+/** 试运行取数 SQL：返回列名与前 N 行，供页面确认字段映射（不落盘）；slot 指定用哪个数据库试 */
 app.post('/api/apc/config/preview-query', requireAdmin, apcProbeRateLimit, async (req, res) => {
   const body = req.body && typeof req.body === 'object' ? req.body : {}
   try {
@@ -1188,6 +1271,7 @@ app.post('/api/apc/config/preview-query', requireAdmin, apcProbeRateLimit, async
       params: body.params,
       minutes: body.minutes,
       maxRows: body.maxRows,
+      slot: body.slot === 'db2' ? 'db2' : 'db1',
     }))
   } catch (err) {
     // 本接口仅管理员可调用，因此把真实失败原因回给对方才有排错价值

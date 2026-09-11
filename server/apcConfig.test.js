@@ -17,7 +17,9 @@ import { fileURLToPath } from 'url'
 import {
   getEffectiveHanaConfig, isDataSourceConfigured, saveDatabase, saveQueries,
   saveParams, saveMeta, resetSection, getConfigForClient, getEffectiveCatalog,
-  invalidateConfigCache, setActiveDatabase, getActiveDatabaseId, getDatabases,
+  invalidateConfigCache, getDatabases,
+  DEFAULT_PROJECT_ID, DEFAULT_CHAT_ROWS, listProjects, getProject,
+  createProject, updateProject, deleteProject, saveLimits, getEffectiveLimits,
 } from './apcConfig.js'
 import { loadCatalog, buildTemplateVars, buildHistorySql, previewQuery } from './apcService.js'
 
@@ -282,28 +284,30 @@ describe('apcConfig · 元信息与重置', () => {
   })
 })
 
-// ===== 双数据库系统槽位与切换 =====
+// ===== 双数据库系统槽位（按参数绑定 dbSlot，不再有全局 active 开关）=====
 
-describe('apcConfig · 双数据库系统槽位与切换', () => {
-  it('两个槽位独立保存，互不干扰；缺省 active 为 db1', () => {
-    expect(getActiveDatabaseId()).toBe('db1')
+describe('apcConfig · 双数据库系统槽位', () => {
+  it('两个槽位独立保存，互不干扰；缺省槽位为 db1', () => {
     saveDatabase('db1', { host: '10.1.1.1', user: 'U1' })
     saveDatabase('db2', { host: '10.2.2.2', user: 'U2' })
     const view = getConfigForClient()
-    expect(view.database.activeId).toBe('db1')
     expect(view.database.slots).toHaveLength(2)
     expect(getEffectiveHanaConfig('db1').host).toBe('10.1.1.1')
     expect(getEffectiveHanaConfig('db2').host).toBe('10.2.2.2')
-    expect(getEffectiveHanaConfig().host).toBe('10.1.1.1') // 默认取 active
+    expect(getEffectiveHanaConfig().host).toBe('10.1.1.1') // 缺省取 db1
   })
 
-  it('setActiveDatabase 切换当前使用的数据源', () => {
-    saveDatabase('db1', { host: '10.1.1.1', user: 'U1' })
-    saveDatabase('db2', { host: '10.2.2.2', user: 'U2' })
-    setActiveDatabase('db2')
-    expect(getActiveDatabaseId()).toBe('db2')
-    expect(getEffectiveHanaConfig().host).toBe('10.2.2.2')
-    expect(getConfigForClient().database.activeId).toBe('db2')
+  it('全局 activeDatabase 开关已废弃：残留字段被忽略，配置视图不再包含 activeId', () => {
+    fs.writeFileSync(TMP_CONFIG, JSON.stringify({
+      version: 1,
+      databases: { db1: { host: 'a', user: 'u' }, db2: { host: 'b', user: 'u' } },
+      activeDatabase: 'db2',
+      catalog: {},
+    }))
+    invalidateConfigCache()
+    // 残留的 activeDatabase 不再生效：缺省槽位恒为 db1
+    expect(getEffectiveHanaConfig().host).toBe('a')
+    expect(getConfigForClient().database).not.toHaveProperty('activeId')
   })
 
   it('resetSection(database, db2) 只清空指定槽位', () => {
@@ -400,7 +404,7 @@ describe('apcService · 取数模板渲染', () => {
 
 describe('apcService · SQL 试运行', () => {
   it('未配置只读数据源时给出可读错误，而不是静默失败', async () => {
-    await expect(previewQuery({})).rejects.toThrow(/数据库连接/)
+    await expect(previewQuery({})).rejects.toThrow(/数据库管理/)
   })
 
   it('草稿非法同样被拦截：试运行不能成为绕过护栏的口子', async () => {
@@ -424,5 +428,77 @@ describe('apcService · SQL 试运行', () => {
     await expect(previewQuery({
       queries: { mode: 'long', history: 'SELECT {{minutes}} FROM T WHERE {{x}}=1', columns: OK_COLUMNS },
     })).rejects.toThrow(/占位符/)
+  })
+})
+
+// ===== 监测项目 =====
+
+const P_BASE = { lsl: 0, usl: 1, min: -1, max: 2, setpoint: 0.5 }
+
+describe('apcConfig · 监测项目（dbSlot + SQL 模板 + 参数自成一套）', () => {
+  it('新建/更新/删除项目；参数 dbSlot 跟随项目槽位；默认项目不可删除', () => {
+    const p = createProject({
+      name: '注液量监测',
+      description: '示例项目',
+      dbSlot: 'db2',
+      params: [{ code: 'P1', ...P_BASE }, { code: 'P2', ...P_BASE, dbSlot: 'db1' }],
+    })
+    expect(p.id).toBeTruthy()
+    expect(p.id).not.toBe(DEFAULT_PROJECT_ID)
+    expect(p.dbSlot).toBe('db2')
+    // 项目绑定数据库：两个参数的 dbSlot 都统一为 db2
+    expect(p.params.every(x => x.dbSlot === 'db2')).toBe(true)
+
+    const u = updateProject(p.id, { name: '注液量监测 v2' })
+    expect(u.name).toBe('注液量监测 v2')
+    expect(u.params).toHaveLength(2) // 未传 params 时保留原值
+    expect(u.dbSlot).toBe('db2')
+
+    expect(() => deleteProject(DEFAULT_PROJECT_ID)).toThrow(/不可删除/)
+    deleteProject(p.id)
+    expect(getProject(p.id)).toBeNull()
+    expect(listProjects().find(x => x.id === p.id)).toBeUndefined()
+  })
+
+  it('项目名必填；dbSlot 非法拒绝', () => {
+    expect(() => createProject({ name: '' })).toThrow(/名称/)
+    expect(() => createProject({ name: 'X', dbSlot: 'db9' })).toThrow(/槽位/)
+    expect(() => createProject(null)).toThrow()
+  })
+
+  it('历史全局 catalog 自动迁移为默认项目', () => {
+    fs.writeFileSync(TMP_CONFIG, JSON.stringify({
+      version: 1,
+      catalog: {
+        queries: { mode: 'long', history: OK_SQL, columns: OK_COLUMNS },
+        params: [{ code: 'Z1', ...P_BASE }],
+      },
+    }))
+    invalidateConfigCache()
+    expect(getProject(DEFAULT_PROJECT_ID).params[0].code).toBe('Z1')
+    expect(getProject(DEFAULT_PROJECT_ID).queries.history).toBe(OK_SQL)
+    expect(getEffectiveCatalog().params[0].code).toBe('Z1')
+  })
+
+  it('saveLimits 校验范围并生效；reset limits 回默认', () => {
+    expect(getEffectiveLimits().chatRows).toBe(DEFAULT_CHAT_ROWS)
+    expect(() => saveLimits({ chatRows: 0 })).toThrow(/行数上限/)
+    expect(() => saveLimits({ chatRows: 99999 })).toThrow(/行数上限/)
+    saveLimits({ chatRows: 50 })
+    expect(getEffectiveLimits().chatRows).toBe(50)
+    resetSection('limits')
+    expect(getEffectiveLimits().chatRows).toBe(DEFAULT_CHAT_ROWS)
+  })
+
+  it('项目的 queries 按项目隔离：改默认项目不影响新项目', () => {
+    const p = createProject({ name: '独立项目', dbSlot: 'db1' })
+    saveQueries({ mode: 'long', history: OK_SQL, columns: OK_COLUMNS })
+    expect(getProject(DEFAULT_PROJECT_ID).queries).toBeTruthy()
+    expect(getProject(p.id).queries === undefined || getProject(p.id).queries === null).toBe(true)
+    // 配置视图的项目摘要正确
+    const view = getConfigForClient()
+    expect(view.projects.find(x => x.id === DEFAULT_PROJECT_ID)).toBeTruthy()
+    expect(view.projects.find(x => x.id === p.id).name).toBe('独立项目')
+    expect(view.limits.chatRows).toBe(DEFAULT_CHAT_ROWS)
   })
 })
