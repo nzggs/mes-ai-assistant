@@ -94,6 +94,19 @@ chmod +x deploy.sh && ./deploy.sh
 | `SLIM_TEXT_THRESHOLD` | 文档正文超过该字符数时不下发（默认 800000） |
 | `MES_IDX_MAX_DF` | 单个词出现在超过该页数即视为停用词丢弃（默认 1500） |
 | `MES_IDX_MAX_POSTINGS` | 倒排表总条目上限，内存兜底（默认 3000000） |
+| `APC_ENABLED` | 设 `0` 可整体关闭「APC和RTO」功能（默认开启） |
+| `HANA_HOST` / `HANA_PORT` | HANA 地址与 SQL 端口（端口默认 30015） |
+| `HANA_USER` / `HANA_PASSWORD` | HANA 登录账号（**只读账号**，仅授予 SELECT） |
+| `HANA_DATABASE` | MDC 多租户场景下的租户库名（可选） |
+| `HANA_USE_TLS` / `HANA_VALIDATE_CERT` | 是否启用 TLS / 是否校验服务端证书 |
+| `HANA_MAX_ROWS` | 单次读取行数上限，硬保护（默认 2000） |
+| `HANA_STATEMENT_TIMEOUT_MS` | 语句超时，超时即断连释放会话（默认 15000） |
+| `HANA_USE_LIMIT` | 是否自动为查询追加 `LIMIT`（默认开启；老版本 HANA 不支持时设 `0`） |
+| `APC_CACHE_TTL_MS` | 后端结果缓存时长，避免前端轮询打库（默认 5000） |
+| `APC_RATE_LIMIT` | APC 数据接口每分钟每 IP 请求上限（默认 60） |
+| `APC_PROBE_RATE_LIMIT` | APC 配置类接口（测试连接 / 试运行 / 读写配置）每分钟每 IP 上限（默认 20） |
+| `APC_CATALOG_FILE` | 指定参数目录文件；**设置后页面上的目录类保存不再生效**（默认 `server/apc.catalog.json`） |
+| `APC_CONFIG_FILE` | 覆盖运行期配置文件路径（默认 `<数据目录>/apc.config.json`，主要用于测试） |
 
 > 两个令牌必须**同一值**，否则管理操作 403。仓库里的令牌经确认可公开，
 > 如需更换见第六节。
@@ -104,6 +117,103 @@ chmod +x deploy.sh && ./deploy.sh
 > `GET /api/search` 承担。这两条正是为了消除「换一台浏览器打开就要先拉几十 MB 正文」的问题。
 > 索引只在**已入库（approved）**文档上构建，重启后后台异步重建（秒级），构建期间
 > 前端自动退回本地检索，功能不降级。
+
+### 3.4 APC / RTO 只读数据源
+
+左侧边栏「APC和RTO」页面会即时读取只读数据库（HANA）中记录的过程数据列值，并给出过程参数
+设定值的优化建议。数据源、取数 SQL 与参数目录**都可以在页面上手工配置**，保存即生效、
+无需重启服务；完全未配置时后端回退到**内置仿真数据源**（页面会明确标注），仅用于功能验证。
+
+#### ① 页面配置（推荐）
+
+在「APC和RTO」页面右上角点 **数据源配置**，有三个窗口：
+
+| 窗口 | 能配什么 |
+|---|---|
+| **数据库登录** | 地址、端口、租户库名、用户名、密码、Schema、TLS/证书、读取行数上限、连接与语句超时、是否自动追加 LIMIT；带**测试连接**（用页面草稿真连一次，不落盘） |
+| **SQL 查询语句** | 取数模式（窄表/宽表）、SQL 模板、字段映射（编码列/时间列/数值列）；带**试运行**（真执行一次只读查询，返回列名与前 N 行，可点选列名自动指派映射） |
+| **参数配置** | 逐个过程参数的设定值、RTO 理想操作点、规格上下限、可调范围、单次限幅、工艺死区、过程增益，以及装置名/采样间隔/默认窗口；支持增删、JSON 批量导入导出 |
+
+配置保存在**数据卷** `mes-ai-assistant_mes-data` 的 `/data/apc.config.json`，
+重建容器不丢，且**不在 git 里**。
+
+> ⚠ **不要把生产库密码写进 `.env`**：本仓库把 `.env` 纳入了 git 跟踪且仓库是公开的，
+> 写进去等于公开凭据。用页面「数据库登录」保存即可，密码只落在数据卷里，
+> 接口只回传「是否已设置密码」，永不回显密码原文。
+> （若确实要用环境变量传凭据，请先把 `.env` 加入 `.gitignore` 并 `git rm --cached .env`。）
+
+配置类接口全部需要管理员令牌（`ADMIN_TOKEN`）：从非本机访问时，页面会提示粘贴令牌，
+令牌与知识库管理/用户管理共用。
+
+#### ② 环境变量配置（适合统一管控的场景）
+
+在项目根目录 `.env` 中补齐（`docker compose up -d` 生效，无需重建镜像）：
+
+```bash
+HANA_HOST=10.0.0.21
+HANA_PORT=30015
+HANA_USER=READONLY_APC        # 必须是只读账号
+HANA_PASSWORD=********
+# 可选
+HANA_DATABASE=HDB             # MDC 多租户租户库名
+HANA_SCHEMA=MES               # 供 SQL 模板里的 {{schema}} 使用
+HANA_USE_TLS=true
+HANA_VALIDATE_CERT=true
+HANA_MAX_ROWS=2000
+HANA_STATEMENT_TIMEOUT_MS=15000
+```
+
+取值优先级：**页面保存值 > 环境变量 > 内置默认**。页面上每一项都标了来源，
+点「恢复为环境变量/默认值」即可回退。
+
+#### ③ 取数模式与 SQL 模板
+
+**窄表（long）**——一行一个参数值，最常见：
+
+```sql
+SELECT "PARAM_CODE", "TS", "VALUE" FROM "MES_PROCESS_HIST"
+WHERE "TS" >= ADD_SECONDS(CURRENT_TIMESTAMP, -60 * {{minutes}}){{codeFilter}}
+ORDER BY "TS" ASC LIMIT {{limit}}
+```
+
+**宽表（wide）**——一行一个时间戳，各参数各占一列（列名在「参数配置」里逐个填写）：
+
+```sql
+SELECT "TS", {{columns}} FROM "MES_PROCESS_HIST"
+WHERE "TS" >= ADD_SECONDS(CURRENT_TIMESTAMP, -60 * {{minutes}}) LIMIT {{limit}}
+```
+
+模板占位符共 5 个，都是服务端生成、不可注入任意文本：
+
+| 占位符 | 说明 |
+|---|---|
+| `{{minutes}}` | 统计窗口分钟数（整数） |
+| `{{limit}}` | 行数上限（整数） |
+| `{{codeFilter}}` | 窄表：由白名单参数编码生成的 `AND "CODE" IN (...)` |
+| `{{columns}}` | 宽表：各参数数据列名列表（已校验+加引号） |
+| `{{schema}}` | 模式名（在「数据库登录」里配置） |
+
+宽表模式下若某个参数没填数据列名，保存会被直接拒绝，取数时也会立即报错——
+不会拿参数编码去猜列名（那会悄悄取错数据）。
+
+#### ④ 安全边界（重要）
+
+1. **只读**：无论 SQL 来自目录文件、页面保存还是试运行草稿，执行前一律强制校验
+   「单条 SELECT / WITH」；DDL/DML（insert/update/delete/merge/truncate/drop/alter/
+   create/grant/call…）、多语句拼接、`SELECT INTO`、`FOR UPDATE` 全部拒绝；
+   校验前先剥离注释、屏蔽字符串与带引号标识符，无法靠注释或字面量绕过。
+2. **不接受可执行裸 SQL**：接口没有「传一段 SQL 就跑」的入口。页面保存的是**模板**，
+   运行时只代入服务端生成的整数、白名单编码与已校验列名；
+   唯一的自由 SQL 入口是管理员的**试运行**，同样要过上面同一层护栏。
+3. **限量**：自动追加 `LIMIT`（默认 2000 行），并在客户端再硬截断一次。
+4. **限时**：连接超时 8s、语句超时 15s，超时立即销毁连接释放服务端会话。
+5. **限流 + 缓存**：数据接口每 IP 60 次/分钟、结果缓存 5s；配置类接口每 IP 20 次/分钟，
+   前端轮询不会打到数据库。
+6. **凭据不出服务端**：密码只落在数据卷配置文件，接口只回 `passwordSet` 布尔值。
+7. **建议不下发**：页面展示的设定值建议**不会**自动写入 DCS/PLC，需工艺工程师确认后手动执行。
+
+> 生产环境请务必为 HANA 单独建一个**只读账号**（仅 `SELECT` 权限，且只授权所需表/视图），
+> 不要复用管理员账号——应用层的只读护栏是第二道防线，数据库授权才是第一道。
 
 ---
 
@@ -126,6 +236,18 @@ curl -s http://127.0.0.1:3001/api/search/status
 
 # 服务端检索（示例：按对象名/业务词检索，返回 Top-K 命中页）
 curl -s 'http://127.0.0.1:3001/api/search?q=查询库存列表&topK=5' | head -c 600
+
+# APC/RTO 功能与数据源状态（mode=hana 表示已接真实 HANA，simulated 表示仿真源）
+curl -s http://127.0.0.1:3001/api/apc/status
+
+# 过程参数实时值概览（近 1 小时窗口）
+curl -s 'http://127.0.0.1:3001/api/apc/overview?minutes=60' | head -c 400
+
+# 设定值优化建议
+curl -s 'http://127.0.0.1:3001/api/apc/optimize?minutes=60' | head -c 600
+
+# HANA 连通性探测（管理员接口，需带令牌）
+curl -s http://127.0.0.1:3001/api/apc/ping -H "X-Admin-Token: $ADMIN_TOKEN"
 ```
 
 浏览器打开 `http://<宿主机IP>:3001`，右上角「API 配置」应显示：本地 DeepSeek / DeepSeek-R1 1.5B。
@@ -148,10 +270,14 @@ curl -s 'http://127.0.0.1:3001/api/search?q=查询库存列表&topK=5' | head -c
 │  └─ <docId>.ext         # 扩展名（pdf/docx/…）
 ├─ tasks/                 # 总结任务的临时状态（终态超 24h 自动清理）
 ├─ doc-logs.json          # 操作日志（最多 4000 条）
-└─ users.json             # 用户表（跨设备共享）
+├─ users.json             # 用户表（跨设备共享）
+└─ apc.config.json        # APC/RTO 数据源配置（连接参数、取数 SQL、参数目录；含密码，勿外传）
 ```
 
 删除文档是软删除（`index.json` 打 `deleted` 墓碑），原始 `files/` 一并清除。
+
+> `apc.config.json` 里可能含数据库密码，备份文件请按敏感数据管理。
+> 删除该文件等价于「全部恢复为环境变量/默认值」，服务会自动回退到种子目录与仿真数据源。
 
 ### 5.2 备份
 

@@ -2,6 +2,7 @@ import { useState, useCallback, useRef, useEffect } from 'react'
 import { Sidebar } from './components/Sidebar'
 import { ChatArea } from './components/ChatArea'
 import { KnowledgeBase } from './components/KnowledgeBase'
+import { ApcRto } from './components/ApcRto'
 import { WelcomeScreen } from './components/WelcomeScreen'
 import { ApiKeyModal } from './components/ApiKeyModal'
 import { AuthModal, getSession, clearSession, type User } from './components/AuthModal'
@@ -13,7 +14,7 @@ import { streamChat, hasApiKey, getProvider, getReasoningModelId, resolveModelId
 import { buildKnowledgeContext, decideRetrievalMode, detectSummaryIntent, getCachedSummary, FULL_DOC_SUMMARY_KEY, summarizeDocumentScope } from './services/knowledgeService'
 import { ensureSuperAdminSeeded, syncUsersFromBackend, canAccessUserManagement } from './services/userService'
 import { getAllDocs, restoreDocsFromRecords, syncLocalToBackend, saveTableSummary, fetchAllDocPages } from './services/docStore'
-import { resolveServerHits, fetchObjectIndex, type ServerSearchHit, type SearchObject } from './services/searchApi'
+import { resolveServerHits, fetchObjectIndex, fetchDocumentIndex, type ServerSearchHit, type SearchObject, type DocIndexResult } from './services/searchApi'
 import { resolveModelProfile, hasSqlIntent } from '../shared/modelProfile.js'
 import type { Conversation, ChatMessage, SidebarView, KnowledgeDoc } from './types'
 import { APP_VERSION } from './version'
@@ -253,8 +254,9 @@ export default function App() {
     // 模型会拿文档名当表名编造 SQL，必须靠这份清单告诉它库里有哪些对象。
     let serverHits: ServerSearchHit[] = []
     let objectIndex: SearchObject[] = []
+    let docIndex: DocIndexResult | null = null
     if (kbEnabled) {
-      const [hits, objs] = await Promise.all([
+      const [hits, objs, ledger] = await Promise.all([
         resolveServerHits(text, documents, {
           topK: profile.topK,
           perHitChars: profile.perHitChars,
@@ -270,9 +272,14 @@ export default function App() {
           boostSql: sqlIntent,
           timeoutMs: 5000,
         }),
+        // 文档台账（权威的文档清单与三态计数）：让「知识库里有几篇文档」按台账真值回答，
+        // 而不是让模型去数"有正文可注入的文档"（正文被剥离且本次未命中的 approved 文档会被漏算）。
+        // 失败/未就绪返回 null → buildKnowledgeContext 走历史行为，零回归。
+        fetchDocumentIndex({ timeoutMs: 5000 }),
       ])
       serverHits = hits
       objectIndex = objs
+      docIndex = ledger
     }
 
     // 兜底：服务端索引不可用（未构建完成 / 旧版本后端）且存在「正文剥离」的超大文档时，
@@ -285,8 +292,10 @@ export default function App() {
       if (deferred.length > 0) {
         try {
           const patches = await Promise.all(deferred.map(async d => {
-            deferredFilled.current.add(d.id)
+            // 注意：必须等拉取成功后再标记"已补全"。此前先 add 再 await，
+            // 一旦 fetchAllDocPages 抛错，该文档会被永久跳过（内容仍为空），导致文档计数漂移。
             const pages = await fetchAllDocPages(d.id)
+            deferredFilled.current.add(d.id)
             return { id: d.id, patch: { ...d, content: pages, contentOmitted: false } }
           }))
           if (patches.length > 0) {
@@ -295,6 +304,8 @@ export default function App() {
             docsForContext = documents.map(d => map.get(d.id) || d)
           }
         } catch (e) {
+          // 拉取失败的文档回滚"已补全"标记，允许下次提问重试（否则会永久跳过）
+          for (const d of deferred) deferredFilled.current.delete(d.id)
           console.warn('超大文档正文按需补全失败（将继续使用已有内容）:', e)
         }
       }
@@ -306,7 +317,7 @@ export default function App() {
     // （旧逻辑是「没点名文档就走探索」，导致「开发 XX 功能」这类问题只回一串文档名，拿不到正文。）
     const effectiveMode = decideRetrievalMode(text, documents)
 
-    const knowledgeContext = kbEnabled ? buildKnowledgeContext(docsForContext, text, kbContextLimit, effectiveMode, serverHits, objectIndex) : ''
+    const knowledgeContext = kbEnabled ? buildKnowledgeContext(docsForContext, text, kbContextLimit, effectiveMode, serverHits, objectIndex, docIndex) : ''
 
     // 项⑤：整体归纳意图自动触发整表总结（优先用已缓存，否则后台生成并持久化）
     // 效果：用户问"总结2026履历/分析整个XX文档"时，自动走 map-reduce 全量总结；
@@ -691,6 +702,8 @@ export default function App() {
                 onToggleDeepThink={() => setDeepThink(d => !d)}
               />
             )
+          ) : sidebarView === 'apc' ? (
+            <ApcRto />
           ) : sidebarView === 'knowledge' ? (
             <KnowledgeBase
               documents={documents}

@@ -17,6 +17,13 @@ import {
 import { extractPdfTextFromFile } from './pdfExtract.js'
 import { startSummary, getTask, cancelTask, listTasks, recoverSummaryTasks, startTaskCleanup } from './summaryTask.js'
 import { configureSearchIndex, buildIndex, search as searchInIndex, listObjects as listObjectsInIndex, getStatus as getIndexStatus, upsertDocument, removeDocument, hasDocument, pagesOfDoc } from './searchIndex.js'
+import { getApcStatus, getOverview, getOptimization, getHistory, isApcEnabled, clearApcCache, previewQuery } from './apcService.js'
+import { pingHana, closeHana, getHanaStatus, testHanaConnection } from './hanaClient.js'
+import {
+  getConfigForClient, saveDatabase, saveQueries, saveParams, saveMeta,
+  resetSection, RESET_SECTIONS, setActiveDatabase, DB_SLOTS,
+} from './apcConfig.js'
+import { registerDocIndexRoutes } from './docIndexRoute.js'
 
 // 优先加载项目根目录 .env，再用 server/.env 覆盖（server/.env 为后端配置真相源）。
 dotenv.config()
@@ -206,6 +213,10 @@ app.get('/api/health', (req, res) => {
 //   GET /api/docs/:id/pages 按需取页 + GET /api/search 服务端检索兜住，
 //   避免「换一台浏览器就要全量拉取数十 MB 正文」；带 includeContent=1 可强制下发全量。
 // - 带 page 参数：分页 + 轻量元数据（不含 textContent/content/summaryChunks），供列表 UI 翻页，降低传输与解析成本
+
+// 文档台账（只读轻量索引）：给 AI/前端一份权威的「知识库有哪些文档」，独立模块一行挂载
+registerDocIndexRoutes(app)
+
 app.get('/api/docs', (_req, res) => {
   try {
     const { page, pageSize, status, q, includeContent } = _req.query
@@ -947,6 +958,246 @@ app.post('/api/summary/:taskId/cancel', (req, res) => {
   res.json({ ok })
 })
 
+// ===== APC / RTO 只读数据接口 =====
+// 这些接口会直接访问 HANA（现场历史/实时库），因此叠加多重保护：
+//   ① 专用限流（APC_RATE_LIMIT，默认 60 次/分钟/IP，远低于 LLM 通道），防止前端轮询把库打满；
+//   ② 服务端短 TTL 结果缓存（APC_CACHE_TTL_MS，默认 5s），同一窗口内的重复刷新不重复取数，
+//      带 ?refresh=1 可强制绕过缓存；
+//   ③ hanaClient 内置的语句超时 + 行数上限 + 单连接串行执行，超时即销毁连接释放会话；
+//   ④ 只执行 apc.catalog.json 里的 SQL 模板，接口不接受任何客户端传入的 SQL。
+// 全程只读：不提供任何写库入口。
+const APC_RATE_LIMIT = Number(process.env.APC_RATE_LIMIT || 60)
+const apcRateMap = new Map() // ip -> { count, resetAt }
+export function apcRateLimit(req, res, next) {
+  const ip = (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.socket.remoteAddress || 'unknown'
+  const now = Date.now()
+  let entry = apcRateMap.get(ip)
+  if (!entry || entry.resetAt <= now) {
+    entry = { count: 0, resetAt: now + 60 * 1000 }
+    apcRateMap.set(ip, entry)
+  }
+  entry.count++
+  if (entry.count > APC_RATE_LIMIT) {
+    return res.status(429).json({ error: 'APC/RTO 数据刷新过于频繁，请稍后再试' })
+  }
+  next()
+}
+setInterval(() => {
+  const now = Date.now()
+  for (const [ip, e] of apcRateMap) {
+    if (e.resetAt <= now) apcRateMap.delete(ip)
+  }
+}, 5 * 60 * 1000).unref()
+
+function apcEnabledGuard(_req, res, next) {
+  if (!isApcEnabled()) {
+    return res.status(503).json({ error: 'APC/RTO 功能已关闭（设置 APC_ENABLED=1 开启）' })
+  }
+  next()
+}
+
+/** 统计窗口分钟数：限制在 5 分钟 ~ 24 小时，避免超大范围拖垮数据库 */
+function parseWindowMinutes(v) {
+  if (v === undefined || v === '') return undefined
+  const n = parseInt(v, 10)
+  if (!Number.isFinite(n)) return undefined
+  return Math.min(1440, Math.max(5, n))
+}
+
+/** 功能与数据源状态（不含任何凭据） */
+app.get('/api/apc/status', apcEnabledGuard, (_req, res) => {
+  try {
+    res.json(getApcStatus())
+  } catch (err) {
+    return internalError(res, err)
+  }
+})
+
+/** 参数概览：实时值 + 统计量 + 趋势 */
+app.get('/api/apc/overview', apcEnabledGuard, apcRateLimit, async (req, res) => {
+  try {
+    if (boolParam(req.query.refresh)) clearApcCache()
+    res.json(await getOverview({ minutes: parseWindowMinutes(req.query.minutes) }))
+  } catch (err) {
+    return fail(res, err)
+  }
+})
+
+/** 单个参数的历史数据列值 */
+app.get('/api/apc/history', apcEnabledGuard, apcRateLimit, async (req, res) => {
+  try {
+    const code = String(req.query.code || '').trim()
+    if (!code) return res.status(400).json({ error: 'code 为必填' })
+    if (boolParam(req.query.refresh)) clearApcCache()
+    res.json(await getHistory({ code, minutes: parseWindowMinutes(req.query.minutes) }))
+  } catch (err) {
+    return fail(res, err)
+  }
+})
+
+/** 优化建议：按紧急度给出过程参数设定值建议 */
+app.get('/api/apc/optimize', apcEnabledGuard, apcRateLimit, async (req, res) => {
+  try {
+    const codes = typeof req.query.codes === 'string'
+      ? req.query.codes.split(',').map(s => s.trim()).filter(Boolean).slice(0, 50)
+      : undefined
+    if (Boolean(req.query.refresh)) clearApcCache()
+    res.json(await getOptimization({ minutes: parseWindowMinutes(req.query.minutes), codes }))
+  } catch (err) {
+    return fail(res, err)
+  }
+})
+
+/** 配置类接口与真实连库探测用更严格的限流（默认 20 次/分钟/IP） */
+const APC_PROBE_RATE_LIMIT = Number(process.env.APC_PROBE_RATE_LIMIT || 20)
+const apcProbeRateMap = new Map() // ip -> { count, resetAt }
+export function apcProbeRateLimit(req, res, next) {
+  const ip = (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.socket.remoteAddress || 'unknown'
+  const now = Date.now()
+  let entry = apcProbeRateMap.get(ip)
+  if (!entry || entry.resetAt <= now) {
+    entry = { count: 0, resetAt: now + 60 * 1000 }
+    apcProbeRateMap.set(ip, entry)
+  }
+  entry.count++
+  if (entry.count > APC_PROBE_RATE_LIMIT) {
+    return res.status(429).json({ error: '配置类操作过于频繁，请稍后再试' })
+  }
+  next()
+}
+setInterval(() => {
+  const now = Date.now()
+  for (const [ip, e] of apcProbeRateMap) {
+    if (e.resetAt <= now) apcProbeRateMap.delete(ip)
+  }
+}, 5 * 60 * 1000).unref()
+
+/** HANA 连通性探测（仅管理员：会产生一次真实连库动作） */
+app.get('/api/apc/ping', requireAdmin, apcProbeRateLimit, async (_req, res) => {
+  const started = Date.now()
+  try {
+    await pingHana()
+    res.json({ ...getHanaStatus(), ok: true, elapsedMs: Date.now() - started })
+  } catch (err) {
+    res.status(502).json({ ...getHanaStatus(), ok: false, error: String((err && err.message) || err) })
+  }
+})
+
+/** 主动断开 HANA 连接（仅管理员：用于切换配置后重连） */
+app.post('/api/apc/disconnect', requireAdmin, async (_req, res) => {
+  try {
+    clearApcCache()
+    await closeHana()
+    res.json({ ok: true })
+  } catch (err) {
+    return internalError(res, err)
+  }
+})
+
+// ===== APC / RTO 数据源配置接口（仅管理员）=====
+// 页面上三个配置窗口（数据库登录 / SQL 查询语句 / 参数配置）都读写这里：
+//   ① 全部挂 requireAdmin：只有持有 ADMIN_TOKEN 的调用方才能查看与修改；
+//   ② 密码只进不出：GET 只回 passwordSet（布尔），PUT 中空字符串=不修改、null=清除；
+//   ③ 保存前一律经 apcCatalog 结构校验 + sqlGuard 只读校验，非法配置直接 400 且不落盘；
+//   ④ 保存/重置后清结果缓存并断开旧连接，下一次取数即用新配置重连，**无需重启服务**。
+// 注意：一个请求里同时改多段时按 meta → queries → params 顺序落盘，
+//       分段写入保证「宽表模式 + 缺列名」这类组合会在保存前被整体校验拦下。
+
+/** 配置变更后让缓存与连接跟配置对齐 */
+async function applyConfigChange() {
+  clearApcCache()
+  await closeHana()
+}
+
+/** 读取当前配置（不含密码原文） */
+app.get('/api/apc/config', requireAdmin, (_req, res) => {
+  try {
+    res.json(getConfigForClient())
+  } catch (err) {
+    return internalError(res, err)
+  }
+})
+
+/** 保存配置：body 可含 databases（按槽位）/ activeDatabase / queries / params / meta 任意组合 */
+app.put('/api/apc/config', requireAdmin, async (req, res) => {
+  const body = req.body && typeof req.body === 'object' ? req.body : {}
+  const saved = new Set()
+  try {
+    // 兼容历史单库：旧的 body.database 直接落到 db1 槽位
+    if (body.database !== undefined && body.databases === undefined) {
+      body.databases = { db1: body.database }
+    }
+    if (body.meta !== undefined) { saveMeta(body.meta); saved.add('meta') }
+    if (body.queries !== undefined) { saveQueries(body.queries); saved.add('queries') }
+    if (body.params !== undefined) { saveParams(body.params); saved.add('params') }
+    if (body.databases !== undefined && body.databases && typeof body.databases === 'object') {
+      for (const id of Object.keys(body.databases)) {
+        if (!DB_SLOTS.includes(id)) continue
+        saveDatabase(id, body.databases[id])
+        saved.add('database')
+      }
+    }
+    if (body.activeDatabase !== undefined) {
+      setActiveDatabase(body.activeDatabase)
+      saved.add('database')
+    }
+    if (saved.size === 0) {
+      return res.status(400).json({ error: '没有可保存的配置段（可用：database / queries / params / meta）' })
+    }
+    await applyConfigChange()
+    res.json({ ok: true, saved: [...saved], config: getConfigForClient() })
+  } catch (err) {
+    return fail(res, err)
+  }
+})
+
+/** 把某一段恢复为种子文件 / 环境变量提供的默认值 */
+app.post('/api/apc/config/reset', requireAdmin, async (req, res) => {
+  const section = String((req.body && req.body.section) || '').trim()
+  if (!RESET_SECTIONS.includes(section)) {
+    return res.status(400).json({
+      error: `不支持重置的配置段：${section || '(空)'}（可选：${RESET_SECTIONS.join(' / ')}）`,
+    })
+  }
+  try {
+    const config = resetSection(section, req.body && req.body.databaseId)
+    await applyConfigChange()
+    res.json({ ok: true, section, config })
+  } catch (err) {
+    return fail(res, err)
+  }
+})
+
+/** 用页面草稿凭据做一次性连通性测试（不落盘） */
+app.post('/api/apc/config/test-db', requireAdmin, apcProbeRateLimit, async (req, res) => {
+  const draft = (req.body && req.body.database) || {}
+  const id = req.body && req.body.id
+  try {
+    res.json(await testHanaConnection(draft, id))
+  } catch (err) {
+    return internalError(res, err)
+  }
+})
+
+/** 试运行取数 SQL：返回列名与前 N 行，供页面确认字段映射（不落盘） */
+app.post('/api/apc/config/preview-query', requireAdmin, apcProbeRateLimit, async (req, res) => {
+  const body = req.body && typeof req.body === 'object' ? req.body : {}
+  try {
+    res.json(await previewQuery({
+      queries: body.queries,
+      params: body.params,
+      minutes: body.minutes,
+      maxRows: body.maxRows,
+    }))
+  } catch (err) {
+    // 本接口仅管理员可调用，因此把真实失败原因回给对方才有排错价值
+    // （配置/校验类错误自带 status=400；连库失败统一按 502 返回）
+    const status = err && err.status ? err.status : 502
+    if (status === 500) return internalError(res, err)
+    return res.status(status).json({ error: String((err && err.message) || err) })
+  }
+})
+
 // ===== 静态前端托管（生产/局域网部署：同一端口同时提供前端与 API）=====
 const DIST_DIR = path.join(__dirname, '..', 'dist')
 if (fs.existsSync(DIST_DIR)) {
@@ -1005,6 +1256,16 @@ if (isMain) {
     console.log(`  API Key 由前端用户提供（X-Api-Key Header）`)
     console.log(`  ${process.env.LLM_API_KEY ? '(.env 中的 Key 作为备用)' : '(.env 未配置 Key)'}`)
     console.log(`  ${ADMIN_TOKEN ? '管理操作：已启用 ADMIN_TOKEN' : '管理操作：仅本机(loopback)可写'}`)
+    try {
+      const apc = getApcStatus()
+      const modeDesc = apc.queryMode === 'wide' ? '宽表' : apc.queryMode === 'long' ? '窄表' : '—'
+      const apcDesc = !apc.enabled
+        ? '已关闭'
+        : apc.mode === 'hana'
+          ? `只读数据源 ${apc.hana.host}:${apc.hana.port}（${modeDesc}取数 · ${apc.paramCount} 个过程参数）`
+          : `内置仿真数据源（${apc.paramCount} 个过程参数）· 可在页面「数据源配置」中填写连接信息`
+      console.log(`  APC/RTO:   ${apcDesc}${apc.catalogError ? `  [目录异常] ${apc.catalogError}` : ''}`)
+    } catch { /* 状态打印失败不影响启动 */ }
     console.log(`========================================\n`)
   })
 }

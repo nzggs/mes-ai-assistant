@@ -51,6 +51,21 @@ services:
       MES_DATA_DIR: /data
       # host 网络下 127.0.0.1 即宿主机 → 直连宿主机 Ollama
       OLLAMA_API_URL: ${OLLAMA_BASE:-http://127.0.0.1:11434}/v1/chat/completions
+      # ===== APC / RTO（只读 HANA 数据源；未配置 HANA_* 时自动回退内置仿真源）=====
+      # 取数 SQL 与参数目录见 server/apc.catalog.json，只读安全边界见 DEPLOY.md 3.4
+      APC_ENABLED: ${APC_ENABLED:-1}
+      HANA_HOST: ${HANA_HOST:-}
+      HANA_PORT: ${HANA_PORT:-30015}
+      HANA_USER: ${HANA_USER:-}
+      HANA_PASSWORD: ${HANA_PASSWORD:-}
+      HANA_DATABASE: ${HANA_DATABASE:-}
+      HANA_USE_TLS: ${HANA_USE_TLS:-false}
+      HANA_VALIDATE_CERT: ${HANA_VALIDATE_CERT:-true}
+      HANA_MAX_ROWS: ${HANA_MAX_ROWS:-2000}
+      HANA_STATEMENT_TIMEOUT_MS: ${HANA_STATEMENT_TIMEOUT_MS:-15000}
+      HANA_USE_LIMIT: ${HANA_USE_LIMIT:-1}
+      APC_CACHE_TTL_MS: ${APC_CACHE_TTL_MS:-5000}
+      APC_RATE_LIMIT: ${APC_RATE_LIMIT:-60}
     volumes:
       - mes-data:/data
 

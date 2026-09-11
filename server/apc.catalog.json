@@ -1,0 +1,19 @@
+{
+  "_comment": "APC / RTO 参数目录（种子文件）。本文件只提供「结构性默认值」：取数 SQL 模板形状与目录元信息。管理员在页面「APC和RTO → 数据源配置」里的保存会覆盖它（保存值优先级更高），配置落在数据卷 apc.config.json。也可用环境变量 APC_CATALOG_FILE 指定本文件作为唯一来源（此时页面上的目录类保存不再生效）。",
+  "_params_note": "params 有意留空：监测项全部由管理员在页面上自行添加/删除，系统不预置任何过程参数（不预设工序、不预设参数名）。空目录是合法状态，页面会给出空态引导。",
+  "station": "消费类聚合物锂离子电池 · 电芯产线",
+  "sampleIntervalSec": 120,
+  "defaultWindowMinutes": 120,
+  "deadbandPctDefault": 10,
+  "queries": {
+    "_comment": "mode: long=窄表（一行一个参数值，需 columns.code/ts/value）；wide=宽表（一行一个时间戳，各参数在 params[].column 里填列名）。占位符：{{minutes}} {{limit}} {{codeFilter}}(窄表) {{columns}}(宽表) {{schema}}。表名/列名请按现场实际库表调整——也可直接在页面上改。",
+    "mode": "long",
+    "history": "SELECT \"PARAM_CODE\", \"TS\", \"VALUE\" FROM \"MES_PROCESS_HIST\" WHERE \"TS\" >= ADD_SECONDS(CURRENT_TIMESTAMP, -60 * {{minutes}}){{codeFilter}} ORDER BY \"TS\" ASC LIMIT {{limit}}",
+    "columns": {
+      "code": "PARAM_CODE",
+      "ts": "TS",
+      "value": "VALUE"
+    }
+  },
+  "params": []
+}
