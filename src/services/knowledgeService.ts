@@ -1365,10 +1365,14 @@ export function buildKnowledgeContext(
 
   // ===== 第二阶段：命中扩展 —— 根据用户查询，跨文档检索命中的具体内容，按相关性排序后注入 =====
   let anyRelevant = false
+  // 单篇档位封顶：本地小档位的总预算可能小于历史上的**绝对值下限**（8000 / 16000），
+  // 若不封顶，单篇正文/总结会直接击穿档位预算（实测 6000 档位实际产出 7927 字符，
+  // 反而拖慢小模型并把其他命中文档挤出上下文）。云端大预算下该封顶不生效，行为不变。
+  const tierSectionCap = Math.max(1500, Math.floor(totalLimit * 0.6))
   // 单篇文档正文注入预算：扩大至 contentBudget/4（下限 8000），配合"总结预算独立"后正文不再被总结挤占
-  const perDocBudget = Math.max(8000, Math.floor(contentBudget / 4))
+  const perDocBudget = Math.min(Math.max(8000, Math.floor(contentBudget / 4)), tierSectionCap)
   // 整篇/整表总结缓存注入独立预算（与正文切片分开计数，避免大总结吃掉正文切片预算导致"总结里没有细节"时正文也查不到）
-  const summaryBudget = Math.max(16000, Math.floor(contentBudget * 0.5))
+  const summaryBudget = Math.min(Math.max(16000, Math.floor(contentBudget * 0.5)), tierSectionCap)
 
   // 收集每份文档的命中结果（含分数），最后跨文档按分数排序注入，
   // 避免"目录靠前的文档先占满预算、后面的相关文档（如 SQL语句.xlsx）注入不到"。
@@ -1575,8 +1579,17 @@ export function buildKnowledgeContext(
   }
   for (const hit of docHits) {
     if (contentUsed >= contentBudget) break
-    context += `### 文档：${hit.doc.name}\n${hit.section}\n---\n\n`
-    contentUsed += hit.section.length + hit.doc.name.length + 20
+    const head = `### 文档：${hit.doc.name}\n`
+    const tail = '\n---\n\n'
+    // 按「剩余预算」截断：上面的 break 是**前置**判断，若只判断一次，最后一篇会整段超额注入
+    // （单篇 section 上限为 perDocBudget），导致实际上下文远超档位预算。
+    const remain = contentBudget - contentUsed - head.length - tail.length
+    if (remain < 200) break
+    const body = hit.section.length > remain
+      ? hit.section.slice(0, remain) + '\n…（受本次模型上下文预算限制，已截断）'
+      : hit.section
+    context += head + body + tail
+    contentUsed += head.length + body.length + tail.length
   }
 
   // 全部文档都未命中时，明确提示并转外部/通用知识

@@ -667,10 +667,13 @@ app.post('/api/chat', chatRateLimit, async (req, res) => {
       }
     }
 
-    // 「等待首字」上限：本地模型 150s（处理知识库大上下文时 CPU prompt 处理慢，60s 不够），云端 60s。
+    // 「等待首字」上限：本地模型 300s、云端 60s。
+    // 本地上限的取值依据（实测宿主机 CPU 推理 deepseek-r1:1.5b，思考型模型）：
+    //   prompt ≈ 9.6k 字符时**首字节就要 108s**、整段 181s；原先的 150s 会把它误杀成
+    //   「模型响应超时」，用户看到的是失败而非"慢"。300s 与 chat-once 的本地上限保持一致。
     // 若前端传了 timeoutMs（流式问答会传，使后端早于前端超时并先发干净错误），则取二者较小值，
     // 避免后端还在等时前端已 abort 而被误报为「后端代理不可用」。
-    const maxTimeout = isLocal ? 150000 : 60000
+    const maxTimeout = isLocal ? 300000 : 60000
     const chatTimeoutMs = (Number.isFinite(timeoutMs) && timeoutMs > 0)
       ? Math.min(timeoutMs, maxTimeout)
       : maxTimeout

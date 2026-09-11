@@ -313,9 +313,12 @@ async function streamChatViaBackend(
   options?: { useThinking?: boolean; knowledgeContext?: string; modelId?: string }
 ): Promise<void> {
   const provider = getProvider()
-  // 本地模型「等待首字」上限 150s：处理知识库大上下文时 CPU prompt 处理很慢，60s 会误报超时；云端保持 30s。
+  // 本地模型「等待首字」上限 320s：实测宿主机 CPU 推理 deepseek-r1:1.5b（思考型）处理
+  // ≈9.6k 字符 prompt 时**首字节就要 108s**、整段约 181s；150s 会把它误杀成「模型响应超时」。
+  // 云端保持 30s（云 API 首字通常亚秒级）。前端上限须**大于**后端上限（见下 timeoutMs），
+  // 这样后端能先发回干净的 SSE error，而不是被前端 abort 掉只剩「signal is aborted」。
   const isLocal = provider.id === 'ollama' || !!provider.noApiKey
-  const frontendTimeout = isLocal ? 150000 : 30000
+  const frontendTimeout = isLocal ? 320000 : 30000
   const res = await fetchWithTimeout(`${BACKEND_URL}/api/chat`, {
     method: 'POST',
     headers: {
@@ -329,8 +332,8 @@ async function streamChatViaBackend(
       providerId: provider.id,
       modelId: resolveModelId(options?.modelId),
       groupId: getGroupId(),
-      // 让后端比前端早 10s 超时，使其能先发回干净的 SSE error 事件，避免前端 abort 误报
-      timeoutMs: isLocal ? 140000 : undefined,
+      // 让后端比前端早 20s 超时，使其能先发回干净的 SSE error 事件，避免前端 abort 误报
+      timeoutMs: isLocal ? 300000 : undefined,
     }),
   }, frontendTimeout)
 

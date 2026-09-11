@@ -158,3 +158,16 @@ describe('buildKnowledgeContext：XML 空目录的预算回补', () => {
     expect(ctx).toContain('SOP_TAIL_MARKER')
   })
 })
+
+describe('buildKnowledgeContext：档位预算不被绝对值下限击穿', () => {
+  it('本地小档位（6000）下总长受控，且仍保住真实 SQL', () => {
+    // 旧实现 perDocBudget = max(8000, contentBudget/4)、summaryBudget = max(16000, …)，
+    // 这两个**绝对值下限**会击穿 6000 的档位预算（实测请求 6000 实际产出 7927 字符），
+    // 对本地小模型既拖慢首字又挤掉其他命中文档。新实现按 totalLimit 封顶 + 按剩余预算截断。
+    const bigSql: ServerSearchHit = { ...sqlHit, text: `${sqlHit.text}\n${'y'.repeat(30000)}` }
+    const bigWidget: ServerSearchHit = { ...widgetHit, text: `${widgetHit.text}\n${'x'.repeat(30000)}` }
+    const ctx = buildKnowledgeContext(DOCS, QUERY, 6000, 'detail', [bigSql, bigWidget], OBJECTS)
+    expect(ctx).toContain('FROM Z_SOP ZS')
+    expect(ctx.length).toBeLessThan(6000 * 1.35)
+  })
+})
