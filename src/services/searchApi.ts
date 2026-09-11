@@ -154,6 +154,51 @@ export async function fetchObjectIndex(
   }
 }
 
+/** 文档台账的单篇条目（服务端 /api/documents 返回，绝不携带正文） */
+export interface DocIndexItem {
+  id: string
+  name: string
+  type: string
+  status: string
+  pages: number | null
+  chunks: number
+  size: string
+  uploadDate: string
+  approvedDate: string
+  uploaderName: string
+  indexed: boolean
+  indexedPages: number
+}
+
+/** 文档台账：counts 为三态权威计数，供模型直接引用而不是自己数 */
+export interface DocIndexResult {
+  items: DocIndexItem[]
+  total: number
+  counts: { total: number; approved: number; pending: number; rejected: number }
+}
+
+/**
+ * 取「知识库文档台账」：权威的文档清单与状态计数，**不含正文**。
+ * 与 fetchObjectIndex 的关键区别：失败/未就绪返回 **null**（而非空数组），
+ * 让调用方区分「服务端不可用」与「库里真的没有文档」——前者必须维持历史行为（零回归）。
+ */
+export async function fetchDocumentIndex(
+  opts: { status?: string; q?: string; limit?: number; timeoutMs?: number } = {}
+): Promise<DocIndexResult | null> {
+  const st = await fetchSearchStatus()
+  if (!st?.ready) return null
+  const qs = new URLSearchParams()
+  if (opts.status) qs.set('status', opts.status)
+  if (opts.q) qs.set('q', opts.q)
+  qs.set('limit', String(Math.min(Math.max(opts.limit ?? 200, 1), 500)))
+  try {
+    const data = await fetchJson(`${BACKEND_BASE}/api/documents?${qs.toString()}`, opts.timeoutMs ?? DEFAULT_TIMEOUT)
+    return data && Array.isArray(data.items) ? (data as DocIndexResult) : null
+  } catch {
+    return null
+  }
+}
+
 /**
  * 提问前统一解析服务端的命中结果：
  * - 服务端索引就绪 → 走 /api/search（唯一能检索到 contentOmitted 超大文档正文的通道）
