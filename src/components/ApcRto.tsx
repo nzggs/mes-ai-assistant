@@ -87,7 +87,7 @@ function confidenceColor(c: number): string {
   return '#ef4444'
 }
 
-export function ApcRto() {
+export function ApcRto({ initialProjectId }: { initialProjectId?: string | null } = {}) {
   const [status, setStatus] = useState<ApcStatusResponse | null>(null)
   const [overview, setOverview] = useState<ApcOverview | null>(null)
   const [optimization, setOptimization] = useState<ApcOptimization | null>(null)
@@ -100,7 +100,21 @@ export function ApcRto() {
   const [detailCode, setDetailCode] = useState<string | null>(null)
   const [updatedAt, setUpdatedAt] = useState<number | null>(null)
   const [copied, setCopied] = useState(false)
-  const [configOpen, setConfigOpen] = useState(false)
+  // 项目制：当前选中的监测项目 + 正在编辑的项目 id（null = 新建）
+  const [activeProject, setActiveProject] = useState<string>(() => {
+    if (initialProjectId) return initialProjectId
+    try { return localStorage.getItem('mes-ai-apc-project') || '' } catch { return '' }
+  })
+  const [editingId, setEditingId] = useState<string | null | undefined>(undefined) // undefined=关闭
+
+  const projects = status?.projects || []
+  const activeProjectId = activeProject || projects[0]?.id || ''
+  const activeProjectMeta = projects.find(p => p.id === activeProjectId) || null
+
+  const handleSelectProject = useCallback((id: string) => {
+    setActiveProject(id)
+    try { localStorage.setItem('mes-ai-apc-project', id) } catch { /* 忽略 */ }
+  }, [])
 
   const loadStatus = useCallback(() => {
     return fetchApcStatus()
@@ -112,8 +126,8 @@ export function ApcRto() {
     setLoading(true)
     try {
       const [ov, op] = await Promise.all([
-        fetchApcOverview({ minutes: windowMinutes, refresh: opts.refresh }),
-        fetchApcOptimization({ minutes: windowMinutes, refresh: opts.refresh }),
+        fetchApcOverview({ minutes: windowMinutes, refresh: opts.refresh, project: activeProjectId || undefined }),
+        fetchApcOptimization({ minutes: windowMinutes, refresh: opts.refresh, project: activeProjectId || undefined }),
       ])
       setOverview(ov)
       setOptimization(op)
@@ -124,13 +138,22 @@ export function ApcRto() {
     } finally {
       setLoading(false)
     }
-  }, [windowMinutes])
+  }, [windowMinutes, activeProjectId])
 
   // 配置保存后：重新拉状态（数据源模式可能已从仿真切到真实库）并立即刷新数据
   const handleConfigSaved = useCallback(() => {
     loadStatus()
     load({ refresh: true })
   }, [loadStatus, load])
+
+  // 项目编辑器保存/删除成功后：刷新项目列表 + 数据；新建后自动切换选中
+  const handleProjectSaved = useCallback((savedId?: string) => {
+    setEditingId(undefined)
+    if (savedId) handleSelectProject(savedId)
+    loadStatus()
+    // load 依赖 activeProjectId，等一拍让选中项目生效后再刷新
+    setTimeout(() => load({ refresh: true }), 0)
+  }, [handleSelectProject, loadStatus, load])
 
   useEffect(() => {
     loadStatus()
@@ -248,6 +271,7 @@ export function ApcRto() {
             </div>
             <p className="text-xs text-mes-textTertiary mt-1 leading-relaxed">
               即时读取只读数据源中记录的过程数据列值，依据数据变化优化过程参数设定值，给出建议值。
+              {activeProjectMeta ? ` · 项目「${activeProjectMeta.name}」（${activeProjectMeta.dbSlot === 'db2' ? '数据库系统 2' : '数据库系统 1'}）` : ''}
               {overview ? ` · ${overview.station}` : ''}
             </p>
           </div>
@@ -297,16 +321,41 @@ export function ApcRto() {
               立即刷新
             </button>
 
+            <select
+              value={activeProjectId}
+              onChange={e => handleSelectProject(e.target.value)}
+              className="text-xs px-2.5 py-1.5 rounded-lg border border-mes-border bg-white text-mes-textSecondary focus:outline-none focus:border-mes-primary max-w-[200px]"
+              title="监测项目"
+            >
+              {projects.length === 0 && <option value="">（暂无项目）</option>}
+              {projects.map(p => (
+                <option key={p.id} value={p.id}>{p.name}</option>
+              ))}
+            </select>
+
             <button
-              onClick={() => setConfigOpen(true)}
-              title="配置只读数据库连接、取数 SQL 与过程参数"
-              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border border-mes-border bg-white text-mes-textSecondary hover:border-mes-primary hover:text-mes-primary transition-colors"
+              onClick={() => setEditingId(activeProjectId || null)}
+              disabled={!activeProjectId}
+              title="编辑当前监测项目（名称 / 数据库 / SQL 模板 / 参数）"
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border border-mes-border bg-white text-mes-textSecondary hover:border-mes-primary hover:text-mes-primary disabled:opacity-50 transition-colors"
             >
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                 <circle cx="12" cy="12" r="3" />
                 <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9v0a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
               </svg>
-              数据源配置
+              编辑项目
+            </button>
+
+            <button
+              onClick={() => setEditingId(null)}
+              title="新建监测项目（用哪个数据库 + SQL 模板 + 参数）"
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border border-mes-border bg-white text-mes-textSecondary hover:border-mes-primary hover:text-mes-primary transition-colors"
+            >
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <line x1="12" y1="5" x2="12" y2="19" />
+                <line x1="5" y1="12" x2="19" y2="12" />
+              </svg>
+              新建项目
             </button>
 
             <button
@@ -353,17 +402,20 @@ export function ApcRto() {
               <span className="text-mes-textTertiary">只读模式</span>
               <span className="px-2 py-0.5 rounded-full bg-green-50 text-green-700 font-medium">仅 SELECT · 禁增删改</span>
             </div>
-            {status?.hana && (
-              <div className="flex items-center gap-2">
+            {status?.hana && status.hana.slots?.length > 0 && (
+              <div className="flex items-center gap-2 flex-wrap">
                 <span className="text-mes-textTertiary">连接</span>
-                <span className="flex items-center gap-1.5">
-                  <span className={`w-2 h-2 rounded-full ${overview?.mode === 'hana' ? 'bg-mes-success' : 'bg-gray-300'}`} />
-                  <span className="text-mes-textSecondary">
-                    {overview?.mode === 'hana'
-                      ? (status.hana.connected ? `已连接 ${status.hana.host}:${status.hana.port}` : '待连接（首次取数时建立）')
-                      : '未启用（仿真源）'}
+                {status.hana.slots.map(s => (
+                  <span key={s.id} className="flex items-center gap-1.5">
+                    <span className={`w-2 h-2 rounded-full ${s.connected ? 'bg-mes-success' : (s.configured ? 'bg-amber-400' : 'bg-gray-300')}`} />
+                    <span className="text-mes-textSecondary">
+                      {s.configured
+                        ? (s.connected ? `${s.name || s.id} 已连接 ${s.host}:${s.port}` : `${s.name || s.id} 待连接（首次取数时建立）`)
+                        : `${s.name || s.id} 未配置`}
+                    </span>
                   </span>
-                </span>
+                ))}
+                {overview?.mode !== 'hana' && <span className="text-mes-textSecondary">未启用（仿真源）</span>}
               </div>
             )}
             {overview && (
@@ -389,18 +441,20 @@ export function ApcRto() {
               {overview.source.note}
               <div className="mt-2 flex flex-wrap items-center gap-2">
                 <button
-                  onClick={() => setConfigOpen(true)}
+                  onClick={() => setEditingId(null)}
                   className="px-2.5 py-1 rounded-lg text-[11px] font-medium bg-mes-primary text-white hover:bg-mes-primaryHover"
                 >
-                  配置只读数据库连接
+                  新建监测项目
                 </button>
-                <span>配置保存后立即生效，无需重启服务。</span>
+                <span>在项目里选好数据库并配置 SQL 模板后，即可从仿真切换为真实数据。</span>
               </div>
             </div>
           )}
-          {status?.hana?.lastError && overview?.mode === 'hana' && (
+          {status?.hana?.slots?.some(s => s.lastError) && overview?.mode === 'hana' && (
             <div className="mt-3 pt-3 border-t border-mes-border text-[11px] text-red-600">
-              最近一次数据源错误：{status.hana.lastError}
+              {status.hana.slots.filter(s => s.lastError).map(s => (
+                <div key={s.id}>最近一次数据源错误（{s.name || s.id}）：{s.lastError}</div>
+              ))}
             </div>
           )}
         </div>
@@ -448,6 +502,52 @@ export function ApcRto() {
 
         {overview && tab === 'overview' && (
           <div className="space-y-5">
+            {/* 监测项目卡片：创建的项目显示在实时概览，点击切换 */}
+            {projects.length > 0 && (
+              <section>
+                <div className="flex items-center gap-2 mb-2">
+                  <span className="text-sm font-semibold text-mes-text">监测项目</span>
+                  <span className="text-[11px] text-mes-textTertiary">{projects.length} 个 · 点击切换</span>
+                  <div className="flex-1 h-px bg-mes-border" />
+                </div>
+                <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-3">
+                  {projects.map(p => {
+                    const active = p.id === activeProjectId
+                    return (
+                      <button
+                        key={p.id}
+                        onClick={() => handleSelectProject(p.id)}
+                        title="切换到该项目"
+                        className={`text-left rounded-xl border p-3.5 transition-all-smooth ${
+                          active
+                            ? 'border-mes-primary bg-mes-tagBg/40 shadow-sm'
+                            : 'border-mes-border bg-white hover:border-mes-primary/40 hover:shadow-md'
+                        }`}
+                      >
+                        <div className="flex items-center justify-between gap-2 mb-1.5">
+                          <span className={`text-sm font-semibold truncate ${active ? 'text-mes-primary' : 'text-mes-text'}`}>{p.name}</span>
+                          <span className="shrink-0 text-[10px] px-1.5 py-0.5 rounded-full bg-mes-tagBg text-mes-tagText font-medium">
+                            {p.dbSlot === 'db2' ? '数据库系统 2' : '数据库系统 1'}
+                          </span>
+                        </div>
+                        <p className="text-[11px] text-mes-textTertiary line-clamp-2 mb-1.5 min-h-[2em]">
+                          {p.description || '未填写描述'}
+                        </p>
+                        <div className="flex items-center gap-1.5 flex-wrap">
+                          <span className="text-[10px] text-mes-textSecondary">{p.paramCount} 个监测参数</span>
+                          {!p.hasQueries && (
+                            <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-amber-50 text-amber-700">未配 SQL</span>
+                          )}
+                          {active && (
+                            <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-mes-primary text-white">当前</span>
+                          )}
+                        </div>
+                      </button>
+                    )
+                  })}
+                </div>
+              </section>
+            )}
             {grouped.map(g => (
               <section key={g.process}>
                 <div className="flex items-center gap-2 mb-2">
@@ -482,15 +582,17 @@ export function ApcRto() {
         <ParamDetail
           param={detailParam}
           windowMinutes={windowMinutes}
+          projectId={activeProjectId}
           onClose={() => setDetailCode(null)}
         />
       )}
 
-      {/* ===== 数据源配置面板（数据库登录 / SQL 查询语句 / 参数配置）===== */}
-      {configOpen && (
+      {/* ===== 监测项目编辑器（项目设置 / SQL 模板 / 参数配置）===== */}
+      {editingId !== undefined && (
         <ApcConfigPanel
-          onClose={() => setConfigOpen(false)}
-          onSaved={handleConfigSaved}
+          projectId={editingId}
+          onClose={() => setEditingId(undefined)}
+          onSaved={handleProjectSaved}
         />
       )}
     </div>
@@ -728,10 +830,12 @@ function MiniStat({ label, value }: { label: string; value: string }) {
 function ParamDetail({
   param,
   windowMinutes,
+  projectId,
   onClose,
 }: {
   param: ApcParamItem
   windowMinutes: number
+  projectId?: string
   onClose: () => void
 }) {
   const [history, setHistory] = useState<ApcHistoryResponse | null>(null)
@@ -742,12 +846,12 @@ function ParamDetail({
     let cancelled = false
     setLoading(true)
     setErr('')
-    fetchApcHistory(param.code, { minutes: windowMinutes })
+    fetchApcHistory(param.code, { minutes: windowMinutes, project: projectId || undefined })
       .then(h => { if (!cancelled) setHistory(h) })
       .catch(e => { if (!cancelled) setErr(e?.message || String(e)) })
       .finally(() => { if (!cancelled) setLoading(false) })
     return () => { cancelled = true }
-  }, [param.code, windowMinutes])
+  }, [param.code, windowMinutes, projectId])
 
   const r = param.recommendation
   const meta = STATUS_META[param.status]

@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import type { Conversation, SidebarView, KnowledgeDoc } from '../types'
 import type { User } from './AuthModal'
-import { canAccessUserManagement } from '../services/userService'
+import { canAccessUserManagement, canAccessDatabaseManagement } from '../services/userService'
 
 interface SidebarProps {
   conversations: Conversation[]

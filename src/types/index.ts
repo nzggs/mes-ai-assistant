@@ -183,7 +183,7 @@ export interface PresetQuestion {
 }
 
 /** 侧边栏视图 */
-export type SidebarView = 'chat' | 'apc' | 'knowledge' | 'usermanagement'
+export type SidebarView = 'chat' | 'apc' | 'knowledge' | 'usermanagement' | 'dbmanage'
 
 /** 知识图谱节点类型 */
 export type GraphNodeType = 'equipment' | 'process' | 'product' | 'quality' | 'personnel' | 'material' | 'document'
@@ -312,6 +312,8 @@ export interface ApcOverview {
 
 /** 优化建议响应（GET /api/apc/optimize） */
 export interface ApcOptimization {
+  project?: string
+  projectName?: string
   station: string
   mode: ApcSourceMode
   generatedAt: string
@@ -328,8 +330,10 @@ export interface ApcOptimization {
   items: ApcParamItem[]
 }
 
-/** HANA 只读数据源运行状态 */
-export interface ApcHanaStatus {
+/** 单个数据库槽位的只读数据源运行状态 */
+export interface ApcHanaSlotStatus {
+  id: string
+  name?: string
   configured: boolean
   connected: boolean
   connecting: boolean
@@ -348,6 +352,12 @@ export interface ApcHanaStatus {
   abortedCount: number
 }
 
+/** HANA 只读数据源运行状态（按槽位分别给出） */
+export interface ApcHanaStatus {
+  configured: boolean
+  slots: ApcHanaSlotStatus[]
+}
+
 /** 功能状态响应（GET /api/apc/status） */
 export interface ApcStatusResponse {
   enabled: boolean
@@ -361,6 +371,8 @@ export interface ApcStatusResponse {
   catalogOrigin: 'env-file' | 'saved'
   catalogFileLocked: boolean
   catalogError: string
+  /** 监测项目摘要列表 */
+  projects: Array<{ id: string; name: string; description: string; dbSlot: string; paramCount: number; hasQueries: boolean }>
   /** 运行期配置文件（落在数据卷，不随镜像重建丢失，且不入 git） */
   configFile: string
   configFileExists: boolean
@@ -435,6 +447,8 @@ export interface ApcParamConfig {
   processGain: number
   /** 宽表模式下的取值列名；窄表模式留空 */
   column?: string
+  /** 该参数的数据取自哪个数据库系统（db1 / db2），缺省 db1 */
+  dbSlot?: 'db1' | 'db2'
   sim?: Record<string, number>
 }
 
@@ -497,14 +511,16 @@ export interface ApcConfigResponse {
   catalogFileLocked: boolean
   seedFile: string
   database: {
-    /** 当前「正在使用」的数据库槽位 id */
-    activeId: string
-    /** 两个数据库系统（db1 / db2）的生效配置 */
+    /** 连接按槽位保存（公用配置，在「数据库管理」页维护） */
     slots: ApcDatabaseSlot[]
     envConfigured: boolean
     envValues: Partial<ApcDatabaseValues> & { passwordSet: boolean }
     defaults: Partial<ApcDatabaseValues>
   }
+  /** 问答直查公用限制（数据库管理页维护） */
+  limits: { chatRows: number }
+  /** 监测项目摘要列表 */
+  projects: ApcProjectSummary[]
   queries: ApcQueryConfig | null
   params: ApcParamConfig[]
   meta: ApcCatalogMeta | null
@@ -517,11 +533,59 @@ export interface ApcConfigPatch {
   database?: ApcDatabaseDraft
   /** 按槽位保存的数据库连接（db1 / db2） */
   databases?: Record<string, ApcDatabaseDraft>
-  /** 切换「正在使用」的数据库槽位 */
+  /** @deprecated 全局「正在使用」开关已废弃，改由每个参数项各自绑定 dbSlot */
   activeDatabase?: string
   queries?: ApcQueryConfig
   params?: ApcParamConfig[]
   meta?: Partial<ApcCatalogMeta>
+}
+
+/** 监测项目摘要（列表/卡片用，不含 queries/params 全文） */
+export interface ApcProjectSummary {
+  id: string
+  name: string
+  description: string
+  /** 项目绑定的数据库槽位（db1 / db2） */
+  dbSlot: string
+  paramCount: number
+  /** 是否已配置取数 SQL 模板 */
+  hasQueries: boolean
+  createdAt: string | null
+  updatedAt: string | null
+}
+
+/** 监测项目完整定义（项目编辑器用） */
+export interface ApcProjectFull extends ApcProjectSummary {
+  queries: ApcQueryConfig | null
+  params: ApcParamConfig[]
+}
+
+/** 项目创建/更新草稿（只提交传入的字段） */
+export interface ApcProjectDraft {
+  name?: string
+  description?: string
+  dbSlot?: string
+  queries?: ApcQueryConfig | null
+  params?: ApcParamConfig[]
+}
+
+/** MES 直查指引（GET /api/mes/guide，不含任何凭据；与项目 SQL 模板无关，SQL 从知识库检索） */
+export interface MesGuide {
+  slots: Array<{ id: string; name: string; configured: boolean }>
+  limits: { maxRows: number; chatRows: number }
+}
+
+/** MES 直查结果（POST /api/mes/query） */
+export interface MesQueryResult {
+  ok: boolean
+  slot: string
+  slotName: string
+  columns: string[]
+  rows: Record<string, unknown>[]
+  rowCount: number
+  truncated: boolean
+  elapsedMs: number
+  sql: string
 }
 
 /** 数据库连接测试结果 */

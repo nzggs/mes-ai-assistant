@@ -2,7 +2,7 @@ import { useEffect, useRef } from 'react'
 import type { Conversation } from '../types'
 import type { User } from '../services/userService'
 import { MessageBubble } from './MessageBubble'
-import { ChatInput } from './ChatInput'
+import { ChatInput, type MesSource, type MesSlotInfo } from './ChatInput'
 
 interface ChatAreaProps {
   conversation: Conversation
@@ -12,6 +12,9 @@ interface ChatAreaProps {
   currentUser?: User | null
   deepThink: boolean
   onToggleDeepThink: () => void
+  mesSource?: MesSource
+  mesSlots?: MesSlotInfo[]
+  onMesSourceChange?: (s: MesSource) => void
 }
 
 export function ChatArea({
@@ -22,6 +25,9 @@ export function ChatArea({
   currentUser,
   deepThink,
   onToggleDeepThink,
+  mesSource = 'off',
+  mesSlots = [],
+  onMesSourceChange,
 }: ChatAreaProps) {
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const scrollContainerRef = useRef<HTMLDivElement>(null)
@@ -93,6 +99,9 @@ export function ChatArea({
             onToggleKnowledgeBase={onToggleKnowledgeBase}
             deepThink={deepThink}
             onToggleDeepThink={onToggleDeepThink}
+            mesSource={mesSource}
+            mesSlots={mesSlots}
+            onMesSourceChange={onMesSourceChange}
           />
         </div>
       </div>

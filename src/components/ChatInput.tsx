@@ -1,5 +1,13 @@
 import { useState, useRef, useEffect } from 'react'
 
+export type MesSource = 'off' | 'db1' | 'db2'
+
+export interface MesSlotInfo {
+  id: string
+  name: string
+  configured: boolean
+}
+
 interface ChatInputProps {
   onSend: (text: string) => void
   disabled: boolean
@@ -7,6 +15,10 @@ interface ChatInputProps {
   onToggleKnowledgeBase: () => void
   deepThink: boolean
   onToggleDeepThink: () => void
+  /** 问答环节的数据源选择：关闭 / 数据库1 / 数据库2 */
+  mesSource?: MesSource
+  mesSlots?: MesSlotInfo[]
+  onMesSourceChange?: (s: MesSource) => void
 }
 
 export function ChatInput({
@@ -16,6 +28,9 @@ export function ChatInput({
   onToggleKnowledgeBase,
   deepThink,
   onToggleDeepThink,
+  mesSource = 'off',
+  mesSlots = [],
+  onMesSourceChange,
 }: ChatInputProps) {
   const [text, setText] = useState('')
   const textareaRef = useRef<HTMLTextAreaElement>(null)
@@ -97,19 +112,34 @@ export function ChatInput({
               知识库
             </button>
 
-            {/* MES数据（暂不开发，常驻灰色禁用） */}
-            <button
-              disabled
-              className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-medium text-gray-300 bg-gray-100 cursor-not-allowed"
-              title="MES 数据查询功能暂未开放"
+            {/* MES 数据源选择：关闭 / 数据库1 / 数据库2。
+                选择某个数据库后，问答可按「数据源配置」里推荐的 SQL 与硬性要求
+                （仅 SELECT、行数上限、连接/语句超时）检索出具体数据。 */}
+            <div
+              className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-medium transition-all-smooth ${
+                mesSource !== 'off' ? 'bg-mes-tagBg text-mes-primary' : 'text-mes-textSecondary hover:bg-gray-100'
+              }`}
+              title="选择 MES 数据源后，AI 可按只读护栏（仅 SELECT、行数上限、超时限制）检索具体过程数据"
             >
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                 <ellipse cx="12" cy="5" rx="9" ry="3" />
                 <path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3" />
                 <path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5" />
               </svg>
-              MES数据
-            </button>
+              <select
+                value={mesSource}
+                onChange={e => onMesSourceChange(e.target.value as MesSource)}
+                disabled={disabled}
+                className="bg-transparent text-xs font-medium outline-none cursor-pointer disabled:cursor-not-allowed max-w-[110px]"
+              >
+                <option value="off">数据库关闭</option>
+                {mesSlots.map(s => (
+                  <option key={s.id} value={s.id}>
+                    {s.name || s.id}{s.configured ? '' : '（未配置）'}
+                  </option>
+                ))}
+              </select>
+            </div>
           </div>
 
           {/* 发送按钮 */}

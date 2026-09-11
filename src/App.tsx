@@ -7,12 +7,16 @@ import { WelcomeScreen } from './components/WelcomeScreen'
 import { ApiKeyModal } from './components/ApiKeyModal'
 import { AuthModal, getSession, clearSession, type User } from './components/AuthModal'
 import { UserManagement } from './components/UserManagement'
+import { DatabaseManage } from './components/DatabaseManage'
 import { ChangePasswordModal } from './components/ChangePasswordModal'
 import ErrorToasts from './components/ErrorToasts'
 import { generateResponse, initialConversations, presetQuestions } from './data/mockData'
 import { streamChat, hasApiKey, getProvider, getReasoningModelId, resolveModelId, summarizeHistory, type ChatMessageDto } from './services/llmApi'
 import { buildKnowledgeContext, decideRetrievalMode, detectSummaryIntent, getCachedSummary, FULL_DOC_SUMMARY_KEY, summarizeDocumentScope } from './services/knowledgeService'
-import { ensureSuperAdminSeeded, syncUsersFromBackend, canAccessUserManagement } from './services/userService'
+import { fetchMesGuide, queryMesData } from './services/apcApi'
+import type { MesSource, MesSlotInfo } from './components/ChatInput'
+import type { MesGuide } from './types'
+import { ensureSuperAdminSeeded, syncUsersFromBackend, canAccessUserManagement, canAccessDatabaseManagement } from './services/userService'
 import { getAllDocs, restoreDocsFromRecords, syncLocalToBackend, saveTableSummary, fetchAllDocPages } from './services/docStore'
 import { resolveServerHits, fetchObjectIndex, fetchDocumentIndex, type ServerSearchHit, type SearchObject, type DocIndexResult } from './services/searchApi'
 import { resolveModelProfile, hasSqlIntent } from '../shared/modelProfile.js'
@@ -31,6 +35,58 @@ function uid(prefix: string): string {
   return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
 }
 
+// ===== 问答中的 MES 数据直查（两轮对话）=====
+//
+// 问答环节与监测项目的 SQL 模板无关：SQL 由模型从知识库上下文中检索/改写得到
+// （知识库里的 SQL/脚本页在检索时已加权）。第一轮注入「硬性要求」（数据库管理页维护的
+// 限制），模型如需真实数据，先给出来源行，再输出一个 ```mes-sql 代码块；
+// 第二轮：前端提取 SQL → POST /api/mes/query（服务端硬护栏：仅 SELECT / 行数上限 /
+// 连接与语句超时，按所选数据库槽位执行）→ 结果回灌给模型，基于真实数据作答。
+
+/** 从模型回答中提取 mes-sql 推荐查询（只取第一个代码块） */
+function extractMesSql(text: string): string | null {
+  const m = text.match(/```mes-sql\s*([\s\S]*?)```/)
+  const sql = m ? m[1].trim() : ''
+  return sql || null
+}
+
+/** 从 mes-sql 代码块之前的文本里提取「来源：xxx」标注（SQL 取自哪篇文档/哪个脚本） */
+function extractMesSource(text: string): string | null {
+  const m = text.match(/来源\s*[：:]\s*([^\n`]{1,120})/)
+  return m ? m[1].trim() : null
+}
+
+/** 构建注入给模型的 MES 直查指引（随所选槽位变化；不注入任何项目 SQL 模板） */
+function buildMesInstruction(guide: MesGuide | null, slotId: 'db1' | 'db2', slotName: string): string {
+  const limits = guide?.limits
+  const lines: string[] = []
+  lines.push(`\n\n## MES 数据库直查（${slotName}，HANA 只读）`)
+  lines.push(`用户已选择从「${slotName}」检索数据。你可以通过输出**恰好一个** \`\`\`mes-sql 代码块来发起一次只读查询，系统执行后会把真实结果回传给你，届时你再基于真实数据作答。硬性要求（系统强制，违反会被直接拒绝）：`)
+  lines.push(`1. 只允许单条 SELECT / WITH 查询语句；任何 INSERT / UPDATE / DELETE / DDL 都会被拦截。`)
+  lines.push(`2. 结果行数上限 ${limits?.chatRows ?? 100} 行；请在 SQL 里写好 LIMIT 并合理取数。`)
+  lines.push(`3. 不得残留任何 {{...}} 模板占位符——占位符必须代入具体值。`)
+  lines.push(`4. 只查询与用户问题相关的数据，不要把所有列全查出来。`)
+  lines.push(`SQL 从哪里来：**优先使用上方知识库上下文里出现的 SQL 查询/脚本片段**（包括其表名、列名与过滤写法），按用户问题改写成一条完整 SELECT；知识库中没有可用的 SQL 时，基于上下文里的表结构信息谨慎编写，并明确说明该 SQL 未经现场验证。`)
+  lines.push(`输出格式：需要查库时，先用一句话说明查询意图与 **来源**（格式：来源：<文档名/脚本名>；若无来源写 来源：知识库未命中，SQL 为自行编写），然后输出一个 \`\`\`mes-sql 代码块（内含完整 SQL），除此之外**不要编造任何具体数值**；系统会把查询结果回传，你再给出最终回答。无需查库即可回答时，不要输出 mes-sql 代码块。`)
+  return lines.join('\n')
+}
+
+/** 把查询结果压成模型友好的文本（限制总长度，防止撑爆上下文） */
+function formatMesRows(result: { columns: string[]; rows: Record<string, unknown>[]; rowCount: number; truncated: boolean }): string {
+  const MAX_CHARS = 12000
+  const head = `列名：${result.columns.join(', ')}`
+  let body = ''
+  let n = 0
+  for (const row of result.rows) {
+    const line = JSON.stringify(row)
+    if (body.length + line.length > MAX_CHARS) break
+    body += (body ? '\n' : '') + line
+    n++
+  }
+  const tail = n < result.rows.length ? `\n（仅展示前 ${n} 行，共 ${result.rowCount} 行${result.truncated ? '，已按上限截断' : ''}）` : ''
+  return `${head}\n${body}${tail}`
+}
+
 export default function App() {
   const [conversations, setConversations] = useState<Conversation[]>(initialConversations)
   const [activeId, setActiveId] = useState<string | null>(null)
@@ -46,6 +102,32 @@ export default function App() {
   const [documents, setDocuments] = useState<KnowledgeDoc[]>([])
   const [useKnowledgeBase, setUseKnowledgeBase] = useState(true)
   const [deepThink, setDeepThink] = useState(true)
+  // 问答环节的 MES 数据源选择：数据库关闭 / 数据库1 / 数据库2（持久化到 localStorage）
+  const [mesSource, setMesSource] = useState<MesSource>(() => {    const v = localStorage.getItem('mes-ai-mes-source')
+    return v === 'db1' || v === 'db2' ? v : 'off'
+  })
+  const [mesSlots, setMesSlots] = useState<MesSlotInfo[]>([
+    { id: 'db1', name: '数据库系统 1', configured: false },
+    { id: 'db2', name: '数据库系统 2', configured: false },
+  ])
+  const mesGuideRef = useRef<MesGuide | null>(null)
+  useEffect(() => { localStorage.setItem('mes-ai-mes-source', mesSource) }, [mesSource])
+  // 拉取 MES 直查指引（槽位显示名 / 是否已配置 / 推荐 SQL 模板 / 参数白名单）
+  useEffect(() => {
+    let cancelled = false
+    fetchMesGuide()
+      .then(g => {
+        if (cancelled) return
+        mesGuideRef.current = g
+        if (g.slots?.length) {
+          setMesSlots(g.slots.map(s => ({ id: s.id, name: s.name, configured: s.configured })))
+        }
+      })
+      .catch(() => { /* 未配置 APC / 服务不可用时静默：下拉仍显示默认槽位名 */ })
+    return () => { cancelled = true }
+  }, [])
+  const handleMesSourceChange = useCallback((s: MesSource) => setMesSource(s), [])
+
   const chatAreaRef = useRef<HTMLDivElement>(null)
   // 会话列表 ref：让发送回调始终读取最新历史，避免 useCallback 闭包陈旧导致快速连发漏消息
   const conversationsRef = useRef(conversations)
@@ -227,6 +309,8 @@ export default function App() {
     let hasContent = false
     let hasThinking = false
     let llmFailed = false
+    // 累计正文（用于 MES 直查：从第一轮回答里提取 mes-sql 推荐查询）
+    let answerAccum = ''
 
     // 构建知识库上下文（仅当启用知识库检索时，传入用户查询实现智能检索）
     // 三态：
@@ -366,12 +450,20 @@ export default function App() {
       : ''
     finalKnowledgeContext += kbMissHint
 
+    // MES 数据直查指引：问答栏选择了数据库1/数据库2 时，注入推荐 SQL 模板与硬性要求，
+    // 允许模型输出一个 ```mes-sql 推荐查询，由系统按只读护栏执行后再回灌真实数据
+    const mesActive = mesSource === 'db1' || mesSource === 'db2'
+    if (mesActive) {
+      const slotName = mesSlots.find(s => s.id === mesSource)?.name || (mesSource === 'db1' ? '数据库系统 1' : '数据库系统 2')
+      finalKnowledgeContext += buildMesInstruction(mesGuideRef.current, mesSource, slotName)
+    }
+
     // 深度思考模式：启用推理过程展示，并优先切换到支持推理的模型
     const reasoningModelId = deepThink ? (getReasoningModelId() || getProvider().defaultModel) : getProvider().defaultModel
 
-    // 封装流式请求，便于"仅推理无正文"时自动重试一次
-    const runStream = async (): Promise<void> => {
-      await streamChat(llmMessages, {
+    // 封装流式请求，便于"仅推理无正文"时自动重试一次；msgs 可指定（MES 第二轮会追加查询结果）
+    const runStream = async (msgs: ChatMessageDto[] = llmMessages, useThinking = deepThink): Promise<void> => {
+      await streamChat(msgs, {
       onThinking: (chunk) => {
         hasThinking = true
         setConversations(prev => prev.map(c => {
@@ -397,6 +489,7 @@ export default function App() {
       },
       onContent: (chunk) => {
         hasContent = true
+        answerAccum += chunk
         setConversations(prev => prev.map(c => {
           if (c.id !== convId) return c
           return {
@@ -476,7 +569,7 @@ export default function App() {
       },
     }, {
       knowledgeContext: finalKnowledgeContext,
-      useThinking: deepThink,
+      useThinking,
       modelId: reasoningModelId,
     })
   }
@@ -487,6 +580,7 @@ export default function App() {
   if (hasThinking && !hasContent && !llmFailed) {
     hasThinking = false
     hasContent = false
+    answerAccum = ''
     // 清空上一轮思考内容，保留等待状态
     setConversations(prev => prev.map(c => {
       if (c.id !== convId) return c
@@ -496,6 +590,76 @@ export default function App() {
       }
     }))
     await runStream()
+  }
+
+  // ===== MES 数据直查第二轮 =====
+  // 模型在第一轮回答里给出了 ```mes-sql 推荐查询：按硬性要求（仅 SELECT / 行数上限 /
+  // 连接与语句超时，走所选数据库槽位）执行，把真实结果回灌，让模型基于具体数据作答。
+  if (mesActive && hasContent && !llmFailed) {
+    const mesSql = extractMesSql(answerAccum)
+    if (mesSql) {
+      const slotName = mesSlots.find(s => s.id === mesSource)?.name || (mesSource === 'db1' ? '数据库系统 1' : '数据库系统 2')
+      const mesSourceNote = extractMesSource(answerAccum.replace(/```mes-sql[\s\S]*?```/, ''))
+      // 在回答中留下「已执行查询」的可见标记（含所用 SQL 与来源）
+      const marker = `\n\n> 🗄️ 正在按以下 SQL 查询「${slotName}」（只读，服务端强制行数上限与超时）…\n> 来源：${mesSourceNote || '未标注'}\n\n\`\`\`sql\n${mesSql}\n\`\`\`\n`
+      setConversations(prev => prev.map(c => {
+        if (c.id !== convId) return c
+        return {
+          ...c,
+          messages: c.messages.map(m => {
+            if (m.id !== aiMsgId) return m
+            const textBlock = m.contents.find(ct => ct.type === 'text')
+            if (textBlock) {
+              return { ...m, contents: m.contents.map(ct => ct.type === 'text' ? { ...ct, text: (ct.text || '') + marker } : ct) }
+            }
+            return { ...m, contents: [{ type: 'text' as const, text: marker }] }
+          }),
+        }
+      }))
+      try {
+        const result = await queryMesData({ slot: mesSource, sql: mesSql })
+        const doneNote = `已在「${result.slotName}」执行只读查询（${result.rowCount} 行 / ${result.elapsedMs}ms${result.truncated ? '，已按行数上限截断' : ''}）`
+        setConversations(prev => prev.map(c => {
+          if (c.id !== convId) return c
+          return {
+            ...c,
+            messages: c.messages.map(m => {
+              if (m.id !== aiMsgId) return m
+              return {
+                ...m,
+                contents: m.contents.map(ct => ct.type === 'text' ? { ...ct, text: (ct.text || '').replace(/> 🗄️ 正在按以下 SQL 查询「[^」]*」（只读，服务端强制行数上限与超时）…/, `> 🗄️ ${doneNote}`) } : ct),
+                isStreaming: true,
+              }
+            }),
+          }
+        }))
+        const followup: ChatMessageDto = {
+          role: 'user',
+          content:
+            `【MES 查询结果】\n已在「${result.slotName}」执行以下只读查询（${result.rowCount} 行，耗时 ${result.elapsedMs}ms${result.truncated ? '，结果已按行数上限截断' : ''}）：\n${result.sql}\n\n查询结果（JSON 行）：\n${formatMesRows(result)}\n\n请基于以上**真实查询数据**回答用户最初的问题：给出具体数值与必要的数据分析，并在回答里注明所用 SQL 与其来源（${mesSourceNote || '未标注'}）；如果数据不足以回答，请明确说明缺什么，不要编造数值。`,
+        }
+        await runStream(
+          [...llmMessages, { role: 'assistant' as const, content: answerAccum }, followup],
+          false // 第二轮不再单独输出思考块，直接给出基于数据的回答
+        )
+      } catch (err: any) {
+        const msg = err?.message || String(err)
+        setConversations(prev => prev.map(c => {
+          if (c.id !== convId) return c
+          return {
+            ...c,
+            messages: c.messages.map(m => {
+              if (m.id !== aiMsgId) return m
+              return {
+                ...m,
+                contents: m.contents.map(ct => ct.type === 'text' ? { ...ct, text: (ct.text || '').replace(/> 🗄️ 正在按以下 SQL 查询「[^」]*」（只读，服务端强制行数上限与超时）…/, `> ⚠️ 查询失败：${msg}`)} : ct),
+                isStreaming: false,
+              }
+            }),
+          }
+        }))
+      }
+    }
   }
 
     // LLM 完全无响应（无正文且无推理过程）且未报错时：生产环境明确报错，DEV 环境降级到 Mock
@@ -571,7 +735,7 @@ export default function App() {
       console.error('handleSendMessage error:', err)
     }
   }
-}, [activeId, openApiKeyModal, useKnowledgeBase, documents, deepThink])
+}, [activeId, openApiKeyModal, useKnowledgeBase, documents, deepThink, mesSource, mesSlots])
 
   // 删除对话
   const handleDeleteConversation = useCallback((id: string) => {
@@ -702,6 +866,8 @@ export default function App() {
                 onToggleDeepThink={() => setDeepThink(d => !d)}
               />
             )
+          ) : sidebarView === 'dbmanage' && canAccessDatabaseManagement(user) ? (
+            <DatabaseManage />
           ) : sidebarView === 'apc' ? (
             <ApcRto />
           ) : sidebarView === 'knowledge' ? (
@@ -729,6 +895,9 @@ export default function App() {
               currentUser={user}
               deepThink={deepThink}
               onToggleDeepThink={() => setDeepThink(d => !d)}
+              mesSource={mesSource}
+              mesSlots={mesSlots}
+              onMesSourceChange={handleMesSourceChange}
             />
           )}
         </div>

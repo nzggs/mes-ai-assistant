@@ -1,20 +1,23 @@
-// 「APC 和 RTO」数据源配置面板
+// 「APC 和 RTO」监测项目编辑器
 //
-// 三个可手工灵活配置的窗口：
-//   ① 数据库登录     —— 连接参数 + 测试连接 + 密码保持/清除，保存后立即生效（无需重启）
-//   ② SQL 查询语句   —— 窄表/宽表两种取数模式、SQL 模板与占位符、字段映射、试运行预览
-//   ③ 参数配置       —— 过程参数逐个编辑 / 增删 / JSON 批量导入导出，含目录元信息
+// 每个监测项目自带一套完整设置：
+//   ① 项目设置     —— 名称 / 描述 / 绑定哪个数据库系统（db1 / db2）+ 全局目录元信息
+//   ② SQL 模板     —— 窄表/宽表两种取数模式、SQL 模板与占位符、字段映射、试运行预览
+//   ③ 参数配置     —— 过程参数逐个编辑 / 增删 / JSON 批量导入导出（参数跟随项目绑定数据库）
 //
+// 数据库连接（怎么连）与查询限制（怎么限）是公用配置，在侧边栏「数据库管理」页维护。
 // 全部接口在服务端挂 requireAdmin，需带 X-Admin-Token；
-// 密码只进不出：读取回来的配置里没有密码原文，只有「是否已保存」。
 // 配置落在服务端数据卷（不入 git），任何配置改动都要过只读护栏与结构校验。
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   fetchApcConfig,
+  fetchApcProject,
+  createApcProject,
+  updateApcProject,
+  deleteApcProject,
   saveApcConfig,
   resetApcConfig,
-  testApcDatabase,
   previewApcQuery,
   setAdminToken,
   hasAdminToken,
@@ -22,40 +25,17 @@ import {
 } from '../services/apcApi'
 import type {
   ApcConfigResponse,
-  ApcDatabaseDraft,
   ApcParamConfig,
   ApcQueryConfig,
   ApcQueryPreview,
-  ApcTestDbResult,
 } from '../types'
 
-type TabKey = 'database' | 'queries' | 'params'
+type TabKey = 'settings' | 'queries' | 'params'
 
 const TABS: { key: TabKey; label: string; desc: string }[] = [
-  { key: 'database', label: '数据库登录', desc: '只读库连接参数' },
-  { key: 'queries', label: 'SQL 查询语句', desc: '取数模板与字段映射' },
+  { key: 'settings', label: '项目设置', desc: '名称与绑定的数据库系统' },
+  { key: 'queries', label: 'SQL 模板', desc: '取数模板与字段映射' },
   { key: 'params', label: '参数配置', desc: '过程参数目录' },
-]
-
-const DB_TEXT_FIELDS: { key: keyof ApcDatabaseDraft; label: string; placeholder: string; hint: string }[] = [
-  { key: 'host', label: '数据库地址', placeholder: '如 10.0.0.21', hint: 'HANA 主机名或 IP；地址与用户名齐备即视为已配置数据源' },
-  { key: 'user', label: '用户名', placeholder: '如 READONLY_APC', hint: '务必使用仅授予 SELECT 权限的只读账号，不要复用管理员账号' },
-  { key: 'databaseName', label: '租户库名', placeholder: '单库实例可留空', hint: 'MDC 多租户场景填写租户库名；单库实例留空' },
-  { key: 'schema', label: '模式名 Schema', placeholder: '可留空，供 {{schema}} 使用', hint: '填写后会作为 SQL 模板里 {{schema}} 占位符的值' },
-  { key: 'caFile', label: 'CA 证书路径', placeholder: '仅启用 TLS 且需校验时填写', hint: '需是容器内可访问的路径（已挂载到镜像里）' },
-]
-
-const DB_NUM_FIELDS: { key: keyof ApcDatabaseDraft; label: string; min: number; max: number; hint: string }[] = [
-  { key: 'port', label: '端口', min: 1, max: 65535, hint: 'HANA SQL 端口，默认 30015' },
-  { key: 'maxRows', label: '单次读取行数上限', min: 1, max: 20000, hint: '硬保护：任何一次取数都不会超过该行数' },
-  { key: 'connectTimeoutMs', label: '连接超时（ms）', min: 1000, max: 60000, hint: '超时立刻放弃连接，不给数据库留挂起会话' },
-  { key: 'statementTimeoutMs', label: '语句超时（ms）', min: 1000, max: 120000, hint: '查询超时即断开连接，释放数据库会话' },
-]
-
-const DB_BOOL_FIELDS: { key: keyof ApcDatabaseDraft; label: string; hint: string }[] = [
-  { key: 'useTLS', label: '启用 TLS', hint: '生产环境建议开启' },
-  { key: 'validateCert', label: '校验证书', hint: '使用自签证书的内网环境可关闭' },
-  { key: 'useLimit', label: '自动追加 LIMIT', hint: '少数老版本 HANA 不支持 LIMIT 时可关闭' },
 ]
 
 const OBJECTIVE_OPTIONS = [
@@ -87,8 +67,14 @@ function cellText(v: unknown): string {
   return String(v)
 }
 
-export function ApcConfigPanel({ onClose, onSaved }: { onClose: () => void; onSaved: () => void }) {
-  const [tab, setTab] = useState<TabKey>('database')
+export function ApcConfigPanel({ projectId, onClose, onSaved }: {
+  /** 要编辑的项目 id；null = 新建项目 */
+  projectId: string | null
+  onClose: () => void
+  /** 保存/删除成功后回调（参数为已保存的项目 id，新建后用于切换选中） */
+  onSaved: (projectId?: string) => void
+}) {
+  const [tab, setTab] = useState<TabKey>('settings')
   const [config, setConfig] = useState<ApcConfigResponse | null>(null)
   const [loading, setLoading] = useState(true)
   const [fatal, setFatal] = useState('')
@@ -96,17 +82,15 @@ export function ApcConfigPanel({ onClose, onSaved }: { onClose: () => void; onSa
   const [tokenInput, setTokenInput] = useState('')
   const [notice, setNotice] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null)
 
-  // 各段草稿与脏标记（数据库按槽位 db1/db2 分别保存，可手动切换使用哪个）
-  const [dbEditId, setDbEditId] = useState<string>('db1')
-  const [dbDrafts, setDbDrafts] = useState<Record<string, ApcDatabaseDraft>>({})
-  const [dbActiveId, setDbActiveId] = useState<string>('db1')
-  const [dbDirty, setDbDirty] = useState(false)
-  const [pwInputs, setPwInputs] = useState<Record<string, string>>({})
-  const [clearPwFlags, setClearPwFlags] = useState<Record<string, boolean>>({})
-  const [testResult, setTestResult] = useState<ApcTestDbResult | null>(null)
-  const [testing, setTesting] = useState(false)
+  // 项目设置草稿（名称 / 描述 / 绑定的数据库槽位）
+  const [sName, setSName] = useState('')
+  const [sDesc, setSDesc] = useState('')
+  const [sDbSlot, setSDbSlot] = useState<'db1' | 'db2'>('db1')
+  const [sDirty, setSDirty] = useState(false)
 
   const [qDraft, setQDraft] = useState<ApcQueryConfig>({ mode: 'long', history: '', columns: {} })
+  // 载入时的原始模板快照：用于判断草稿是否被改动过（qDirty 之外的精确比对）
+  const [origQueries, setOrigQueries] = useState<ApcQueryConfig | null>(null)
   const [qDirty, setQDirty] = useState(false)
   const [preview, setPreview] = useState<ApcQueryPreview | null>(null)
   const [previewErr, setPreviewErr] = useState('')
@@ -124,21 +108,20 @@ export function ApcConfigPanel({ onClose, onSaved }: { onClose: () => void; onSa
   const [metaDirty, setMetaDirty] = useState(false)
 
   const [saving, setSaving] = useState(false)
+  const [deleting, setDeleting] = useState(false)
   const sqlRef = useRef<HTMLTextAreaElement>(null)
 
+  const isNew = !projectId
+
   // ===== 载入 =====
-  const applyConfig = useCallback((c: ApcConfigResponse) => {
-    setConfig(c)
-    setDbDrafts(Object.fromEntries(c.database.slots.map(s => [s.id, { ...s.values }])))
-    setDbEditId(c.database.activeId)
-    setDbActiveId(c.database.activeId)
-    setPwInputs({})
-    setClearPwFlags({})
-    setDbDirty(false)
-    setQDraft(c.queries ? { ...c.queries, columns: { ...c.queries.columns } } : { mode: 'long', history: '', columns: {} })
-    setPDraft(c.params.map(p => ({ ...p })))
-    setMetaDraft(c.meta ? { ...c.meta } : null)
-    setDbDirty(false)
+  const applyProject = useCallback((p: { name: string; description?: string; dbSlot?: string; queries?: ApcQueryConfig | null; params?: ApcParamConfig[] } | null) => {
+    setSName(p?.name || '')
+    setSDesc(p?.description || '')
+    setSDbSlot(p?.dbSlot === 'db2' ? 'db2' : 'db1')
+    setQDraft(p?.queries ? { ...p.queries, columns: { ...p.queries.columns } } : { mode: 'long', history: '', columns: {} })
+    setOrigQueries(p?.queries ? { ...p.queries, columns: { ...p.queries.columns } } : null)
+    setPDraft((p?.params || []).map(x => ({ ...x })))
+    setSDirty(false)
     setQDirty(false)
     setPDirty(false)
     setMetaDirty(false)
@@ -151,7 +134,14 @@ export function ApcConfigPanel({ onClose, onSaved }: { onClose: () => void; onSa
     setFatal('')
     try {
       const c = await fetchApcConfig()
-      applyConfig(c)
+      setConfig(c)
+      setMetaDraft(c.meta ? { ...c.meta } : null)
+      if (projectId) {
+        const { project } = await fetchApcProject(projectId)
+        applyProject(project)
+      } else {
+        applyProject(null)
+      }
       setNeedsToken(false)
     } catch (err: any) {
       if (err?.status === 403) setNeedsToken(true)
@@ -159,113 +149,99 @@ export function ApcConfigPanel({ onClose, onSaved }: { onClose: () => void; onSa
     } finally {
       setLoading(false)
     }
-  }, [applyConfig])
+  }, [applyProject, projectId])
 
   useEffect(() => { load() }, [load])
 
   const locked = Boolean(config?.catalogFileLocked)
   const dirtySections = useMemo(() => {
-    const out: ApcConfigSection[] = []
-    if (dbDirty) out.push('database')
+    const out: Array<'settings' | 'queries' | 'params' | 'meta'> = []
+    if (sDirty) out.push('settings')
     if (qDirty) out.push('queries')
     if (pDirty) out.push('params')
     if (metaDirty) out.push('meta')
     return out
-  }, [dbDirty, qDirty, pDirty, metaDirty])
+  }, [sDirty, qDirty, pDirty, metaDirty])
 
-  // ===== 保存 / 重置 =====
+  // ===== 保存 / 重置 / 删除 =====
   const handleSave = useCallback(async () => {
     if (dirtySections.length === 0) return
     setSaving(true)
     setNotice(null)
     try {
-      const patch: Record<string, unknown> = {}
-      if (dbDirty) {
-        const id = dbEditId
-        const db: ApcDatabaseDraft = { ...(dbDrafts[id] || {}) }
-        if (clearPwFlags[id]) db.password = null
-        else if (pwInputs[id]) db.password = pwInputs[id]
-        else delete db.password
-        patch.databases = { [id]: db }
+      if (isNew) {
+        // 新建：名称必填，首次保存即创建项目并带上已填的模板/参数
+        if (!sName.trim()) throw new Error('项目名称不能为空')
+        const res = await createApcProject({
+          name: sName.trim(),
+          description: sDesc.trim(),
+          dbSlot: sDbSlot,
+          queries: qDirty || qDraft.history ? qDraft : undefined,
+          params: pDirty || pDraft.length > 0 ? pDraft : undefined,
+        })
+        if (metaDirty && metaDraft) await saveApcConfig({ meta: metaDraft })
+        setNotice({ kind: 'ok', text: `已创建项目「${res.project.name}」并生效` })
+        onSaved(res.project.id)
+      } else {
+        const patch: Record<string, unknown> = {}
+        if (sDirty) { patch.name = sName.trim(); patch.description = sDesc.trim(); patch.dbSlot = sDbSlot }
+        if (qDirty) patch.queries = qDraft
+        if (pDirty) patch.params = pDraft
+        if (Object.keys(patch).length > 0) await updateApcProject(projectId!, patch)
+        if (metaDirty && metaDraft) await saveApcConfig({ meta: metaDraft })
+        setNotice({ kind: 'ok', text: `已保存：${dirtySections.map(s => TABS.find(t => t.key === s)?.label || s).join('、')}；配置已生效（缓存已刷新）` })
+        onSaved(projectId!)
       }
-      if (dbActiveId !== config?.database.activeId) patch.activeDatabase = dbActiveId
-      if (qDirty) patch.queries = qDraft
-      if (pDirty) patch.params = pDraft
-      if (metaDirty && metaDraft) patch.meta = metaDraft
-
-      const res = await saveApcConfig(patch)
-      applyConfig(res.config)
-      setNotice({ kind: 'ok', text: `已保存：${res.saved.map(s => TABS.find(t => t.key === s)?.label || s).join('、')}；配置已生效（缓存与数据库连接已刷新）` })
-      onSaved()
+      setSDirty(false); setQDirty(false); setPDirty(false); setMetaDirty(false)
     } catch (err: any) {
       setNotice({ kind: 'err', text: err?.message || String(err) })
     } finally {
       setSaving(false)
     }
-  }, [dirtySections, dbDirty, dbEditId, dbDrafts, pwInputs, clearPwFlags, dbActiveId, config, qDirty, qDraft, pDirty, pDraft, metaDirty, metaDraft, applyConfig, onSaved])
+  }, [dirtySections, isNew, sName, sDesc, sDbSlot, qDirty, qDraft, pDirty, pDraft, metaDirty, metaDraft, projectId, onSaved])
 
-  const handleReset = useCallback(async (section: ApcConfigSection, databaseId?: string) => {
+  const handleDelete = useCallback(async () => {
+    if (!projectId) return
+    if (!window.confirm('确定删除该项目？项目内的 SQL 模板与参数配置将一并清除。')) return
+    setDeleting(true)
+    setNotice(null)
+    try {
+      await deleteApcProject(projectId)
+      onSaved()
+    } catch (err: any) {
+      setNotice({ kind: 'err', text: err?.message || String(err) })
+    } finally {
+      setDeleting(false)
+    }
+  }, [projectId, onSaved])
+
+  const handleReset = useCallback(async (section: ApcConfigSection) => {
     setSaving(true)
     setNotice(null)
     try {
-      const res = await resetApcConfig(section, databaseId)
-      applyConfig(res.config)
-      setNotice({ kind: 'ok', text: `已恢复默认：${TABS.find(t => t.key === section)?.label || section}` })
-      onSaved()
+      await resetApcConfig(section, undefined, projectId || undefined)
+      await load()
+      setNotice({ kind: 'ok', text: `已清空：${TABS.find(t => t.key === section)?.label || section}` })
+      onSaved(projectId || undefined)
     } catch (err: any) {
       setNotice({ kind: 'err', text: err?.message || String(err) })
     } finally {
       setSaving(false)
     }
-  }, [applyConfig, onSaved])
-
-  /** 切换「当前使用」的数据库系统（下次取数 / 测试均走该槽位） */
-  const handleSetActive = useCallback(async (id: string) => {
-    setSaving(true)
-    setNotice(null)
-    try {
-      const res = await saveApcConfig({ activeDatabase: id })
-      setDbActiveId(id)
-      applyConfig(res.config)
-      const name = res.config.database.slots.find(s => s.id === id)?.name || id
-      setNotice({ kind: 'ok', text: `已切换当前使用的数据源为「${name}」（配置已生效）` })
-      onSaved()
-    } catch (err: any) {
-      setNotice({ kind: 'err', text: err?.message || String(err) })
-    } finally {
-      setSaving(false)
-    }
-  }, [applyConfig, onSaved])
-
-  const handleTest = useCallback(async () => {
-    setTesting(true)
-    setTestResult(null)
-    setNotice(null)
-    try {
-      const id = dbEditId
-      const db: ApcDatabaseDraft = { ...(dbDrafts[id] || {}) }
-      if (!clearPwFlags[id] && pwInputs[id]) db.password = pwInputs[id]
-      if (clearPwFlags[id]) db.password = null
-      setTestResult(await testApcDatabase(db, id))
-    } catch (err: any) {
-      setTestResult({ ok: false, elapsedMs: 0, error: err?.message || String(err), target: { host: '', port: 0, user: '', databaseName: '', schema: '', useTLS: false, validateCert: true } })
-    } finally {
-      setTesting(false)
-    }
-  }, [dbEditId, dbDrafts, clearPwFlags, pwInputs])
+  }, [projectId, load, onSaved])
 
   const handlePreview = useCallback(async () => {
     setPreviewing(true)
     setPreviewErr('')
     setPreview(null)
     try {
-      setPreview(await previewApcQuery({ queries: qDraft, params: pDraft, minutes: previewRows > 0 ? 120 : 120, maxRows: previewRows }))
+      setPreview(await previewApcQuery({ queries: qDraft, params: pDraft, minutes: 120, maxRows: previewRows, slot: sDbSlot }))
     } catch (err: any) {
       setPreviewErr(err?.message || String(err))
     } finally {
       setPreviewing(false)
     }
-  }, [qDraft, pDraft, previewRows])
+  }, [qDraft, pDraft, previewRows, sDbSlot])
 
   // ===== 令牌 =====
   const handleTokenSave = useCallback(() => {
@@ -374,9 +350,9 @@ export function ApcConfigPanel({ onClose, onSaved }: { onClose: () => void; onSa
         <div className="bg-white border-b border-mes-border px-5 py-3 flex items-start justify-between gap-3 shrink-0">
           <div className="min-w-0">
             <div className="flex items-center gap-2">
-              <h2 className="text-base font-semibold text-mes-text">数据源配置</h2>
+              <h2 className="text-base font-semibold text-mes-text">{isNew ? '新建监测项目' : `编辑项目 · ${sName || projectId}`}</h2>
               <span className="text-[11px] px-2 py-0.5 rounded-full bg-mes-tagBg text-mes-tagText font-medium">
-                手工配置 · 保存即生效
+                保存即生效
               </span>
               {locked && (
                 <span className="text-[11px] px-2 py-0.5 rounded-full bg-amber-50 text-amber-700 font-medium">
@@ -385,8 +361,8 @@ export function ApcConfigPanel({ onClose, onSaved }: { onClose: () => void; onSa
               )}
             </div>
             <div className="text-[11px] text-mes-textTertiary mt-1 leading-relaxed">
-              配置文件：<span className="font-mono">{config?.configFile || '—'}</span>
-              {config?.updatedAt ? ` · 最近保存 ${fmtTime(config.updatedAt)}` : ' · 尚未保存过任何改动'}
+              数据库连接与查询限制是公用配置，在侧边栏「数据库管理」页维护；本项目只需选择用哪个数据库系统。
+              {config?.configFileError ? ` · 配置文件异常：${config.configFileError}` : ''}
             </div>
           </div>
           <div className="flex items-center gap-2 shrink-0">
@@ -473,30 +449,78 @@ export function ApcConfigPanel({ onClose, onSaved }: { onClose: () => void; onSa
             </div>
           )}
 
-          {config && tab === 'database' && (
-            <DatabaseTab
-              config={config}
-              dbEditId={dbEditId}
-              dbActiveId={dbActiveId}
-              drafts={dbDrafts}
-              pwInputs={pwInputs}
-              clearPwFlags={clearPwFlags}
-              onSwitchSlot={setDbEditId}
-              onDraft={patch => { setDbDrafts(d => ({ ...d, [dbEditId]: { ...(d[dbEditId] || {}), ...patch } })); setDbDirty(true) }}
-              onPassword={v => { setPwInputs(p => ({ ...p, [dbEditId]: v })); setDbDirty(true) }}
-              onClearPassword={v => { setClearPwFlags(f => ({ ...f, [dbEditId]: v })); setDbDirty(true) }}
-              onSetActive={handleSetActive}
-              testing={testing}
-              testResult={testResult}
-              onTest={handleTest}
-              onReset={(id) => handleReset('database', id)}
-              saving={saving}
-            />
+          {config && tab === 'settings' && (
+            <div className="p-5">
+              <SectionCard title="项目信息" desc="项目 = 一套完整的监测设置：用哪个数据库、用哪条 SQL 取数、监测哪些参数">
+                <div className="grid grid-cols-1 gap-3">
+                  <FieldShell label="项目名称" hint="必填；将显示在主页与 APC和RTO 页面">
+                    <input
+                      type="text"
+                      value={sName}
+                      onChange={e => { setSName(e.target.value); setSDirty(true) }}
+                      placeholder="如 注液量监测"
+                      className={inputCls}
+                    />
+                  </FieldShell>
+                  <FieldShell label="项目描述" hint="可选；一句话说明该项目的用途">
+                    <input
+                      type="text"
+                      value={sDesc}
+                      onChange={e => { setSDesc(e.target.value); setSDirty(true) }}
+                      placeholder="如 监测注液工序的过程数据并给出设定值建议"
+                      className={inputCls}
+                    />
+                  </FieldShell>
+                  <FieldShell label="使用数据库" hint="该项目的参数数据从这个数据库系统读取（连接参数在「数据库管理」页配置）">
+                    <div className="flex items-center gap-2">
+                      <select
+                        value={sDbSlot}
+                        onChange={e => { setSDbSlot(e.target.value === 'db2' ? 'db2' : 'db1'); setSDirty(true) }}
+                        className={`${inputCls} max-w-[260px]`}
+                      >
+                        {(config.database.slots.length > 0 ? config.database.slots : [{ id: 'db1', name: '数据库系统 1' }, { id: 'db2', name: '数据库系统 2' }])
+                          .map(s => (
+                            <option key={s.id} value={s.id}>
+                              {s.name}（{s.id}）{'configured' in s && (s as { configured?: boolean }).configured === false ? ' · 未配置' : ''}
+                            </option>
+                          ))}
+                      </select>
+                      <span className={`text-[10px] px-1.5 py-0.5 rounded-full ${
+                        config.database.slots.find(s => s.id === sDbSlot)?.configured
+                          ? 'bg-green-50 text-green-700'
+                          : 'bg-gray-100 text-mes-textTertiary'
+                      }`}>
+                        {config.database.slots.find(s => s.id === sDbSlot)?.configured ? '已配置连接' : '尚未配置连接（取数将回退仿真）'}
+                      </span>
+                    </div>
+                  </FieldShell>
+                </div>
+              </SectionCard>
+
+              {metaDraft && (
+                <SectionCard title="目录元信息" desc="全局设置（对所有项目共用）：装置名 / 采样间隔 / 默认统计窗口 / 默认工艺死区">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <FieldShell label="装置/产线名称">
+                      <input type="text" value={metaDraft.station} onChange={e => { setMetaDraft({ ...metaDraft, station: e.target.value }); setMetaDirty(true) }} className={inputCls} />
+                    </FieldShell>
+                    <FieldShell label="采样间隔（秒）">
+                      <input type="number" min={10} max={86400} value={String(metaDraft.sampleIntervalSec)} onChange={e => { setMetaDraft({ ...metaDraft, sampleIntervalSec: Number(e.target.value) }); setMetaDirty(true) }} className={inputCls} />
+                    </FieldShell>
+                    <FieldShell label="默认统计窗口（分钟）">
+                      <input type="number" min={5} max={1440} value={String(metaDraft.defaultWindowMinutes)} onChange={e => { setMetaDraft({ ...metaDraft, defaultWindowMinutes: Number(e.target.value) }); setMetaDirty(true) }} className={inputCls} />
+                    </FieldShell>
+                    <FieldShell label="默认工艺死区（%）">
+                      <input type="number" min={0} max={100} value={String(metaDraft.deadbandPctDefault)} onChange={e => { setMetaDraft({ ...metaDraft, deadbandPctDefault: Number(e.target.value) }); setMetaDirty(true) }} className={inputCls} />
+                    </FieldShell>
+                  </div>
+                </SectionCard>
+              )}
+            </div>
           )}
 
           {config && tab === 'queries' && (
             <QueriesTab
-              config={config}
+              effective={origQueries}
               draft={qDraft}
               params={pDraft}
               locked={locked}
@@ -525,6 +549,7 @@ export function ApcConfigPanel({ onClose, onSaved }: { onClose: () => void; onSa
               jsonText={jsonText}
               jsonErr={jsonErr}
               meta={metaDraft}
+              dbSlotLabel={sDbSlot === 'db2' ? '数据库系统 2' : '数据库系统 1'}
               onSelect={setSelected}
               onPatch={patchParam}
               onAdd={addParam}
@@ -534,7 +559,6 @@ export function ApcConfigPanel({ onClose, onSaved }: { onClose: () => void; onSa
               onExportJson={exportJson}
               onJsonText={setJsonText}
               onApplyJson={applyJson}
-              onMeta={patch => { setMetaDraft(m => (m ? { ...m, ...patch } : m)); setMetaDirty(true) }}
               onReset={() => handleReset('params')}
             />
           )}
@@ -543,12 +567,20 @@ export function ApcConfigPanel({ onClose, onSaved }: { onClose: () => void; onSa
         {/* ===== 底部操作 ===== */}
         <div className="bg-white border-t border-mes-border px-5 py-3 flex items-center justify-between gap-3 shrink-0">
           <div className="text-[11px] text-mes-textTertiary leading-relaxed">
-            只读边界不变：无论怎么改配置，取数只可能是单条 SELECT，且强制行数上限与语句超时；
-            账号密码只保存在服务端数据卷（不入 git），页面不回显密码。
+            只读边界不变：无论怎么改配置，取数只可能是单条 SELECT，且强制行数上限与语句超时。
           </div>
           <div className="flex items-center gap-2 shrink-0">
+            {!isNew && (
+              <button
+                onClick={handleDelete}
+                disabled={deleting || saving}
+                className="px-3 py-1.5 rounded-lg text-xs font-medium border border-red-200 bg-white text-red-600 hover:bg-red-50 disabled:opacity-50"
+              >
+                {deleting ? '删除中…' : '删除项目'}
+              </button>
+            )}
             <button
-              onClick={() => { if (config) applyConfig(config) }}
+              onClick={load}
               disabled={dirtySections.length === 0 || saving}
               className="px-3 py-1.5 rounded-lg text-xs font-medium border border-mes-border bg-white text-mes-textSecondary hover:border-mes-primary hover:text-mes-primary disabled:opacity-50"
             >
@@ -565,7 +597,7 @@ export function ApcConfigPanel({ onClose, onSaved }: { onClose: () => void; onSa
                   <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10" />
                 </svg>
               )}
-              保存{dirtySections.length > 0 ? `（${dirtySections.length} 段）` : ''}
+              {isNew ? '创建项目' : `保存${dirtySections.length > 0 ? `（${dirtySections.length} 段）` : ''}`}
             </button>
           </div>
         </div>
@@ -625,229 +657,15 @@ const btnGhost = 'px-3 py-1.5 rounded-lg text-xs font-medium border border-mes-b
 const btnPrimary = 'px-3 py-1.5 rounded-lg text-xs font-medium bg-mes-primary text-white hover:bg-mes-primaryHover disabled:opacity-50'
 const btnDanger = 'px-3 py-1.5 rounded-lg text-xs font-medium border border-red-200 bg-white text-red-600 hover:bg-red-50 disabled:opacity-50'
 
-// ===== ① 数据库登录 =====
+// ===== ① 项目设置（在主组件内渲染，无需独立 Tab 组件） =====
 
-function DatabaseTab({
-  config, dbEditId, dbActiveId, drafts, pwInputs, clearPwFlags,
-  onSwitchSlot, onDraft, onPassword, onClearPassword, onSetActive,
-  testing, testResult, onTest, onReset, saving,
-}: {
-  config: ApcConfigResponse
-  dbEditId: string
-  dbActiveId: string
-  drafts: Record<string, ApcDatabaseDraft>
-  pwInputs: Record<string, string>
-  clearPwFlags: Record<string, boolean>
-  onSwitchSlot: (id: string) => void
-  onDraft: (patch: ApcDatabaseDraft) => void
-  onPassword: (v: string) => void
-  onClearPassword: (v: boolean) => void
-  onSetActive: (id: string) => void
-  testing: boolean
-  testResult: ApcTestDbResult | null
-  onTest: () => void
-  onReset: (id: string) => void
-  saving: boolean
-}) {
-  const { envValues, defaults, envConfigured } = config.database
-  const slot = config.database.slots.find(s => s.id === dbEditId) || config.database.slots[0]
-  const draft = drafts[dbEditId] || {}
-  const pwInput = pwInputs[dbEditId] || ''
-  const clearPw = Boolean(clearPwFlags[dbEditId])
-  const passwordSet = slot.passwordSet
-  const savedKeys = slot.savedKeys
-
-  function sourceOf(key: string): string {
-    if (savedKeys.includes(key)) return '页面配置'
-    const v = (envValues as Record<string, unknown>)[key]
-    if (v !== undefined && v !== null && v !== '') return '环境变量'
-    return '默认值'
-  }
-
-  function envHint(key: string): string | undefined {
-    const v = (envValues as Record<string, unknown>)[key]
-    if (v === undefined || v === null || v === '') return undefined
-    if (String(v) === String((draft as Record<string, unknown>)[key])) return undefined
-    return `环境变量当前取值：${String(v)}`
-  }
-
-  return (
-    <div className="p-5">
-      <div className="rounded-xl border border-blue-200 bg-blue-50 px-4 py-3 mb-4 text-[11px] text-blue-800 leading-relaxed">
-        <div className="font-medium mb-1">只读接入说明</div>
-        这里填写的是<b>只读账号</b>（仅授予 SELECT）。保存后立即生效、无需重启服务；账号密码只写入服务端数据卷
-        <span className="font-mono mx-1">{config.configFile}</span>，不会进入 git，也不会回显到页面。
-        {envConfigured && <div className="mt-1">检测到环境变量里也有连接配置：<b>页面保存值优先</b>；如需回退，点下方「清空本系统」。</div>}
-        <div className="mt-1">本系统支持接入 <b>两个数据库系统</b>（db1 / db2），可分别配置后在下方手动切换「当前使用」的数据源；SQL 取数模板与监测项两个系统共享。</div>
-      </div>
-
-      {/* 两个数据库系统分页 */}
-      <div className="flex flex-wrap items-center gap-2 mb-4">
-        {config.database.slots.map(s => (
-          <button
-            key={s.id}
-            onClick={() => onSwitchSlot(s.id)}
-            className={`px-3 py-2 rounded-lg border text-sm font-medium transition-colors ${
-              dbEditId === s.id
-                ? 'border-mes-primary bg-white text-mes-primary shadow-sm'
-                : 'border-mes-border bg-white text-mes-textSecondary hover:border-mes-primary/40'
-            }`}
-          >
-            <span className="inline-flex items-center gap-2">
-              {s.name || s.id}
-              {dbActiveId === s.id
-                ? <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-green-100 text-green-700">当前使用</span>
-                : !s.configured
-                  ? <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-gray-100 text-mes-textTertiary">未配置</span>
-                  : null}
-            </span>
-          </button>
-        ))}
-      </div>
-
-      {/* 当前编辑系统的名称 + 切换为当前使用 */}
-      <div className="flex items-center justify-between gap-3 mb-3">
-        <input
-          type="text"
-          value={String((draft as Record<string, unknown>).name ?? slot.name ?? '')}
-          placeholder="数据库系统显示名（如 一厂HANA / 二厂HANA）"
-          onChange={e => onDraft({ name: e.target.value } as ApcDatabaseDraft)}
-          className={`${inputCls} max-w-[360px]`}
-        />
-        {dbActiveId === dbEditId ? (
-          <span className="text-[11px] px-2.5 py-1 rounded-full bg-green-50 text-green-700 font-medium whitespace-nowrap">✓ 当前正在使用此系统</span>
-        ) : (
-          <button
-            onClick={() => onSetActive(dbEditId)}
-            disabled={saving}
-            className="px-3 py-1.5 rounded-lg text-xs font-medium bg-mes-primary text-white hover:bg-mes-primaryHover disabled:opacity-50 whitespace-nowrap"
-          >
-            切换为当前使用
-          </button>
-        )}
-      </div>
-
-      <SectionCard
-        title="连接与账号"
-        desc="地址与用户名齐备即视为已配置数据源；未配置时页面回退到内置仿真数据源"
-        actions={
-          <>
-            <button onClick={onTest} disabled={testing} className={btnGhost}>
-              {testing ? '正在测试…' : '测试连接'}
-            </button>
-            <button onClick={() => onReset(dbEditId)} disabled={saving || savedKeys.length === 0} className={btnGhost}>
-              清空本系统
-            </button>
-          </>
-        }
-      >
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-x-5 gap-y-3">
-          {DB_TEXT_FIELDS.map(f => (
-            <FieldShell key={String(f.key)} label={f.label} source={sourceOf(String(f.key))} hint={envHint(String(f.key)) || f.hint}>
-              <input
-                type="text"
-                value={String((draft as Record<string, unknown>)[String(f.key)] ?? '')}
-                placeholder={f.placeholder}
-                onChange={e => onDraft({ [f.key]: e.target.value } as ApcDatabaseDraft)}
-                className={inputCls}
-              />
-            </FieldShell>
-          ))}
-
-          <FieldShell
-            label="密码"
-            source={savedKeys.includes('password') ? '页面配置' : (envValues.passwordSet ? '环境变量' : '未设置')}
-            hint={passwordSet ? '服务端已保存密码；留空表示不修改，勾选下方选项可清除' : '当前没有可用密码，请填写'}
-          >
-            <input
-              type="password"
-              value={pwInput}
-              disabled={clearPw}
-              onChange={e => onPassword(e.target.value)}
-              placeholder={passwordSet ? '••••••（留空表示不修改）' : '请输入只读账号密码'}
-              className={`${inputCls} ${clearPw ? 'opacity-50' : ''}`}
-              autoComplete="new-password"
-            />
-            <label className="flex items-center gap-1.5 mt-1.5 text-[11px] text-mes-textSecondary cursor-pointer">
-              <input type="checkbox" checked={clearPw} onChange={e => onClearPassword(e.target.checked)} className="accent-mes-primary" />
-              清除已保存的密码
-            </label>
-          </FieldShell>
-        </div>
-      </SectionCard>
-
-      <SectionCard title="连接与读取保护" desc="限制单次读取规模与执行时长，避免把生产库拖垮">
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-x-5 gap-y-3">
-          {DB_NUM_FIELDS.map(f => (
-            <FieldShell key={String(f.key)} label={f.label} source={sourceOf(String(f.key))} hint={`${f.hint}（范围 ${f.min} ~ ${f.max}）`}>
-              <input
-                type="number"
-                value={String((draft as Record<string, unknown>)[String(f.key)] ?? '')}
-                min={f.min}
-                max={f.max}
-                onChange={e => {
-                  const raw = e.target.value
-                  onDraft({ [f.key]: raw === '' ? '' : Number(raw) } as ApcDatabaseDraft)
-                }}
-                className={inputCls}
-              />
-            </FieldShell>
-          ))}
-          <div className="md:col-span-2 grid grid-cols-1 sm:grid-cols-3 gap-3">
-            {DB_BOOL_FIELDS.map(f => (
-              <label key={String(f.key)} className="flex items-start gap-2 rounded-lg border border-mes-border px-3 py-2 cursor-pointer hover:border-mes-primary/40">
-                <input
-                  type="checkbox"
-                  checked={Boolean((draft as Record<string, unknown>)[String(f.key)])}
-                  onChange={e => onDraft({ [f.key]: e.target.checked } as ApcDatabaseDraft)}
-                  className="accent-mes-primary mt-0.5"
-                />
-                <span className="min-w-0">
-                  <span className="block text-[11px] font-medium text-mes-textSecondary">{f.label}</span>
-                  <span className="block text-[10px] text-mes-textTertiary leading-relaxed">{f.hint}</span>
-                </span>
-              </label>
-            ))}
-          </div>
-        </div>
-        <div className="mt-3 text-[10px] text-mes-textTertiary leading-relaxed">
-          默认值参考：端口 {defaults.port} · 读取上限 {defaults.maxRows} 行 · 连接超时 {defaults.connectTimeoutMs} ms · 语句超时 {defaults.statementTimeoutMs} ms
-        </div>
-      </SectionCard>
-
-      {testResult && (
-        <div className={`rounded-xl border px-4 py-3 text-xs leading-relaxed ${
-          testResult.ok ? 'border-green-200 bg-green-50 text-green-800' : 'border-red-200 bg-red-50 text-red-700'
-        }`}>
-          <div className="font-medium mb-1">
-            {testResult.ok ? '连接成功' : '连接失败'}（耗时 {testResult.elapsedMs} ms）
-          </div>
-          <div>
-            目标：{testResult.target.host || '—'}:{testResult.target.port || '—'}
-            {testResult.target.databaseName ? ` · 租户库 ${testResult.target.databaseName}` : ''}
-            {' · '}用户 {testResult.target.user || '—'}
-            {testResult.target.useTLS ? ' · TLS' : ''}
-          </div>
-          {testResult.serverVersion && <div>服务端版本：{testResult.serverVersion}</div>}
-          {testResult.error && <div className="mt-1">原因：{testResult.error}</div>}
-          {testResult.ok && (
-            <div className="mt-1 text-[11px] opacity-80">
-              测试连接使用的是页面上的草稿值，尚未保存；确认无误后点右下角「保存」。
-            </div>
-          )}
-        </div>
-      )}
-    </div>
-  )
-}
-
-// ===== ② SQL 查询语句 =====
 
 function QueriesTab({
-  config, draft, params, locked, sqlRef, dirty, onDraft, onColumns, onInsert,
+  effective, draft, params, locked, sqlRef, dirty, onDraft, onColumns, onInsert,
   previewing, preview, previewErr, previewRows, onPreviewRows, onPreview, onReset,
 }: {
-  config: ApcConfigResponse
+  /** 载入时的原始模板（未改动时用于显示「当前生效」提示） */
+  effective: ApcQueryConfig | null
   draft: ApcQueryConfig
   params: ApcParamConfig[]
   locked: boolean
@@ -1064,12 +882,12 @@ function QueriesTab({
       {dirty && (
         <div className="text-[11px] text-orange-600">取数配置有未保存的改动，确认无误后点右下角「保存」。</div>
       )}
-      {!dirty && config.queries && (
+      {!dirty && effective && (
         <div className="text-[11px] text-mes-textTertiary">
-          当前生效：{config.queries.mode === 'wide' ? '宽表' : '窄表'}模式
-          {config.queries.columns.ts ? ` · 时间列 ${config.queries.columns.ts}` : ''}
-          {config.queries.columns.code ? ` · 编码列 ${config.queries.columns.code}` : ''}
-          {config.queries.columns.value ? ` · 数值列 ${config.queries.columns.value}` : ''}
+          当前生效：{effective.mode === 'wide' ? '宽表' : '窄表'}模式
+          {effective.columns.ts ? ` · 时间列 ${effective.columns.ts}` : ''}
+          {effective.columns.code ? ` · 编码列 ${effective.columns.code}` : ''}
+          {effective.columns.value ? ` · 数值列 ${effective.columns.value}` : ''}
         </div>
       )}
     </div>
@@ -1079,8 +897,8 @@ function QueriesTab({
 // ===== ③ 参数配置 =====
 
 function ParamsTab({
-  params, selected, current, locked, jsonMode, jsonText, jsonErr, meta,
-  onSelect, onPatch, onAdd, onDuplicate, onRemove, onToggleJson, onExportJson, onJsonText, onApplyJson, onMeta, onReset,
+  params, selected, current, locked, jsonMode, jsonText, jsonErr, meta, dbSlotLabel,
+  onSelect, onPatch, onAdd, onDuplicate, onRemove, onToggleJson, onExportJson, onJsonText, onApplyJson, onReset,
 }: {
   params: ApcParamConfig[]
   selected: number
@@ -1090,6 +908,8 @@ function ParamsTab({
   jsonText: string
   jsonErr: string
   meta: ApcConfigResponse['meta'] | null
+  /** 项目绑定的数据库显示名（参数数据统一取自该系统） */
+  dbSlotLabel: string
   onSelect: (i: number) => void
   onPatch: (patch: Partial<ApcParamConfig>) => void
   onAdd: () => void
@@ -1099,7 +919,6 @@ function ParamsTab({
   onExportJson: () => void
   onJsonText: (t: string) => void
   onApplyJson: () => void
-  onMeta: (patch: Partial<NonNullable<ApcConfigResponse['meta']>>) => void
   onReset: () => void
 }) {
   const numField = (
@@ -1119,27 +938,6 @@ function ParamsTab({
 
   return (
     <div className="p-5">
-      <SectionCard
-        title="目录元信息"
-        desc="装置名、默认统计窗口与默认工艺死区；死区是「建议保持不动」的判定阈值"
-        actions={<button onClick={onReset} disabled={locked} className={btnGhost}>恢复默认目录</button>}
-      >
-        <div className="grid grid-cols-1 sm:grid-cols-4 gap-3">
-          <FieldShell label="装置/产线名称">
-            <input type="text" value={meta?.station || ''} onChange={e => onMeta({ station: e.target.value })} className={inputCls} disabled={!meta || locked} />
-          </FieldShell>
-          <FieldShell label="采样间隔（秒）" hint="用于仿真数据源与曲线点数估算">
-            <input type="number" value={meta ? String(meta.sampleIntervalSec) : ''} onChange={e => onMeta({ sampleIntervalSec: Number(e.target.value) })} className={inputCls} disabled={!meta || locked} />
-          </FieldShell>
-          <FieldShell label="默认统计窗口（分钟）">
-            <input type="number" value={meta ? String(meta.defaultWindowMinutes) : ''} onChange={e => onMeta({ defaultWindowMinutes: Number(e.target.value) })} className={inputCls} disabled={!meta || locked} />
-          </FieldShell>
-          <FieldShell label="默认工艺死区（%）" hint="占规格带宽比例；参数未单独设置时用它">
-            <input type="number" value={meta ? String(meta.deadbandPctDefault) : ''} onChange={e => onMeta({ deadbandPctDefault: Number(e.target.value) })} className={inputCls} disabled={!meta || locked} />
-          </FieldShell>
-        </div>
-      </SectionCard>
-
       <div className="flex items-center justify-between gap-2 mb-2">
         <div className="text-sm font-semibold text-mes-text">
           过程参数<span className="ml-1.5 text-[11px] font-normal text-mes-textTertiary">{params.length} 个</span>
@@ -1147,6 +945,7 @@ function ParamsTab({
         <div className="flex items-center gap-2">
           <button onClick={onToggleJson} className={btnGhost}>{jsonMode ? '返回表单' : 'JSON 批量编辑'}</button>
           <button onClick={onExportJson} className={btnGhost}>导出为 JSON</button>
+          <button onClick={onReset} disabled={locked} className={btnGhost}>清空参数</button>
         </div>
       </div>
 
@@ -1190,6 +989,7 @@ function ParamsTab({
                   <div className="text-[10px] text-mes-textTertiary truncate">
                     {p.process} · {p.code}
                     {p.column ? ` · 列 ${p.column}` : ''}
+                    {` · ${p.dbSlot === 'db2' ? '库2' : '库1'}`}
                   </div>
                 </button>
               ))}
@@ -1218,6 +1018,9 @@ function ParamsTab({
                     </FieldShell>
                     <FieldShell label="单位">
                       <input type="text" value={current.unit} onChange={e => onPatch({ unit: e.target.value })} className={inputCls} disabled={locked} />
+                    </FieldShell>
+                    <FieldShell label="使用数据库" hint="项目绑定的数据库系统（在「项目设置」里修改，全部参数统一使用）">
+                      <input type="text" value={dbSlotLabel} className={inputCls} disabled />
                     </FieldShell>
                     {meta && (
                       <FieldShell label="宽表数据列名" hint="仅宽表取数模式需要；窄表模式留空">
