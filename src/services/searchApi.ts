@@ -16,6 +16,28 @@ export interface ServerSearchHit {
   pageTitle: string
   score: number
   text: string
+  /** 对象编号（页标题 `·` 前，如 query.ce.sop.list / UM0CEMM005 / PM1CEMM017） */
+  objectNo?: string
+  /** 对象描述（页标题 `·` 后） */
+  objectDesc?: string
+  /** 对象类型（正文里的 TYPE_CATEGORY_NO，如 query.sql / widget） */
+  objectType?: string
+  /** 页类别：sql / script / widget / flow / other */
+  kind?: string
+  /** 该页正文是否被裁剪（smartTrim 生效时结构类页会被压短） */
+  trimmed?: boolean
+}
+
+/** 对象目录条目（/api/objects，无正文） */
+export interface SearchObject {
+  docId: string
+  docName: string
+  pageIndex: number
+  objectNo: string
+  objectDesc: string
+  objectType: string
+  kind: string
+  score: number
 }
 
 export interface SearchStatus {
@@ -26,6 +48,19 @@ export interface SearchStatus {
   pageCount: number
   termCount: number
   postings: number
+}
+
+/** 检索可选参数：按模型档位传入（见 shared/modelProfile.js） */
+export interface SearchOptions {
+  topK?: number
+  perHitChars?: number
+  timeoutMs?: number
+  /** 按页类别裁剪界面/流程大 JSON（默认不开 → 老行为不变） */
+  smartTrim?: boolean
+  /** 给 query.sql / 含 STATEMENT 的页提权（问 SQL 时开启） */
+  boostSql?: boolean
+  /** 结构类页的裁剪上限（字符） */
+  structChars?: number
 }
 
 const DEFAULT_TIMEOUT = 4000
@@ -73,16 +108,47 @@ export function getCachedSearchStatus(): SearchStatus | null {
  */
 export async function searchOnServer(
   query: string,
-  opts: { topK?: number; perHitChars?: number; timeoutMs?: number } = {}
+  opts: SearchOptions = {}
 ): Promise<ServerSearchHit[]> {
   const q = (query || '').trim()
   if (!q) return []
   const topK = Math.min(Math.max(opts.topK ?? 20, 1), 200)
   const perHitChars = Math.min(Math.max(opts.perHitChars ?? 6000, 200), 60000)
+  const extra = [
+    opts.smartTrim ? 'smartTrim=1' : '',
+    opts.boostSql ? 'boostSql=1' : '',
+    opts.structChars ? `structChars=${Math.round(opts.structChars)}` : '',
+  ].filter(Boolean).join('&')
   const url = `${BACKEND_BASE}/api/search?q=${encodeURIComponent(q)}&topK=${topK}&perHitChars=${perHitChars}`
+    + (extra ? `&${extra}` : '')
   try {
     const data = await fetchJson(url, opts.timeoutMs ?? DEFAULT_TIMEOUT)
     return Array.isArray(data?.hits) ? data.hits as ServerSearchHit[] : []
+  } catch {
+    return []
+  }
+}
+
+/**
+ * 取「与问题相关的对象目录」：只含对象编号/描述/类型/所属文档，**不含正文**，非常廉价。
+ * 用途：把「库里存在哪些对象、分别是什么类型」喂给模型，避免它从命中正文里猜表名
+ * （实测模型会把文档名 `Z_WIDGET_…xml` 当成数据库表，编造出不存在的 SQL）。
+ * 失败/未就绪返回空数组，不影响提问。
+ */
+export async function fetchObjectIndex(
+  query: string,
+  opts: { limit?: number; timeoutMs?: number; boostSql?: boolean } = {}
+): Promise<SearchObject[]> {
+  const q = (query || '').trim()
+  if (!q) return []
+  const limit = Math.min(Math.max(opts.limit ?? 40, 1), 200)
+  const status = await fetchSearchStatus()
+  if (!status?.ready) return []
+  const url = `${BACKEND_BASE}/api/objects?q=${encodeURIComponent(q)}&limit=${limit}`
+    + (opts.boostSql ? '&boostSql=1' : '')
+  try {
+    const data = await fetchJson(url, opts.timeoutMs ?? DEFAULT_TIMEOUT)
+    return Array.isArray(data?.items) ? data.items as SearchObject[] : []
   } catch {
     return []
   }
@@ -96,7 +162,7 @@ export async function searchOnServer(
 export async function resolveServerHits(
   query: string,
   documents: KnowledgeDoc[],
-  opts: { topK?: number; perHitChars?: number; timeoutMs?: number } = {}
+  opts: SearchOptions = {}
 ): Promise<ServerSearchHit[]> {
   const status = await fetchSearchStatus()
   if (!status?.ready) return []

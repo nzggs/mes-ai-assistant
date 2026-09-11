@@ -221,6 +221,26 @@ mes-ai-assistant/
 **5. 检索模式判定**：点名文档 / 标签页 → 详解（下发正文切片）；明确询问"知识库里有哪些文档" → 探索（只列目录）；
 **其余一律详解**——避免"开发 XX 功能"这类问题只回一串文档名而拿不到正文。
 
+**6. 对象目录 + SQL 页优先**（`GET /api/objects`）
+XML 超大文档被剥正文后，「文档目录」里一个对象名都列不出来，模型只能从命中正文里猜表名，
+实测会把文档名 `Z_WIDGET_202609101235.xml` 当成数据库表，编出 `FROM Z_WIDGET ... LIKE '%作业指导书%'` 这种不存在的 SQL。
+因此：
+- 检索时额外取一份**对象目录**（只含对象编号 / 描述 / 类型 / 所属文档，不含正文，很廉价）注入上下文，
+  让模型先看清库里真实存在哪些对象（例如 `query.ce.sop.list · 查询作业指导书列表（query.sql）`）。
+- 命中页按类别标注：`sql` / `script` / `widget`（界面 JSON）/ `flow`（流程 JSON）。
+  问 SQL 类问题时给 `query.sql` 页**提权并优先注入**，同时把界面/流程大 JSON 按上限裁剪（写 SQL 时它们是纯噪声）；
+  问界面类问题时保持完整结构体，不做裁剪。
+
+**7. 按模型分档的检索预算**（`shared/modelProfile.js`）
+注入规模与模型能力匹配，不再"一个公式套所有模型"：云端模型按各家 `contextWindow` 的 80%（封顶 160000 字符）吃饱召回；
+本地模型按**参数量分档**（≤2B / 2~4.5B / 4.5~14B / >14B）逐档收紧窗口、topK 与单页字符数——
+小模型灌太多只会稀释注意力，而且会直接撞上 Ollama 的上下文上限（见 `DEPLOY.md`「本地模型上下文」）。
+
+**8. 上下文预算按实际用量分配**
+历史实现固定「目录 35% / 正文 65%」；XML 文档的目录几乎是空的，那 35% 被白白浪费，正文反而被压到 65% 以内，
+关键 SQL 页因此挤不进上下文。现在正文预算 = 总预算 − 目录**实际**用量（至少保留一半给正文），
+并对跨文档注入加**保底配额**，避免单篇的大 JSON 把其他文档整篇挤出上下文。
+
 ---
 
 ## 模型供应商
@@ -229,16 +249,22 @@ mes-ai-assistant/
 
 | 供应商 | 默认模型 | 上下文 |
 |---|---|---|
-| **本地 DeepSeek（Ollama）** | `deepseek-r1:1.5b` | 32K |
+| **本地 DeepSeek（Ollama）** | `deepseek-r1:1.5b` | 见下方说明（宿主机 `OLLAMA_CONTEXT_LENGTH`） |
 | DeepSeek | `deepseek-chat` / `deepseek-reasoner` | 64K |
 | 通义千问 | `qwen-plus` 等 7 个 | 128K |
 | 智谱 GLM | `glm-4-plus` 等 7 个 | 128K |
-| Kimi（月之暗面） | `moonshot-v1-128k` | 128K |
-| 豆包（字节） | `doubao-pro-32k` | 128K |
+| Kimi（月之暗面） | `moonshot-v1-128k` | 8K / 32K / 128K（按模型） |
+| 豆包（字节） | `doubao-pro-32k` | 32K / 128K（按模型） |
 | 腾讯混元 | `hy3`（256K） | 256K |
 | MiniMax | `MiniMax-Text-01` | 200K |
 
-供应商配置的**单一数据源**是 `shared/providers.js`，前后端共同引用，避免两端模型列表漂移。
+供应商配置的**单一数据源**是 `shared/providers.js`（含单模型的 `contextWindow` 覆盖），
+注入预算的档位表在 `shared/modelProfile.js`，两者共同决定"这个模型该给多少上下文"。
+
+> **本地模型的坑**：Ollama 的 OpenAI 兼容端点**不接受 `num_ctx`**，而缺省上下文只有 4096 token，
+> 超过就直接返回 `HTTP 400 exceed_context_size_error`（模型根本不执行，页面表现为"LLM 无响应"）。
+> 部署时必须设置 `OLLAMA_CONTEXT_LENGTH`（本项目按 8192 配置，与 `shared/modelProfile.js` 的
+> `OLLAMA_SAFE_CTX_TOKENS` 保持一致）。详见 `DEPLOY.md`。
 
 ---
 

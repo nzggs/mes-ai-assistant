@@ -16,7 +16,7 @@ import {
 } from './storage.js'
 import { extractPdfTextFromFile } from './pdfExtract.js'
 import { startSummary, getTask, cancelTask, listTasks, recoverSummaryTasks, startTaskCleanup } from './summaryTask.js'
-import { configureSearchIndex, buildIndex, search as searchInIndex, getStatus as getIndexStatus, upsertDocument, removeDocument, hasDocument, pagesOfDoc } from './searchIndex.js'
+import { configureSearchIndex, buildIndex, search as searchInIndex, listObjects as listObjectsInIndex, getStatus as getIndexStatus, upsertDocument, removeDocument, hasDocument, pagesOfDoc } from './searchIndex.js'
 
 // 优先加载项目根目录 .env，再用 server/.env 覆盖（server/.env 为后端配置真相源）。
 dotenv.config()
@@ -292,6 +292,11 @@ app.get('/api/search/status', (_req, res) => {
   res.json(getIndexStatus())
 })
 
+// 布尔型查询参数解析：'1' / 'true' / 'yes' 为真（缺省即 false，保证老前端行为不变）
+function boolParam(v) {
+  return v === '1' || v === 'true' || v === 'yes'
+}
+
 app.get('/api/search', (req, res) => {
   try {
     const q = String(req.query.q || '').slice(0, 500)
@@ -299,9 +304,33 @@ app.get('/api/search', (req, res) => {
     const perHitChars = Math.min(Math.max(parseInt(req.query.perHitChars, 10) || 6000, 200), 60000)
     const docIdsRaw = typeof req.query.docIds === 'string' ? req.query.docIds : null
     const docIds = docIdsRaw ? docIdsRaw.split(',').filter(Boolean).slice(0, 200) : null
+    // 新增可选能力（默认关闭 → 老前端/老行为完全不变）：
+    //   smartTrim  按页类别裁剪界面/流程大 JSON
+    //   boostSql   给 query.sql / 含 STATEMENT 的页提权
+    const smartTrim = boolParam(req.query.smartTrim)
+    const boostSql = boolParam(req.query.boostSql)
+    const structChars = Number(req.query.structChars) || undefined
     const status = getIndexStatus()
     if (!status.ready) return res.json({ ...status, hits: [], tookMs: 0, total: 0 })
-    const result = searchInIndex(q, { topK, perHitChars, docIds })
+    const result = searchInIndex(q, { topK, perHitChars, docIds, smartTrim, boostSql, structChars })
+    res.json({ ...result, ...getIndexStatus() })
+  } catch (err) {
+    return internalError(res, err)
+  }
+})
+
+// 对象目录（无正文）：给知识库问答注入「库里有哪些对象/表」的廉价索引。
+// 让模型在写 SQL / 做开发前先知道存在哪些对象及其类型，而不是从命中正文里猜表名。
+app.get('/api/objects', (req, res) => {
+  try {
+    const q = String(req.query.q || '').slice(0, 500)
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 40, 1), 200)
+    const docIdsRaw = typeof req.query.docIds === 'string' ? req.query.docIds : null
+    const docIds = docIdsRaw ? docIdsRaw.split(',').filter(Boolean).slice(0, 200) : null
+    const boostSql = boolParam(req.query.boostSql)
+    const status = getIndexStatus()
+    if (!q || !status.ready) return res.json({ ...status, items: [], tookMs: 0, total: 0 })
+    const result = listObjectsInIndex(q, { limit, docIds, boostSql })
     res.json({ ...result, ...getIndexStatus() })
   } catch (err) {
     return internalError(res, err)

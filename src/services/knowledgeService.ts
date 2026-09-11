@@ -6,7 +6,7 @@ import { getApiKey, getProvider, resolveModelId, callLLMNonStream, callLLMNonStr
 import { BACKEND_BASE } from './backend'
 import { reportError } from './errorReporter'
 import { parseXmlFile, type XmlParseResult } from './xmlParser'
-import type { ServerSearchHit } from './searchApi'
+import type { ServerSearchHit, SearchObject } from './searchApi'
 import JSZip from 'jszip'
 
 // ===== PDF 文本提取 =====
@@ -1221,6 +1221,11 @@ export function decideRetrievalMode(text: string, documents: KnowledgeDoc[]): 'e
 
 // ===== 构建知识上下文（注入系统提示词） =====
 
+/** Markdown 表格单元格转义：竖线与换行会破坏表格结构（对象描述里常见） */
+function mdCell(v: string | undefined): string {
+  return String(v ?? '').replace(/\|/g, '\\|').replace(/\r?\n/g, ' ').trim()
+}
+
 export function buildKnowledgeContext(
   documents: KnowledgeDoc[],
   userQuery?: string,
@@ -1233,7 +1238,15 @@ export function buildKnowledgeContext(
    * 传入后，命中页会按分数注入，且这类文档也会被纳入可用文档集合。
    * **不传时，行为与历史实现逐字一致**（现有功能零回归）。
    */
-  serverHits: ServerSearchHit[] | null = null
+  serverHits: ServerSearchHit[] | null = null,
+  /**
+   * 服务端「对象目录」（可选，来自 /api/objects）。
+   * 只含对象编号/描述/类型/所属文档，不含正文。XML 数据导出这类超大文档被剥正文后，
+   * 目录里**一个对象名都列不出来**（content 不在浏览器里），模型只能从命中正文里猜表名，
+   * 实测会把文档名 `Z_WIDGET_…xml` 当成数据库表编造 SQL。传入本参数即可让模型先看清库里有哪些对象。
+   * **不传时行为与历史逐字一致**。
+   */
+  objectIndex: SearchObject[] | null = null
 ): string {
   const hitsByDoc = new Map<string, ServerSearchHit[]>()
   for (const h of serverHits || []) {
@@ -1263,7 +1276,9 @@ export function buildKnowledgeContext(
   // - 探索模式（第一步）：全部预算用于目录，保证尽可能多文档可见，引导用户定位
   // - 详解模式（第二步）：目录占 35%，命中正文扩展占 65%
   const catalogBudget = isExplore ? totalLimit : Math.floor(totalLimit * 0.35)
-  const contentBudget = totalLimit - catalogBudget
+  // 正文预算：初值按 65% 预留；目录实际用量算完后会在下方改为「总预算 - 实际目录用量」，
+  // 避免目录用不满时把这部分预算白白浪费掉（XML 超大文档的目录几乎是空的）。
+  let contentBudget = totalLimit - catalogBudget
 
   let context = '\n\n## 知识库文档目录\n\n'
   context += `**共 ${usableDocs.length} 篇已入库文档。下面是全部文档的目录（文档名 / 标签页·表名 / 摘要）。请先据此定位与用户问题相关的文档和标签页，再查阅下方「与问题相关的内容」部分。**\n\n`
@@ -1309,6 +1324,32 @@ export function buildKnowledgeContext(
       catalogUsed += block.length
     }
   }
+
+  // ===== 项⑩：对象目录（服务端索引命中，只列对象、不含正文）=====
+  // 为什么必须有：XML 数据导出文档的正文不随列表下发（contentOmitted），因此上面「知识库文档目录」
+  // 里**一个对象名都列不出来**。模型看不到库里有哪些对象/表，就只能从命中正文里猜，
+  // 实测会把文档名 `Z_WIDGET_202609101235.xml` 当成数据库表，编造出 `FROM Z_WIDGET` 这种不存在的 SQL。
+  // 补一份廉价的对象清单后，模型作答前就能看到「库里存在 query.ce.sop.list · 查询作业指导书列表（query.sql）」。
+  if (objectIndex && objectIndex.length > 0 && userQuery) {
+    const maxRows = totalLimit >= 80000 ? 60 : totalLimit >= 40000 ? 40 : 20
+    const rows = objectIndex.slice(0, maxRows)
+    let block = '\n\n## 与问题相关的对象目录（服务端索引命中，仅对象编号/描述/类型，正文见下文）\n\n'
+    block += '| 对象编号 | 描述 | 类型 | 所属文档 |\n|---|---|---|---|\n'
+    for (const it of rows) {
+      block += `| ${mdCell(it.objectNo)} | ${mdCell(it.objectDesc)} | ${mdCell(it.objectType || it.kind)} | ${mdCell(it.docName)} |\n`
+    }
+    const sqlN = objectIndex.filter(it => it.kind === 'sql').length
+    block += `\n> 本次按相关度匹配到 ${objectIndex.length} 个对象`
+      + (sqlN > 0 ? `，其中 ${sqlN} 个类型为 query.sql（系统内已存在、可直接引用的 SQL 定义）` : '')
+      + `；上表只列出最相关的前 ${rows.length} 个。\n`
+    context += block
+    catalogUsed += block.length
+  }
+
+  // 正文预算 = 总预算 − 目录与对象目录的**实际**占用（但至少保留总预算的一半给正文）。
+  // 历史实现固定按 35%/65% 切分：XML 超大文档被剥正文后目录近乎为空，35% 被白白浪费，
+  // 正文又只拿到 65% → 真正有用的 SQL 页被挤出上下文。
+  contentBudget = Math.max(Math.floor(totalLimit * 0.5), totalLimit - catalogUsed)
 
   // ===== 探索模式（两步提问法·第一步）：仅目录 + 检索引导，不在本阶段注入正文 =====
   if (isExplore) {
@@ -1418,15 +1459,25 @@ export function buildKnowledgeContext(
         anyRelevant = true
         // 服务端命中优先：给出一个高于本地 grams 打分的基准，避免被本地噪声压到后面
         maxScore = Math.max(maxScore, 50000 + (hits[0].score || 0))
+        // 组内排序：先「SQL / 脚本」类，再按相关度。
+        // 用户要 SQL 时，必须让 query.sql 页先于界面 JSON 页进入单篇预算，
+        // 否则一篇里的大 JSON 页会把 SQL 页挤到 perDocBudget 之外（SQL 就"看不见"了）。
+        const ordered = [...hits].sort((a, b) => {
+          const rank = (k?: string) => (k === 'sql' ? 0 : k === 'script' ? 1 : 2)
+          return rank(a.kind) - rank(b.kind) || (b.score || 0) - (a.score || 0)
+        })
         section += `**【服务端索引命中《${doc.name}》的 ${hits.length} 个对象/页，按相关度排序：】**\n\n`
-        for (const hit of hits) {
+        for (const hit of ordered) {
           if (docUsed >= perDocBudget) break
           const label = hit.pageTitle || `第${hit.pageIndex + 1}页`
           if (injectedLabels.has(label)) continue
           injectedLabels.add(label)
           const remain = Math.max(0, perDocBudget - docUsed)
           const body = hit.text.length > remain ? hit.text.slice(0, remain) + '\n…（本页过长，已截断）' : hit.text
-          section += `**[${label}]**\n${body}\n\n`
+          // 标出对象类型：模型据此能区分「这是 SQL 定义」还是「这是界面组件」，
+          // 不再把界面单据的对象字段当成数据库列拼进 SQL。
+          const typeTag = hit.objectType ? `（对象类型：${hit.objectType}）` : ''
+          section += `**[${label}]${typeTag}**\n${body}\n\n`
           docUsed += body.length
         }
       }
@@ -1503,6 +1554,19 @@ export function buildKnowledgeContext(
 
   // 跨文档按命中分数降序排序（段落/标签级相关性，非"文档级优先"hack）
   docHits.sort((a, b) => b.score - a.score)
+
+  // 跨文档「保底配额」：单篇命中内容过多时，排在前面的文档会把后面的文档整篇挤出预算
+  // （实测 Z_WIDGET 的界面 JSON 挤掉了 Z_LOGIC 的 SQL 页）。按有命中的文档数均分，
+  // 保证每个命中文档都能进上下文，避免"只看到一篇文档"的错觉。
+  const fairShare = Math.max(2000, Math.floor(contentBudget / Math.max(1, docHits.length)))
+  if (docHits.length > 1) {
+    for (const h of docHits) {
+      if (h.section.length > fairShare) {
+        h.section = h.section.slice(0, fairShare)
+          + '\n…（该文档命中内容较多，已按配额截断；如需其余命中可点名具体对象追问）\n\n'
+      }
+    }
+  }
 
   // 注入 top-N（受 contentBudget 限制）
   let contentUsed = 0

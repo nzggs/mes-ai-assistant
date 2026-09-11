@@ -21,6 +21,53 @@ const MAX_DF_PER_TERM = Number(process.env.MES_IDX_MAX_DF || 1500)   // 单 term
 const MAX_TOTAL_POSTINGS = Number(process.env.MES_IDX_MAX_POSTINGS || 3_000_000) // 全局 posting 预算（内存兜底）
 const MAX_QUERY_TERMS = 64           // 单次查询最多使用多少个 term
 const MAX_PAGE_CHARS = 200_000       // 单页参与建索引的最大字符数
+// SQL 意图下给「query.sql / 含 STATEMENT 的页」的提权分值（让 SQL 页稳定排在界面 JSON 之前）
+const SQL_BOOST = Number(process.env.MES_IDX_SQL_BOOST || 8)
+// 界面/流程类页（STRACTURE / WIND_ELEMENT 大 JSON）单页返回上限。
+// 这类 JSON 是写 SQL、答业务问题时纯噪声，动辄上万字符，会把真正有用的 SQL 页挤出上下文预算。
+const DEFAULT_STRUCT_CHARS = Number(process.env.MES_IDX_STRUCT_CHARS || 1500)
+
+// ===== 页级对象元数据 =====
+// 从页标题/正文抽取：对象编号（标题 `·` 前）、对象类型（TYPE_CATEGORY_NO）与「页类别」。
+// 作用：① 命中项带上 objectType，前端可把它标进上下文，模型才知道这页是 SQL 定义而不是界面；
+//      ② smartTrim 按类别裁剪，界面/流程大 JSON 不再挤占 SQL 页的上下文预算。
+const TITLE_SEP = ' · '
+
+/** 判断页类别：sql / script / widget / flow / other */
+export function classifyPage(type, body) {
+  const ty = String(type || '').toLowerCase()
+  const b = String(body || '')
+  if (/(^|\W)query\.sql(\W|$)/.test(ty) || ty === 'query.sql' || ty === 'sql') return 'sql'
+  if (ty === 'script' || ty === 'query' || ty === 'function' || ty === 'logic') return 'script'
+  if (/^[ \t]*STATEMENT[ \t]*:/im.test(b) || /^[ \t]*SELECT[\s(]/im.test(b)) return 'sql'
+  if (/[A-Z_]*STRACTURE[ \t]*:/i.test(b)) return 'widget'
+  if (/WIND_ELEMENT[ \t]*:/i.test(b)) return 'flow'
+  return 'other'
+}
+
+/** 拆页标题：XML 页标题形如「对象编号 · 描述」→ { obj, desc }（无分隔符时 desc 为空） */
+export function splitTitle(title) {
+  const t = String(title || '')
+  const sep = t.indexOf(TITLE_SEP)
+  return {
+    obj: (sep > 0 ? t.slice(0, sep) : t).trim(),
+    desc: sep > 0 ? t.slice(sep + TITLE_SEP.length).trim() : '',
+  }
+}
+
+/** 从页标题与正文抽取对象元数据（对象编号 / 描述 / 对象类型 / 页类别） */
+export function pageMetaOf(title, body) {
+  const { obj, desc } = splitTitle(title)
+  const tm = /^[ \t]*TYPE_CATEGORY_NO[ \t]*:[ \t]*(\S+)/m.exec(String(body || ''))
+  const type = tm ? tm[1] : ''
+  return { obj, desc, type, kind: classifyPage(type, body) }
+}
+
+/** sql / script 类页保留完整正文（SQL 必须逐字可抄）；其余类别是可裁剪的结构类页 */
+function isTrimKind(kind) {
+  return kind !== 'sql' && kind !== 'script'
+}
+
 
 /** 索引运行时状态 */
 const state = {
@@ -210,7 +257,15 @@ export function upsertDocument(docId, doc) {
   if (pages.length === 0) return false
 
   const docIdx = allocDocIdx()
-  const meta = { i: docIdx, name: doc.name || '', titles: new Array(pages.length) }
+  const meta = {
+    i: docIdx,
+    name: doc.name || '',
+    titles: new Array(pages.length),
+    // 页级对象类型（TYPE_CATEGORY_NO）与页类别（sql/script/widget/flow/other），
+    // 与 titles 等长同序；对象编号/描述由标题现算（不额外占内存）。
+    types: new Array(pages.length),
+    kinds: new Array(pages.length),
+  }
   state.docs.set(docId, meta)
   // 关键：占位后 allocDocIdx 才会把下一个 idx 分配给别篇；
   // 否则 docIds[i] 仍为 null，后续文档会复用同一个 docIdx，导致不同文档的命中互相串页。
@@ -221,6 +276,9 @@ export function upsertDocument(docId, doc) {
     const title = String(page.title || '')
     const body = Array.isArray(page.paragraphs) ? page.paragraphs.join('\n') : String(page.paragraphs || '')
     meta.titles[p] = title
+    const pm = pageMetaOf(title, body)
+    meta.types[p] = pm.type
+    meta.kinds[p] = pm.kind
     const source = `${title}\n${body}`.slice(0, MAX_PAGE_CHARS)
     const uniq = new Set(tokenize(source))
     let added = 0
@@ -331,9 +389,24 @@ function readPage(docId, pageIdx) {
 
 /**
  * 关键词检索（页级）。
- * @returns {{ hits: Array<{docId,docName,pageIndex,pageTitle,score,text}>, tookMs:number, total:number }}
+ *
+ * 新增（默认关闭，保证历史行为零回归）：
+ *  - `smartTrim`：按页类别分档裁剪正文——sql/script 页保持完整（SQL 必须逐字可抄），
+ *    widget/flow 等结构类页压到 `structChars`。界面 JSON 动辄上万字符，是问答里最大的噪声源。
+ *  - `boostSql`：给 sql 页（及 script 页一半分值）提权，使用户要 SQL 时 SQL 页稳定排在最前。
+ *
+ * @returns {{ hits: Array<{docId,docName,pageIndex,pageTitle,score,text,objectNo,objectDesc,objectType,kind,trimmed}>,
+ *             tookMs:number, total:number }}
  */
-export function search(query, { topK = 20, perHitChars = 6000, docIds = null } = {}) {
+export function search(query, {
+  topK = 20,
+  perHitChars = 6000,
+  docIds = null,
+  smartTrim = false,
+  structChars = DEFAULT_STRUCT_CHARS,
+  boostSql = false,
+  sqlBoost = SQL_BOOST,
+} = {}) {
   const started = Date.now()
   const q = String(query || '').trim()
   if (!q || !state.ready) return { hits: [], tookMs: 0, total: 0 }
@@ -379,6 +452,18 @@ export function search(query, { topK = 20, perHitChars = 6000, docIds = null } =
     }
   }
 
+  // SQL 意图提权：使用户问「…的 SQL」时，query.sql / 含 STATEMENT 的页排到界面 JSON 页之前。
+  // 否则 Z_WIDGET 这类界面页会靠标题里的中文命中挤占前几名，把真正的 SQL 定义压到上下文预算之外。
+  if (boostSql) {
+    for (const item of acc.values()) {
+      const ref = metaByIdx.get(item.docIdx)
+      if (!ref) continue
+      const k = ref.meta.kinds && ref.meta.kinds[item.pageIdx]
+      if (k === 'sql') item.score += sqlBoost
+      else if (k === 'script') item.score += sqlBoost / 2
+    }
+  }
+
   const sorted = Array.from(acc.values()).sort((a, b) => b.score - a.score).slice(0, Math.max(1, Math.min(topK, 200)))
   const hits = []
   for (const item of sorted) {
@@ -386,16 +471,57 @@ export function search(query, { topK = 20, perHitChars = 6000, docIds = null } =
     if (!ref) continue
     const page = readPage(ref.id, item.pageIdx)
     if (!page) continue
+    const kind = (ref.meta.kinds && ref.meta.kinds[item.pageIdx]) || 'other'
+    const objectType = (ref.meta.types && ref.meta.types[item.pageIdx]) || ''
+    const { obj, desc } = splitTitle(page.head)
+    // 结构类页（界面/流程大 JSON）可按 smartTrim 收紧；sql/script 页永不裁剪到 structChars 以下
+    const cap = (smartTrim && isTrimKind(kind)) ? Math.min(perHitChars, Math.max(200, structChars)) : perHitChars
+    const isTrimmed = page.text.length > cap
+    let text = isTrimmed ? page.text.slice(0, cap) : page.text
+    if (isTrimmed && smartTrim && isTrimKind(kind)) {
+      text += '\n…（该对象为界面/流程定义，结构体过大已裁剪）'
+    }
     hits.push({
       docId: ref.id,
       docName: ref.meta.name,
       pageIndex: item.pageIdx,
       pageTitle: page.head || `第${item.pageIdx + 1}页`,
       score: Number(item.score.toFixed(4)),
-      text: page.text.length > perHitChars ? page.text.slice(0, perHitChars) : page.text,
+      text,
+      objectNo: obj,
+      objectDesc: desc,
+      objectType,
+      kind,
+      trimmed: isTrimmed,
     })
   }
   return { hits, tookMs: Date.now() - started, total: acc.size }
+}
+
+/**
+ * 对象目录：只返回命中页的「对象编号 / 描述 / 对象类型 / 页类别 / 所属文档」，
+ * **不带正文**。用于向模型注入一份廉价的「库里有哪些对象」索引——
+ * 这是让模型知道「存在一个 query.sql 对象叫『查询作业指导书列表』」的关键，
+ * 否则它只能凭命中正文猜表名，极易编造出不存在的表（如把界面单据当成数据库表）。
+ *
+ * @returns {{ items: Array<{docId,docName,pageIndex,objectNo,objectDesc,objectType,kind,score}>, total:number, tookMs:number }}
+ */
+export function listObjects(query, { limit = 40, docIds = null, boostSql = false, sqlBoost = SQL_BOOST } = {}) {
+  const res = search(query, { topK: Math.max(1, Math.min(limit, 200)), perHitChars: 1, docIds, boostSql, sqlBoost })
+  return {
+    items: res.hits.map(h => ({
+      docId: h.docId,
+      docName: h.docName,
+      pageIndex: h.pageIndex,
+      objectNo: h.objectNo,
+      objectDesc: h.objectDesc,
+      objectType: h.objectType,
+      kind: h.kind,
+      score: h.score,
+    })),
+    total: res.total,
+    tookMs: res.tookMs,
+  }
 }
 
 /** 判断某篇文档是否已入索引 */

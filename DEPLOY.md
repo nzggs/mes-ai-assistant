@@ -207,6 +207,46 @@ node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
 改 `shared/providers.js` 中 ollama 段的 `defaultModel`（并确认宿主机已 `ollama pull` 该模型），
 重新构建即可。仅临时切换模型 ID 时，可在页面「API 配置」里直接填本地已有的模型名。
 
+> 换了参数量差别很大的模型（如 1.5B → 7B）时，注入预算会自动跟着档位走，无需改代码；
+> 档位表见下节「模型分级预算」。
+
+### 本地模型上下文（务必配置，否则知识库问答直接失败）
+
+Ollama 的 OpenAI 兼容端点（`/v1/chat/completions`）**不接受 `num_ctx`**，请求一旦超过服务端
+上下文上限就直接返回 `HTTP 400 exceed_context_size_error` —— 模型根本不会执行，页面表现为
+「LLM 无响应」。而 Ollama 缺省上下文只有 **4096 token**，装不下知识库检索出来的正文。
+
+实测：5877 token 的请求 → `request (5877 tokens) exceeds the available context size (4096 tokens)`。
+所以部署时必须把宿主机 Ollama 的上下文调大：
+
+```bash
+sudo mkdir -p /etc/systemd/system/ollama.service.d
+sudo tee /etc/systemd/system/ollama.service.d/ctx.conf >/dev/null <<'EOF'
+[Service]
+Environment="OLLAMA_CONTEXT_LENGTH=8192"
+EOF
+sudo systemctl daemon-reload && sudo systemctl restart ollama
+```
+
+并确认 `shared/modelProfile.js` 里的 `OLLAMA_SAFE_CTX_TOKENS` 与上面取值一致（默认 8192）。
+两者不一致的后果：宿主机更小 → 请求 400 失败；宿主机更大 → 只是没吃满，不会出错。
+
+### 模型分级预算（云端按云端配置 / 本地按参数量分档）
+
+知识库注入规模按模型能力分档，唯一配置点在 `shared/modelProfile.js`：
+
+| 模型 | 档位 | 注入上限（字符） | topK | 单页字符 |
+|---|---|---|---|---|
+| 云端（GLM / DeepSeek / Kimi / 混元…） | cloud | 各家 `contextWindow` × 80%，封顶 160000 | 30 | 9000 |
+| 本地 ≤2B（如 deepseek-r1:1.5b） | tiny | 6000 | 8 | 2500 |
+| 本地 2B~4.5B（如 qwen2.5:3b） | small | 12000 | 12 | 4000 |
+| 本地 4.5B~14B（如 7B / 8B） | medium | min(26000, Ollama 上限) | 20 | 6000 |
+| 本地 >14B（如 32B） | large | min(52000, Ollama 上限) | 30 | 8000 |
+
+小模型必须"少而准"：把 2 万字符灌给 1.5B 只会稀释注意力（关键 SQL 页被界面 JSON 淹没），
+还会直接撞上 Ollama 的上下文上限。云端大模型则相反，窗口越大越应吃满召回。
+同提供商内的短窗口模型也已单独标注（如 Kimi 8K / 128K、豆包 32K / 128K）。
+
 ---
 
 ## 七、排错
@@ -225,6 +265,9 @@ node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
 | 超大 XML 文档「搜不到内容」 | 服务端索引尚未构建完成（刚重启），或该文档未入库（非 approved） | `curl /api/search/status` 看 `ready`；未入库文档本就不参与问答，先点「确认入库」 |
 | 容器内存占用偏高（数百 MB） | 索引与已入库文档正文常驻内存（数万条记录的量级） | 正常；如需收紧可调小 `MES_IDX_MAX_POSTINGS`，或 `SEARCH_INDEX=0` 关闭索引（会退回前端全量检索） |
 | 大文档打开详情较慢 | 正文按需加载（首次打开需从服务端取回） | 预期行为；未下发的正文只在打开文档时才拉取，避免每次打开页面都拉几十 MB |
+| 本地模型问答「LLM 无响应」、日志见 `exceed_context_size_error` | Ollama 上下文仍是缺省 4096，装不下注入的知识库正文 | 见第六节「本地模型上下文」：设 `OLLAMA_CONTEXT_LENGTH` 后重启 ollama |
+| 问 SQL 却答成别的表/编造表名 | 模型拿文档名当表名；对象目录未注入或 SQL 页被界面 JSON 挤掉 | 已修：会注入「对象目录」+ 给 `query.sql` 页提权 + 按类型裁剪大 JSON。若仍错，确认 `/api/objects?q=…` 有返回（`ready=true`） |
+| `/api/objects` 返回空 | 索引未就绪，或查询词与对象名/描述完全不匹配 | `curl /api/search/status` 看 `ready`；换更贴近对象名的关键词重试 |
 
 ---
 

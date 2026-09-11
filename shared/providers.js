@@ -69,9 +69,9 @@ export const PROVIDER_LIST = [
     name: 'Kimi (月之暗面)',
     apiUrl: 'https://api.moonshot.cn/v1/chat/completions',
     models: [
-      { id: 'moonshot-v1-8k', name: 'Moonshot v1 8K' },
-      { id: 'moonshot-v1-32k', name: 'Moonshot v1 32K' },
-      { id: 'moonshot-v1-128k', name: 'Moonshot v1 128K' },
+      { id: 'moonshot-v1-8k', name: 'Moonshot v1 8K', contextWindow: 8192 },
+      { id: 'moonshot-v1-32k', name: 'Moonshot v1 32K', contextWindow: 32768 },
+      { id: 'moonshot-v1-128k', name: 'Moonshot v1 128K', contextWindow: 128000 },
     ],
     defaultModel: 'moonshot-v1-128k',
     keyPlaceholder: 'sk-xxxxxxxxxxxxxxxxxxxxxxxx',
@@ -84,9 +84,9 @@ export const PROVIDER_LIST = [
     name: '豆包 (字节)',
     apiUrl: 'https://ark.cn-beijing.volces.com/api/v3/chat/completions',
     models: [
-      { id: 'doubao-pro-32k', name: 'Doubao Pro 32K' },
-      { id: 'doubao-pro-128k', name: 'Doubao Pro 128K' },
-      { id: 'doubao-lite-32k', name: 'Doubao Lite 32K' },
+      { id: 'doubao-pro-32k', name: 'Doubao Pro 32K', contextWindow: 32768 },
+      { id: 'doubao-pro-128k', name: 'Doubao Pro 128K', contextWindow: 128000 },
+      { id: 'doubao-lite-32k', name: 'Doubao Lite 32K', contextWindow: 32768 },
     ],
     defaultModel: 'doubao-pro-32k',
     keyPlaceholder: 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx',
@@ -138,11 +138,13 @@ export const PROVIDER_LIST = [
     // 本地服务器部署的 OpenAI 兼容模型服务接口；模型跑在本地，无需联网、无需 API。
     // 自定义模型 ID 可填本地已拉取的其他模型（如 qwen2.5:3b、llama3 等）。
     apiUrl: OLLAMA_API_URL,
+    // 单模型的 contextWindow 填「模型真实窗口」，真正的注入预算由 shared/modelProfile.js
+    // 按参数量分档收紧（小模型必须少而准，不能把大上下文灌进去）。
     models: [
-      { id: 'deepseek-r1:1.5b', name: 'DeepSeek-R1 1.5B' },
-      { id: 'deepseek-r1:7b', name: 'DeepSeek-R1 7B' },
-      { id: 'qwen2.5:3b', name: 'Qwen2.5 3B' },
-      { id: 'qwen2.5:7b-instruct', name: 'Qwen2.5 7B Instruct' },
+      { id: 'deepseek-r1:1.5b', name: 'DeepSeek-R1 1.5B', contextWindow: 131072 },
+      { id: 'deepseek-r1:7b', name: 'DeepSeek-R1 7B', contextWindow: 131072 },
+      { id: 'qwen2.5:3b', name: 'Qwen2.5 3B', contextWindow: 32768 },
+      { id: 'qwen2.5:7b-instruct', name: 'Qwen2.5 7B Instruct', contextWindow: 32768 },
     ],
     defaultModel: 'deepseek-r1:1.5b',
     // 离线模型不需要 API；前端存一个占位串以满足既有「已配置」闸门，真实请求不携带有效凭证。

@@ -3,6 +3,7 @@ import { describe, it, expect, beforeEach } from 'vitest'
 import {
   configureSearchIndex, tokenize, resetIndex, upsertDocument, removeDocument,
   buildIndex, hasDocument, indexedPageCount, getStatus, search,
+  splitTitle, pageMetaOf, classifyPage, listObjects,
 } from './searchIndex.js'
 
 /** 构造一篇「已入库」文档（页 = 逻辑单元） */
@@ -208,5 +209,112 @@ describe('超大文档内存保护', () => {
     expect(size).toBeGreaterThan(0)
     expect(size).toBeLessThan(1_500_001)
     expect(typeof terms.length).toBe('number')
+  })
+})
+
+// ===== 页级对象元数据 / 按类型裁剪 / SQL 提权 / 对象目录 =====
+// 背景：XML 数据导出里「界面组件（widget）」「流程（flow）」「SQL 定义（query.sql）」混在同一批文档里。
+// 用户问 SQL 时，界面 JSON 页会靠标题里的中文命中挤到前面，把真正的 SQL 定义挤出上下文预算，
+// 模型只好拿文档名当表名编 SQL。以下用例锁定修复：类型标注 + SQL 提权 + 结构类页裁剪。
+
+const SQL_PAGE_TITLE = 'query.ce.sop.list · 查询作业指导书列表'
+const WIDGET_PAGE_TITLE = 'U00CO00037 · 附件上传组件'
+const SQL_BODY = [
+  'LOGIC_NO: query.ce.sop.list',
+  'LOGIC_DESC: 查询作业指导书列表',
+  'TYPE_CATEGORY_NO: query.sql',
+  'STATEMENT: SELECT ZS.WORK_CENTER, ZS.SOP_FILE FROM Z_SOP ZS WHERE ZS.SITE = :SITE',
+]
+const WIDGET_BODY = [
+  'WIDGET_NO: U00CO00037',
+  'WIDGET_DESC: 附件上传组件',
+  'TYPE_CATEGORY_NO: widget',
+  'REMARK: 作业指导书 附件上传',
+  `STRACTURE: ${'{"clazz":"G.widget.Layout","childrenJson":['.repeat(120)}`,
+]
+
+const SQL_DOC = makeDoc('Z_LOGIC_202609101240.xml', [{ title: SQL_PAGE_TITLE, body: SQL_BODY }])
+const WIDGET_DOC = makeDoc('Z_WIDGET_202609101235.xml', [{ title: WIDGET_PAGE_TITLE, body: WIDGET_BODY }])
+
+/** 入库并等待索引就绪（search/listObjects 都要求 state.ready） */
+async function buildDocs() {
+  STORE.clear()
+  seed(SQL_DOC, WIDGET_DOC)
+  await buildIndex([SQL_DOC, WIDGET_DOC])
+}
+
+describe('页级对象元数据', () => {
+  it('splitTitle 按「对象编号 · 描述」拆标题', () => {
+    expect(splitTitle(SQL_PAGE_TITLE)).toEqual({ obj: 'query.ce.sop.list', desc: '查询作业指导书列表' })
+    expect(splitTitle('无分隔符标题')).toEqual({ obj: '无分隔符标题', desc: '' })
+  })
+
+  it('pageMetaOf 抽取对象类型并判定页类别', () => {
+    expect(pageMetaOf(SQL_PAGE_TITLE, SQL_BODY.join('\n'))).toMatchObject({ type: 'query.sql', kind: 'sql' })
+    expect(pageMetaOf(WIDGET_PAGE_TITLE, WIDGET_BODY.join('\n'))).toMatchObject({ type: 'widget', kind: 'widget' })
+  })
+
+  it('无 TYPE_CATEGORY_NO 时按 STATEMENT / STRUCTURE 兜底判定', () => {
+    expect(classifyPage('', 'STATEMENT: SELECT 1 FROM DUMMY')).toBe('sql')
+    expect(classifyPage('', 'WIND_ELEMENT: {"STEPS":[]}')).toBe('flow')
+    expect(classifyPage('', '普通说明文字')).toBe('other')
+  })
+
+  it('search 命中项带上对象编号/描述/类型/类别', async () => {
+    await buildDocs()
+    const { hits } = search('SOP_FILE', { topK: 5 })
+    const h = hits.find(x => x.pageTitle === SQL_PAGE_TITLE)
+    expect(h).toBeTruthy()
+    expect(h.objectNo).toBe('query.ce.sop.list')
+    expect(h.objectDesc).toBe('查询作业指导书列表')
+    expect(h.objectType).toBe('query.sql')
+    expect(h.kind).toBe('sql')
+  })
+})
+
+describe('smartTrim 按页类别裁剪', () => {
+  it('界面/流程大 JSON 被压短，SQL 页正文保持完整（默认开启前行为不变）', async () => {
+    await buildDocs()
+    const raw = search('作业指导书', { topK: 5, perHitChars: 6000 })
+    const rawWidget = raw.hits.find(x => x.pageTitle === WIDGET_PAGE_TITLE)
+    // 默认（smartTrim 关闭）：结构类页仍按 perHitChars 返回长正文
+    expect(rawWidget.text.length).toBeGreaterThan(1000)
+
+    const trimmed = search('作业指导书', { topK: 5, perHitChars: 6000, smartTrim: true, structChars: 300 })
+    const tWidget = trimmed.hits.find(x => x.pageTitle === WIDGET_PAGE_TITLE)
+    const tSql = trimmed.hits.find(x => x.pageTitle === SQL_PAGE_TITLE)
+    expect(tWidget.text.length).toBeLessThan(500)
+    expect(tWidget.trimmed).toBe(true)
+    // SQL 页绝不因 smartTrim 被裁到 structChars 以下
+    expect(tSql.text).toContain('FROM Z_SOP ZS')
+    expect(tSql.trimmed).toBe(false)
+  })
+})
+
+describe('boostSql 提权', () => {
+  it('两个文档同等命中时，query.sql 页排到界面页之前', async () => {
+    await buildDocs()
+    const plain = search('作业指导书', { topK: 5 })
+    const boosted = search('作业指导书', { topK: 5, boostSql: true })
+    // 提权后 SQL 页必须是第 1 名（否则模型拿到的第一条命中会是界面 JSON）
+    expect(boosted.hits[0].kind).toBe('sql')
+    expect(boosted.hits[0].score).toBeGreaterThan(plain.hits[0].score)
+  })
+})
+
+describe('listObjects 对象目录', () => {
+  it('只返回对象元数据、不含正文', async () => {
+    await buildDocs()
+    const res = listObjects('作业指导书', { limit: 10, boostSql: true })
+    expect(res.items.length).toBeGreaterThan(0)
+    expect(res.items[0]).toMatchObject({ objectNo: 'query.ce.sop.list', objectType: 'query.sql', kind: 'sql' })
+    expect(res.items[0]).not.toHaveProperty('text')
+    expect(res.total).toBeGreaterThan(0)
+  })
+
+  it('索引未就绪时返回空目录（前端据此退回本地检索）', () => {
+    const res = listObjects('任何查询', { limit: 10 })
+    expect(res.items).toEqual([])
+    expect(res.total).toBe(0)
   })
 })

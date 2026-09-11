@@ -9,11 +9,12 @@ import { UserManagement } from './components/UserManagement'
 import { ChangePasswordModal } from './components/ChangePasswordModal'
 import ErrorToasts from './components/ErrorToasts'
 import { generateResponse, initialConversations, presetQuestions } from './data/mockData'
-import { streamChat, hasApiKey, getProvider, getReasoningModelId, summarizeHistory, type ChatMessageDto } from './services/llmApi'
+import { streamChat, hasApiKey, getProvider, getReasoningModelId, resolveModelId, summarizeHistory, type ChatMessageDto } from './services/llmApi'
 import { buildKnowledgeContext, decideRetrievalMode, detectSummaryIntent, getCachedSummary, FULL_DOC_SUMMARY_KEY, summarizeDocumentScope } from './services/knowledgeService'
 import { ensureSuperAdminSeeded, syncUsersFromBackend, canAccessUserManagement } from './services/userService'
 import { getAllDocs, restoreDocsFromRecords, syncLocalToBackend, saveTableSummary, fetchAllDocPages } from './services/docStore'
-import { resolveServerHits, type ServerSearchHit } from './services/searchApi'
+import { resolveServerHits, fetchObjectIndex, type ServerSearchHit, type SearchObject } from './services/searchApi'
+import { resolveModelProfile, hasSqlIntent } from '../shared/modelProfile.js'
 import type { Conversation, ChatMessage, SidebarView, KnowledgeDoc } from './types'
 import { APP_VERSION } from './version'
 
@@ -232,19 +233,46 @@ export default function App() {
     // 2) 点亮且检索到内容 -> 注入文档内容，优先从最新知识库检索归纳并注明出处
     // 3) 点亮但未检索到内容 -> 注入"未命中"提示，要求先告知"知识库中未找到相关内容"，再转外部/通用知识
     const kbEnabled = useKnowledgeBase
-    // 知识库注入上限：按当前模型上下文窗口的 80%（封顶 160000），给长 SQL 完整语句注入留足空间。
-    // 模型输出仍占窗口，但系统提示/历史消息不通过本限值注入，80% 是安全上界（minimax 200k→160k、deepseek 64k→52k）
-    const kbContextLimit = Math.min(160000, Math.round((getProvider().contextWindow || 65536) * 0.8))
+    // ===== 模型分级预算：云端按各家云端配置，本地按参数量分档 =====
+    // 旧实现用「窗口 80%，封顶 160000」这一个公式套所有模型：云端 128k 只注入约 10 万字符（浪费召回），
+    // 本地 1.5B 却被灌进 2 万多字符（注意力稀释，并且会直接撞上 Ollama 的 num_ctx 上限报 HTTP 400）。
+    // 现改为按模型档位取预算，具体档位与依据见 shared/modelProfile.js。
+    const provider = getProvider()
+    const profileModelId = resolveModelId(
+      deepThink ? (getReasoningModelId() || provider.defaultModel) : provider.defaultModel
+    )
+    const profile = resolveModelProfile({ providerId: provider.id, modelId: profileModelId, provider })
+    // 本次知识库上下文最多注入多少字符（由模型档位决定）
+    const kbContextLimit = profile.limit
+    // 是否在问 SQL / 查询语句类问题 → 让 query.sql 页提权并优先注入
+    const sqlIntent = hasSqlIntent(text)
 
     // ===== 服务端检索（第二阶段）：超大文档的正文不常驻浏览器，只能由服务端倒排索引检索 =====
     // 结果直接喂给 buildKnowledgeContext（可选参数），索引未就绪时返回空数组 → 自动走本地既有路径。
+    // 同时取一份「对象目录」（无正文，很廉价）：XML 文档被剥正文后目录里没有对象名，
+    // 模型会拿文档名当表名编造 SQL，必须靠这份清单告诉它库里有哪些对象。
     let serverHits: ServerSearchHit[] = []
+    let objectIndex: SearchObject[] = []
     if (kbEnabled) {
-      serverHits = await resolveServerHits(text, documents, {
-        topK: kbContextLimit >= 80000 ? 30 : 15,
-        perHitChars: 6000,
-        timeoutMs: 5000,
-      })
+      const [hits, objs] = await Promise.all([
+        resolveServerHits(text, documents, {
+          topK: profile.topK,
+          perHitChars: profile.perHitChars,
+          // 只在问 SQL / 查询语句类问题时裁剪界面大 JSON 并给 SQL 页提权：
+          // 问「这个界面有哪些控件」时需要完整结构体，不能被裁掉（保持历史行为）。
+          smartTrim: sqlIntent,
+          boostSql: sqlIntent,
+          structChars: profile.structChars,
+          timeoutMs: 5000,
+        }),
+        fetchObjectIndex(text, {
+          limit: profile.objectRows,
+          boostSql: sqlIntent,
+          timeoutMs: 5000,
+        }),
+      ])
+      serverHits = hits
+      objectIndex = objs
     }
 
     // 兜底：服务端索引不可用（未构建完成 / 旧版本后端）且存在「正文剥离」的超大文档时，
@@ -278,7 +306,7 @@ export default function App() {
     // （旧逻辑是「没点名文档就走探索」，导致「开发 XX 功能」这类问题只回一串文档名，拿不到正文。）
     const effectiveMode = decideRetrievalMode(text, documents)
 
-    const knowledgeContext = kbEnabled ? buildKnowledgeContext(docsForContext, text, kbContextLimit, effectiveMode, serverHits) : ''
+    const knowledgeContext = kbEnabled ? buildKnowledgeContext(docsForContext, text, kbContextLimit, effectiveMode, serverHits, objectIndex) : ''
 
     // 项⑤：整体归纳意图自动触发整表总结（优先用已缓存，否则后台生成并持久化）
     // 效果：用户问"总结2026履历/分析整个XX文档"时，自动走 map-reduce 全量总结；
