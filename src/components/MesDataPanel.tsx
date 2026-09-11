@@ -4,10 +4,8 @@ export function MesDataPanel() {
   const equipmentList = [
     { id: 'W-01', name: '卷绕机', status: 'running', oee: 92.3, product: 'PD-CELL' },
     { id: 'L-02', name: '注液机', status: 'running', oee: 88.7, product: 'PD-CELL' },
-    { id: 'C-01', name: '涂布机', status: 'running', oee: 90.1, product: 'PD-CELL' },
     { id: 'F-01', name: '分容柜', status: 'idle', oee: 0, product: '-' },
     { id: 'F-03', name: '化成柜', status: 'error', oee: 0, product: 'PD-CELL' },
-    { id: 'R-01', name: '辊压机', status: 'running', oee: 85.4, product: 'PD-CELL' },
   ]
 
   const lineList = [

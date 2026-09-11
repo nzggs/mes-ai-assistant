@@ -282,8 +282,6 @@ export const mockKnowledgeGraph: KnowledgeGraphData = {
     ]},
     // 工序
     { id: 'pr-mix', label: '搅拌工序', type: 'process', description: '正负极浆料搅拌混合' },
-    { id: 'pr-coat', label: '涂布工序', type: 'process', description: '浆料涂布与干燥' },
-    { id: 'pr-roll', label: '辊压分切', type: 'process', description: '极片辊压与分切' },
     { id: 'pr-winding', label: '卷绕工序', type: 'process', description: '正负极与隔膜卷绕' },
     { id: 'pr-filling', label: '注液工序', type: 'process', description: '电解液注入' },
     { id: 'pr-formation', label: '化成工序', type: 'process', description: '首次充放电与SEI膜形成' },
@@ -337,7 +335,6 @@ export const mockKnowledgeGraph: KnowledgeGraphData = {
     { source: 'eq-filling', target: 'pr-filling', label: '执行', description: '注液机执行注液工序' },
     { source: 'eq-formation', target: 'pr-formation', label: '执行', description: '化成柜执行化成工序' },
     // 工序 → 产品
-    { source: 'pr-coat', target: 'pd-cell', label: '生产极片' },
     { source: 'pr-winding', target: 'pd-cell', label: '卷绕' },
     { source: 'pr-formation', target: 'pd-cell', label: '化成' },
     { source: 'pr-grading', target: 'pd-cell', label: '分容' },

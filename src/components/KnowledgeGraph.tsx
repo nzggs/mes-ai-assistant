@@ -21,12 +21,10 @@ const nodePositions: Record<string, { x: number; y: number }> = {
   'eq-formation': { x: 100, y: 420 },
   // 工序 (x=320)
   'pr-mix': { x: 320, y: 40 },
-  'pr-coat': { x: 320, y: 140 },
-  'pr-roll': { x: 320, y: 240 },
-  'pr-winding': { x: 320, y: 340 },
-  'pr-filling': { x: 320, y: 440 },
-  'pr-formation': { x: 320, y: 540 },
-  'pr-grading': { x: 320, y: 640 },
+  'pr-winding': { x: 320, y: 140 },
+  'pr-filling': { x: 320, y: 240 },
+  'pr-formation': { x: 320, y: 340 },
+  'pr-grading': { x: 320, y: 440 },
   // 产品 (x=540)
   'pd-cell': { x: 540, y: 300 },
   'pd-pack': { x: 540, y: 460 },
