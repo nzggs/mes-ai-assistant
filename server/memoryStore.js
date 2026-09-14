@@ -64,15 +64,27 @@ function readDoc() {
   return cache
 }
 
-/** 原子写盘（临时文件 + rename），避免半写状态 */
+/** 原子写盘（临时文件 + rename），避免半写状态。Windows 下 rename 目标可能被短暂占用，加重试。 */
 function persist(doc) {
   doc.updatedAt = new Date().toISOString()
   const target = file()
   fs.mkdirSync(path.dirname(target), { recursive: true })
   const tmp = `${target}.tmp`
   fs.writeFileSync(tmp, JSON.stringify(doc, null, 2), 'utf8')
-  fs.renameSync(tmp, target)
-  cache = doc
+  let lastErr = null
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      fs.renameSync(tmp, target)
+      cache = doc
+      return
+    } catch (err) {
+      lastErr = err
+      const spinStart = Date.now()
+      while (Date.now() - spinStart < 50) { /* 忙等 50ms 后重试 */ }
+    }
+  }
+  try { fs.rmSync(tmp, { force: true }) } catch { /* 忽略清理失败 */ }
+  throw lastErr
 }
 
 /** 串行化写队列：避免并发请求相互覆盖 */
