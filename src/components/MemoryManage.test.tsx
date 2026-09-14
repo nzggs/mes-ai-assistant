@@ -22,7 +22,7 @@ const mem = (id: string, content: string): memoryApi.UserMemory => ({
 
 beforeEach(() => {
   vi.clearAllMocks()
-  mocks.fetchUserMemories.mockResolvedValue({ memories: [], limits: { maxLen: 500, maxPerUser: 50 } })
+  mocks.fetchUserMemories.mockResolvedValue({ memories: [], limits: { maxLen: 500, maxPerUser: 100 } })
 })
 
 describe('MemoryManage', () => {
@@ -73,12 +73,12 @@ describe('MemoryManage', () => {
 
   it('接口报错时展示错误信息且不清空列表', async () => {
     mocks.fetchUserMemories.mockResolvedValue({ memories: [mem('mem-1', '保留')] })
-    mocks.addUserMemory.mockRejectedValue(new Error('每个用户最多保存 50 条记忆'))
+    mocks.addUserMemory.mockRejectedValue(new Error('每个用户最多保存 100 条记忆'))
     render(<MemoryManage username="carol" onClose={() => {}} />)
     await screen.findByText('保留')
     fireEvent.change(screen.getByPlaceholderText(/列名注释/), { target: { value: '再添一条' } })
     fireEvent.click(screen.getByRole('button', { name: '添加' }))
-    expect(await screen.findByText(/每个用户最多保存 50 条记忆/)).toBeInTheDocument()
+    expect(await screen.findByText(/每个用户最多保存 100 条记忆/)).toBeInTheDocument()
     expect(screen.getByText('保留')).toBeInTheDocument()
   })
 })

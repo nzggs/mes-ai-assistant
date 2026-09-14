@@ -30,7 +30,7 @@ describe('GET /api/memories', () => {
     expect(res.status).toBe(200)
     expect(res.body.ok).toBe(true)
     expect(Array.isArray(res.body.memories)).toBe(true)
-    expect(res.body.limits).toMatchObject({ maxLen: 500, maxPerUser: 50 })
+    expect(res.body.limits).toMatchObject({ maxLen: 500, maxPerUser: 100 })
   })
 })
 

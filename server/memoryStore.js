@@ -13,7 +13,7 @@ import path from 'path'
  */
 
 const MEMORY_MAX_LEN = 500
-const MEMORY_MAX_PER_USER = 50
+const MEMORY_MAX_PER_USER = 100
 
 let MEMORIES_FILE = null
 let queue = Promise.resolve()

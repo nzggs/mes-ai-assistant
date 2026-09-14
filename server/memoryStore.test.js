@@ -74,7 +74,7 @@ describe('memoryStore', () => {
     expect(doc.users.carol).toBeUndefined()
   })
 
-  it('每人最多 50 条，超出报 400', async () => {
+  it('每人最多 100 条，超出报 400', async () => {
     for (let i = 0; i < MEMORY_LIMITS.maxPerUser; i++) {
       await addMemory('dave', `记忆 ${i}`)
     }

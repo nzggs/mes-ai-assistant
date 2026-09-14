@@ -588,7 +588,7 @@ app.post('/api/doc-logs', async (req, res) => {
 
 // ===== 用户记忆（个性化偏好，如"生成的 SQL 列名注释要加双引号"） =====
 // 按登录用户归属（前端会话携带 username），内容为非敏感偏好文本；
-// 服务端硬限制：单条 ≤500 字、每人 ≤50 条，另加每 IP 限流防刷。
+// 服务端硬限制：单条 ≤500 字、每人 ≤100 条，另加每 IP 限流防刷。
 const MEMORY_RATE_LIMIT = Number(process.env.MEMORY_RATE_LIMIT || 60)
 const memRateMap = new Map() // ip -> { count, resetAt }
 function memoryRateLimit(req, res, next) {

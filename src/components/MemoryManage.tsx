@@ -18,7 +18,7 @@ interface MemoryManageProps {
  */
 export function MemoryManage({ username, onClose, onChanged }: MemoryManageProps) {
   const [memories, setMemories] = useState<UserMemory[]>([])
-  const [limits, setLimits] = useState<MemoryLimits>({ maxLen: 500, maxPerUser: 50 })
+  const [limits, setLimits] = useState<MemoryLimits>({ maxLen: 500, maxPerUser: 100 })
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const [draft, setDraft] = useState('')
