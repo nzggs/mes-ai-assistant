@@ -41,4 +41,11 @@ vitest.config.ts.timestamp-*.mjs
 tmp/
 .buildtmp/
 
+# 本地运维脚本与临时产物（不入库）
+.sshtmp/
+guard-check.mjs
+
+# Windows 重定向误产生的空文件
+/NUL
+
 
