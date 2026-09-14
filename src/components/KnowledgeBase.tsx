@@ -1666,8 +1666,10 @@ function OriginalDocModal({ doc, onClose }: { doc: KnowledgeDoc; onClose: () => 
           const MAX_PREVIEW_RECORDS = 200
           const records = Array.isArray(doc.content) ? doc.content : []
           if (records.length === 0) {
-            container.innerHTML =
-              '<p class="pptx-para" style="color:#9ca3af;text-align:center;padding:32px 12px;">正在加载原文内容……若长时间无响应，请点击右上角「下载原文件」查看。</p>'
+            // contentOmitted = 正文在服务端、正在按需取回；否则是本身就没有可预览的记录。
+            container.innerHTML = doc.contentOmitted
+              ? '<p class="pptx-para" style="color:#9ca3af;text-align:center;padding:32px 12px;">正在加载原文内容……若长时间无响应，请点击右上角「下载原文件」查看。</p>'
+              : '<p class="pptx-para" style="color:#9ca3af;text-align:center;padding:32px 12px;">该文档暂无可预览的原文内容，可点击右上角「下载原文件」查看。</p>'
             return
           }
           const shown = records.slice(0, MAX_PREVIEW_RECORDS)
