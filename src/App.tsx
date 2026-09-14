@@ -154,8 +154,11 @@ export default function App() {
   ])
   const mesGuideRef = useRef<MesGuide | null>(null)
   useEffect(() => { localStorage.setItem('mes-ai-mes-source', mesSource) }, [mesSource])
-  // 拉取 MES 直查指引（槽位显示名 / 是否已配置 / 推荐 SQL 模板 / 参数白名单）
+  // 拉取 MES 直查指引（槽位显示名 / 是否已配置 / 硬性限制）。
+  // 每次回到问答视图都重取一次：在「数据库管理」页改完槽位「系统显示名」后，
+  // 问答栏下拉能立刻跟到新名字，不必整页刷新（此前只在挂载时取一次，改名后会一直显示旧名）。
   useEffect(() => {
+    if (sidebarView !== 'chat') return
     let cancelled = false
     fetchMesGuide()
       .then(g => {
@@ -167,7 +170,7 @@ export default function App() {
       })
       .catch(() => { /* 未配置 APC / 服务不可用时静默：下拉仍显示默认槽位名 */ })
     return () => { cancelled = true }
-  }, [])
+  }, [sidebarView])
   const handleMesSourceChange = useCallback((s: MesSource) => setMesSource(s), [])
 
   const chatAreaRef = useRef<HTMLDivElement>(null)
@@ -504,7 +507,8 @@ export default function App() {
     // 允许模型输出一个 ```mes-sql 推荐查询，由系统按只读护栏执行后再回灌真实数据
     const mesActive = mesSource === 'db1' || mesSource === 'db2'
     if (mesActive) {
-      const slotName = mesSlots.find(s => s.id === mesSource)?.name || (mesSource === 'db1' ? '数据库系统 1' : '数据库系统 2')
+      // 槽位显示名一律取系统显示名（数据库管理页配置），取不到时回落为变量本身，不写死默认名
+      const slotName = mesSlots.find(s => s.id === mesSource)?.name || mesSource
       finalKnowledgeContext += buildMesInstruction(mesGuideRef.current, mesSource, slotName)
     }
 
@@ -694,7 +698,8 @@ export default function App() {
           }
         }))
       }
-      const slotName = mesSlots.find(s => s.id === mesSource)?.name || (mesSource === 'db1' ? '数据库系统 1' : '数据库系统 2')
+      // 槽位显示名一律取系统显示名（数据库管理页配置），取不到时回落为变量本身，不写死默认名
+      const slotName = mesSlots.find(s => s.id === mesSource)?.name || mesSource
       const mesSourceNote = extractMesSource(answerAccum.replace(/```mes-sql[\s\S]*?```/, ''))
       // 在回答中留下「已执行查询」的可见标记（含所用 SQL 与来源）
       const marker = `\n\n> 🗄️ 正在按以下 SQL 查询「${slotName}」（只读，服务端强制行数上限与超时）…\n> 来源：${mesSourceNote || '未标注'}\n\n\`\`\`sql\n${mesSql}\n\`\`\`\n`

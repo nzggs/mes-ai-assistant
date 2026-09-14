@@ -14,6 +14,7 @@ import {
   fetchApcOverview,
   fetchApcOptimization,
   fetchApcHistory,
+  fetchMesGuide,
 } from '../services/apcApi'
 import { ApcTrendChart } from './ApcTrendChart'
 import { ApcConfigPanel } from './ApcConfigPanel'
@@ -119,6 +120,24 @@ export function ApcRto({ initialProjectId }: { initialProjectId?: string | null 
     return projects[0]?.id || ''
   }, [status, activeProject, projects])
   const activeProjectMeta = projects.find(p => p.id === activeProjectId) || null
+
+  // 槽位显示名：一律取系统显示名（侧边栏「数据库管理」页的「系统显示名」），
+  // 不再写死「数据库系统 1 / 2」——系统里改了名字本页跟着变；取不到时回落为变量本身（db1 / db2）。
+  const [slotNames, setSlotNames] = useState<Record<string, string>>({})
+  useEffect(() => {
+    let cancelled = false
+    fetchMesGuide()
+      .then(g => {
+        if (cancelled || !g.slots?.length) return
+        setSlotNames(Object.fromEntries(g.slots.map(s => [s.id, s.name || s.id])))
+      })
+      .catch(() => { /* 指引不可用时静默：回落为变量名 */ })
+    return () => { cancelled = true }
+  }, [])
+  const slotLabel = useCallback(
+    (slot?: string) => (slot ? (slotNames[slot] || slot) : ''),
+    [slotNames]
+  )
 
   const handleSelectProject = useCallback((id: string) => {
     setActiveProject(id)
@@ -294,7 +313,7 @@ export function ApcRto({ initialProjectId }: { initialProjectId?: string | null 
             </div>
             <p className="text-xs text-mes-textTertiary mt-1 leading-relaxed">
               即时读取只读数据源中记录的过程数据列值，依据数据变化优化过程参数设定值，给出建议值。
-              {activeProjectMeta ? ` · 项目「${activeProjectMeta.name}」（${activeProjectMeta.dbSlot === 'db2' ? '数据库系统 2' : '数据库系统 1'}）` : ''}
+              {activeProjectMeta ? ` · 项目「${activeProjectMeta.name}」（${slotLabel(activeProjectMeta.dbSlot)}）` : ''}
               {overview ? ` · ${overview.station}` : ''}
             </p>
           </div>
@@ -577,7 +596,7 @@ export function ApcRto({ initialProjectId }: { initialProjectId?: string | null 
                         <div className="flex items-center justify-between gap-2 mb-1.5">
                           <span className={`text-sm font-semibold truncate ${active ? 'text-mes-primary' : 'text-mes-text'}`}>{p.name}</span>
                           <span className="shrink-0 text-[10px] px-1.5 py-0.5 rounded-full bg-mes-tagBg text-mes-tagText font-medium">
-                            {p.dbSlot === 'db2' ? '数据库系统 2' : '数据库系统 1'}
+                            {slotLabel(p.dbSlot)}
                           </span>
                         </div>
                         <p className="text-[11px] text-mes-textTertiary line-clamp-2 mb-1.5 min-h-[2em]">

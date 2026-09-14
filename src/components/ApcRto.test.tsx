@@ -14,6 +14,7 @@ const mocks = vi.hoisted(() => ({
   fetchApcOverview: vi.fn(),
   fetchApcOptimization: vi.fn(),
   fetchApcHistory: vi.fn(),
+  fetchMesGuide: vi.fn(),
   fetchApcConfig: vi.fn(),
   fetchApcProject: vi.fn(),
   createApcProject: vi.fn(),
@@ -32,6 +33,8 @@ vi.mock('../services/apcApi', () => ({
   fetchApcOverview: mocks.fetchApcOverview,
   fetchApcOptimization: mocks.fetchApcOptimization,
   fetchApcHistory: mocks.fetchApcHistory,
+  // 槽位显示名由 /api/mes/guide 提供（页面用它把 db1/db2 换成系统显示名）
+  fetchMesGuide: mocks.fetchMesGuide,
   // 配置面板用到的接口也一并打桩，避免打开配置入口时打到真实网络
   fetchApcConfig: mocks.fetchApcConfig,
   fetchApcProject: mocks.fetchApcProject,
@@ -263,6 +266,13 @@ beforeEach(() => {
   mocks.fetchApcOverview.mockReset().mockResolvedValue(OVERVIEW)
   mocks.fetchApcOptimization.mockReset().mockResolvedValue(OPTIMIZATION)
   mocks.fetchApcHistory.mockReset().mockResolvedValue(HISTORY)
+  mocks.fetchMesGuide.mockReset().mockResolvedValue({
+    slots: [
+      { id: 'db1', name: '数据库系统 1', configured: true },
+      { id: 'db2', name: '数据库系统 2', configured: true },
+    ],
+    limits: { maxRows: 2000, chatRows: 100 },
+  })
   mocks.fetchApcConfig.mockReset().mockResolvedValue({ catalogFileLocked: false, database: { slots: [] } })
   mocks.fetchApcProject.mockReset().mockResolvedValue({ project: { ...PROJECT_P1, queries: null, params: [] } })
 })
@@ -416,5 +426,27 @@ describe('ApcRto · 选中项目的记忆与校验', () => {
     fireEvent.click(screen.getByRole('button', { name: /新建项目/ }))
     expect(await screen.findByText('新建监测项目')).toBeInTheDocument()
     expect(mocks.fetchApcProject).not.toHaveBeenCalled()
+  })
+
+  it('数据库一律显示系统显示名（改名后跟着变），不写死「数据库系统 2」', async () => {
+    // 系统里把 db2 改成了「甲二只读数据库」，项目绑在 db2 上
+    mocks.fetchMesGuide.mockResolvedValue({
+      slots: [
+        { id: 'db1', name: '数据库系统 1', configured: true },
+        { id: 'db2', name: '甲二只读数据库', configured: true },
+      ],
+      limits: { maxRows: 2000, chatRows: 100 },
+    })
+    mocks.fetchApcStatus.mockResolvedValue({
+      ...STATUS,
+      projects: [{ ...PROJECT_P1, id: 'p2', name: '二厂注液监测', dbSlot: 'db2' }],
+    })
+    localStorage.setItem('mes-ai-apc-project', 'p2')
+    render(<ApcRto />)
+
+    await screen.findByText('APC 和 RTO')
+    // 项目卡片上的库名徽标 + 标题行的项目信息都应显示系统显示名
+    expect((await screen.findAllByText('甲二只读数据库')).length).toBeGreaterThan(0)
+    expect(screen.queryByText('数据库系统 2')).not.toBeInTheDocument()
   })
 })

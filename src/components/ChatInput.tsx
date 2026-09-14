@@ -116,8 +116,9 @@ export function ChatInput({
             </button>
 
             {/* MES 数据源选择：关闭 / 数据库1 / 数据库2。
-                选择某个数据库后，问答可按「数据源配置」里推荐的 SQL 与硬性要求
-                （仅 SELECT、行数上限、连接/语句超时）检索出具体数据。 */}
+                选项的「取值」固定为槽位变量（db1 / db2），「显示文本」取系统显示名
+                （侧边栏「数据库管理」页的「系统显示名」，未配置时回落为变量本身），
+                并把变量以（db1）形式附在后面，便于与配置页、接口日志互相对照。 */}
             <div
               className={`flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs font-medium transition-all-smooth ${
                 mesSource !== 'off' ? 'bg-mes-tagBg text-mes-primary' : 'text-mes-textSecondary hover:bg-gray-100'
@@ -131,14 +132,14 @@ export function ChatInput({
               </svg>
               <select
                 value={mesSource}
-                onChange={e => onMesSourceChange(e.target.value as MesSource)}
+                onChange={e => onMesSourceChange?.(e.target.value as MesSource)}
                 disabled={disabled}
-                className="bg-transparent text-xs font-medium outline-none cursor-pointer disabled:cursor-not-allowed max-w-[110px]"
+                className="bg-transparent text-xs font-medium outline-none cursor-pointer disabled:cursor-not-allowed max-w-[160px]"
               >
                 <option value="off">数据库关闭</option>
                 {mesSlots.map(s => (
                   <option key={s.id} value={s.id}>
-                    {s.name || s.id}{s.configured ? '' : '（未配置）'}
+                    {s.name || s.id}（{s.id}）{s.configured ? '' : ' · 未配置'}
                   </option>
                 ))}
               </select>

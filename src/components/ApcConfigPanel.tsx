@@ -264,6 +264,13 @@ export function ApcConfigPanel({ projectId, onClose, onSaved }: {
     }
   }, [qDraft, pDraft, previewRows, sDbSlot])
 
+  // 槽位变量 → 系统显示名（在「数据库管理」页配置）。项目设置与参数列表统一用它展示，
+  // 不再写死「数据库系统 1 / 2」或「库1 / 库2」——系统里改了名字这里跟着变，取不到时回落为变量本身。
+  const slotNameMap: Record<string, string> = Object.fromEntries(
+    (config?.database?.slots || []).map(s => [s.id, s.name || s.id])
+  )
+  const dbSlotNameOf = (slot: string) => slotNameMap[slot] || slot
+
   // ===== 令牌 =====
   const handleTokenSave = useCallback(() => {
     setAdminToken(tokenInput)
@@ -569,7 +576,8 @@ export function ApcConfigPanel({ projectId, onClose, onSaved }: {
               jsonText={jsonText}
               jsonErr={jsonErr}
               meta={metaDraft}
-              dbSlotLabel={sDbSlot === 'db2' ? '数据库系统 2' : '数据库系统 1'}
+              dbSlotLabel={dbSlotNameOf(sDbSlot)}
+              slotNames={slotNameMap}
               onSelect={setSelected}
               onPatch={patchParam}
               onAdd={addParam}
@@ -917,7 +925,7 @@ function QueriesTab({
 // ===== ③ 参数配置 =====
 
 function ParamsTab({
-  params, selected, current, locked, jsonMode, jsonText, jsonErr, meta, dbSlotLabel,
+  params, selected, current, locked, jsonMode, jsonText, jsonErr, meta, dbSlotLabel, slotNames = {},
   onSelect, onPatch, onAdd, onDuplicate, onRemove, onToggleJson, onExportJson, onJsonText, onApplyJson, onReset,
 }: {
   params: ApcParamConfig[]
@@ -930,6 +938,8 @@ function ParamsTab({
   meta: ApcConfigResponse['meta'] | null
   /** 项目绑定的数据库显示名（参数数据统一取自该系统） */
   dbSlotLabel: string
+  /** 槽位变量 → 系统显示名（列表里按参数自身的 dbSlot 展示，缺省时回落为变量本身） */
+  slotNames?: Record<string, string>
   onSelect: (i: number) => void
   onPatch: (patch: Partial<ApcParamConfig>) => void
   onAdd: () => void
@@ -1009,7 +1019,7 @@ function ParamsTab({
                   <div className="text-[10px] text-mes-textTertiary truncate">
                     {p.process} · {p.code}
                     {p.column ? ` · 列 ${p.column}` : ''}
-                    {` · ${p.dbSlot === 'db2' ? '库2' : '库1'}`}
+                    {` · ${slotNames[p.dbSlot || 'db1'] || p.dbSlot || 'db1'}`}
                   </div>
                 </button>
               ))}
