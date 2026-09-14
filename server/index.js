@@ -600,9 +600,11 @@ setInterval(() => {
   }
 }, 5 * 60 * 1000).unref()
 
-app.get('/api/memories', memoryRateLimit, (req, res) => {
+app.get('/api/memories', memoryRateLimit, async (req, res) => {
   try {
-    res.json({ ok: true, memories: listMemories(String(req.query.username || '')), limits: MEMORY_LIMITS })
+    // listMemories 是 async（内部走写队列/缓存），必须 await——否则 Promise 被 JSON 序列化成 {}
+    const memories = await listMemories(String(req.query.username || ''))
+    res.json({ ok: true, memories, limits: MEMORY_LIMITS })
   } catch (err) {
     return fail(res, err)
   }

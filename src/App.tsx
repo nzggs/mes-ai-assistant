@@ -113,7 +113,7 @@ export default function App() {
     }
     let cancelled = false
     fetchUserMemories(uname)
-      .then(r => { if (!cancelled) setUserMemories(r.memories || []) })
+      .then(r => { if (!cancelled) setUserMemories(Array.isArray(r.memories) ? r.memories : []) })
       .catch(() => { if (!cancelled) setUserMemories([]) })
     return () => { cancelled = true }
   }, [user?.username])
@@ -964,7 +964,7 @@ export default function App() {
         <MemoryManage
           username={user.username}
           onClose={() => setShowMemoryManage(false)}
-          onChanged={list => setUserMemories(list)}
+          onChanged={list => setUserMemories(Array.isArray(list) ? list : [])}
         />
       )}
 

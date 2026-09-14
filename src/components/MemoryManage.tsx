@@ -33,7 +33,8 @@ export function MemoryManage({ username, onClose, onChanged }: MemoryManageProps
     fetchUserMemories(username)
       .then(r => {
         if (cancelled) return
-        setMemories(r.memories || [])
+        // 防御：memories 必须是数组（后端异常时避免非数组进入渲染导致整页崩溃）
+        setMemories(Array.isArray(r.memories) ? r.memories : [])
         if (r.limits) setLimits(r.limits)
       })
       .catch((e: unknown) => { if (!cancelled) setError(e instanceof Error ? e.message : String(e)) })
@@ -42,8 +43,9 @@ export function MemoryManage({ username, onClose, onChanged }: MemoryManageProps
   }, [username])
 
   const notify = (list: UserMemory[]) => {
-    setMemories(list)
-    onChanged?.(list)
+    const safe = Array.isArray(list) ? list : []
+    setMemories(safe)
+    onChanged?.(safe)
   }
 
   const handleAdd = async () => {
