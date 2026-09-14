@@ -25,7 +25,7 @@ import {
   listProjects, getProject, createProject, updateProject, deleteProject,
 } from './apcConfig.js'
 import { registerDocIndexRoutes } from './docIndexRoute.js'
-import { listMemories, addMemory, updateMemory, deleteMemory, MEMORY_LIMITS } from './memoryStore.js'
+import { listMemories, addMemory, updateMemory, deleteMemory, deleteAllMemories, MEMORY_LIMITS } from './memoryStore.js'
 
 // 优先加载项目根目录 .env，再用 server/.env 覆盖（server/.env 为后端配置真相源）。
 dotenv.config()
@@ -519,10 +519,22 @@ app.post('/api/users', requireAdmin, async (req, res) => {
     // 串行化整表写入（B2 / I5：避免并发注册/同步时整表覆盖丢失账号）。
     // 注意：withUsersWrite 会先 readUsers() 再回调 fn(旧对象) 最后 writeUsers(该对象)，
     // 因此回调里必须「覆盖到读到的对象」而非直接 writeUsers，否则会被随后用旧对象写回覆盖掉。
+    const removedUsernames = []
     await withUsersWrite((localUsers) => {
+      // 记下本次被删除的账号（整表覆盖后消失的键），随后同步清空其记忆
+      removedUsernames.push(...Object.keys(localUsers).filter(k => !(k in users)))
       for (const k of Object.keys(localUsers)) delete localUsers[k]
       Object.assign(localUsers, users)
     })
+    // 删除账号时同时清空该账号的全部记忆（失败不阻断用户表写入，只告警）
+    for (const u of removedUsernames) {
+      try {
+        const n = await deleteAllMemories(u)
+        if (n > 0) console.log(`[users] 已删除账号「${u}」，同步清空其 ${n} 条记忆`)
+      } catch (e) {
+        console.error(`[warn] 清空被删账号「${u}」的记忆失败:`, e && e.message)
+      }
+    }
     res.json({ ok: true })
   } catch (err) {
     return internalError(res, err)

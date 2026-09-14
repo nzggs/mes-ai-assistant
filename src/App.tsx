@@ -52,6 +52,18 @@ function extractMesSql(text: string): string | null {
   return sql || null
 }
 
+/** 截掉 mes-sql 代码块之后的所有输出。
+ * 第一轮模型在给出 SQL 后若继续输出"结果表格 / 数值 / 结论"，必然不是真实查询结果
+ * （真实结果要等第二轮系统回传），多为对历史成功回答的复述或编造——曾导致
+ * 「查询失败却在报错前列出查询结果」的误导。展示与回灌历史时一律只保留到代码块结束。 */
+function trimAfterMesSqlBlock(text: string): string {
+  const start = text.indexOf('```mes-sql')
+  if (start === -1) return text
+  const end = text.indexOf('```', start + 10)
+  if (end === -1) return text.slice(0, start)
+  return text.slice(0, end + 3)
+}
+
 /** 从 mes-sql 代码块之前的文本里提取「来源：xxx」标注（SQL 取自哪篇文档/哪个脚本） */
 function extractMesSource(text: string): string | null {
   const m = text.match(/来源\s*[：:]\s*([^\n`]{1,120})/)
@@ -69,7 +81,7 @@ function buildMesInstruction(guide: MesGuide | null, slotId: 'db1' | 'db2', slot
   lines.push(`3. 不得残留任何 {{...}} 模板占位符——占位符必须代入具体值。`)
   lines.push(`4. 只查询与用户问题相关的数据，不要把所有列全查出来。`)
   lines.push(`SQL 从哪里来：**优先使用上方知识库上下文里出现的 SQL 查询/脚本片段**（包括其表名、列名与过滤写法），按用户问题改写成一条完整 SELECT；知识库中没有可用的 SQL 时，基于上下文里的表结构信息谨慎编写，并明确说明该 SQL 未经现场验证。`)
-  lines.push(`输出格式：需要查库时，先用一句话说明查询意图与 **来源**（格式：来源：<文档名/脚本名>；若无来源写 来源：知识库未命中，SQL 为自行编写），然后输出一个 \`\`\`mes-sql 代码块（内含完整 SQL），除此之外**不要编造任何具体数值**；系统会把查询结果回传，你再给出最终回答。无需查库即可回答时，不要输出 mes-sql 代码块。`)
+  lines.push(`输出格式：需要查库时，先用一句话说明查询意图与 **来源**（格式：来源：<文档名/脚本名>；若无来源写 来源：知识库未命中，SQL 为自行编写），然后输出一个 \`\`\`mes-sql 代码块（内含完整 SQL）。输出该代码块后**必须立即停止**，不得再输出任何表格、数值、结论或示例结果——真实结果只能来自系统回传，提前写出的任何数据都会被系统隐藏并视为编造。除此之外**不要编造任何具体数值**。无需查库即可回答时，不要输出 mes-sql 代码块。`)
   return lines.join('\n')
 }
 
@@ -623,6 +635,26 @@ export default function App() {
   if (mesActive && hasContent && !llmFailed) {
     const mesSql = extractMesSql(answerAccum)
     if (mesSql) {
+      // 防护：截掉 mes-sql 代码块之后的多余输出（复述历史结果 / 编造数据），
+      // 避免「查询失败却在报错前列出查询结果」。展示与回灌历史均用截断后的文本。
+      const trimmedRound1 = trimAfterMesSqlBlock(answerAccum)
+      const hiddenNote = '\n\n> ⏳ 已提取推荐 SQL。SQL 之后模型多余输出的内容已隐藏，真实结果以下方系统回传为准。'
+      if (trimmedRound1 !== answerAccum) {
+        answerAccum = trimmedRound1
+        setConversations(prev => prev.map(c => {
+          if (c.id !== convId) return c
+          return {
+            ...c,
+            messages: c.messages.map(m => {
+              if (m.id !== aiMsgId) return m
+              return {
+                ...m,
+                contents: m.contents.map(ct => ct.type === 'text' ? { ...ct, text: trimmedRound1 + hiddenNote } : ct),
+              }
+            }),
+          }
+        }))
+      }
       const slotName = mesSlots.find(s => s.id === mesSource)?.name || (mesSource === 'db1' ? '数据库系统 1' : '数据库系统 2')
       const mesSourceNote = extractMesSource(answerAccum.replace(/```mes-sql[\s\S]*?```/, ''))
       // 在回答中留下「已执行查询」的可见标记（含所用 SQL 与来源）

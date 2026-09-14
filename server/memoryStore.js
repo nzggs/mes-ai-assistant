@@ -203,4 +203,17 @@ export async function deleteMemory(username, id) {
   })
 }
 
+/** 清空某账号的全部记忆（删除账号时同步调用；账号本无记忆则不动文件），返回清除条数 */
+export async function deleteAllMemories(username) {
+  const uname = requireUsername(username)
+  return enqueue(() => {
+    const doc = readDoc()
+    const list = doc.users[uname]
+    if (!Array.isArray(list) || list.length === 0) return 0
+    delete doc.users[uname]
+    persist(doc)
+    return list.length
+  })
+}
+
 export const MEMORY_LIMITS = { maxLen: MEMORY_MAX_LEN, maxPerUser: MEMORY_MAX_PER_USER }

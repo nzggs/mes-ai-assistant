@@ -120,7 +120,7 @@ export function MemoryManage({ username, onClose, onChanged }: MemoryManageProps
             </button>
           </div>
           <p className="text-xs text-mes-textTertiary mb-4">
-            记住你的使用偏好（如：生成的 SQL 中列名注释要加双引号），问答时会自动遵守。仅对账号「{username}」生效。
+            记住你的使用偏好，问答时会自动遵守。仅对账号「{username}」生效。
           </p>
 
           {/* 新增 */}
