@@ -108,14 +108,36 @@ export function ApcRto({ initialProjectId }: { initialProjectId?: string | null 
   })
   const [editingId, setEditingId] = useState<string | null | undefined>(undefined) // undefined=关闭
 
-  const projects = status?.projects || []
-  const activeProjectId = activeProject || projects[0]?.id || ''
+  const projects = useMemo(() => status?.projects || [], [status])
+  // 选中项目必须真实存在于服务端返回的列表里：
+  // localStorage 里可能残留已被删除（或旧版本自动迁移出来的 p_default）的项目 id，
+  // 这种脏 id 会让「编辑项目」去读一个不存在的项目，报「监测项目不存在：xxx」。
+  // status 还没回来时先沿用本地记忆值（首屏少一次多余请求），拿到列表后严格校验，坏值回落到第一个项目。
+  const activeProjectId = useMemo(() => {
+    if (!status) return activeProject
+    if (activeProject && projects.some(p => p.id === activeProject)) return activeProject
+    return projects[0]?.id || ''
+  }, [status, activeProject, projects])
   const activeProjectMeta = projects.find(p => p.id === activeProjectId) || null
 
   const handleSelectProject = useCallback((id: string) => {
     setActiveProject(id)
     try { localStorage.setItem('mes-ai-apc-project', id) } catch { /* 忽略 */ }
   }, [])
+
+  // 打开项目编辑器：只认列表里真实存在的项目，其余一律按「新建」打开，
+  // 绝不把脏 id 交给配置面板（面板会 404，页面显示「读取配置失败：监测项目不存在」）。
+  const openEditor = useCallback((id: string) => {
+    setEditingId(id && projects.some(p => p.id === id) ? id : null)
+  }, [projects])
+
+  // 自愈：确认本地记忆的项目 id 已不在列表里就清掉，免得下次进来继续拿它去请求
+  useEffect(() => {
+    if (!status || !activeProject) return
+    if (projects.some(p => p.id === activeProject)) return
+    setActiveProject('')
+    try { localStorage.removeItem('mes-ai-apc-project') } catch { /* 忽略 */ }
+  }, [status, activeProject, projects])
 
   const loadStatus = useCallback(() => {
     return fetchApcStatus()
@@ -335,7 +357,7 @@ export function ApcRto({ initialProjectId }: { initialProjectId?: string | null 
             </select>
 
             <button
-              onClick={() => setEditingId(activeProjectId || null)}
+              onClick={() => openEditor(activeProjectId)}
               disabled={!activeProjectId}
               title="编辑当前监测项目（名称 / 数据库 / SQL 模板 / 参数）"
               className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border border-mes-border bg-white text-mes-textSecondary hover:border-mes-primary hover:text-mes-primary disabled:opacity-50 transition-colors"
@@ -508,7 +530,7 @@ export function ApcRto({ initialProjectId }: { initialProjectId?: string | null 
             </p>
             <div className="mt-5 flex flex-wrap items-center justify-center gap-2">
               <button
-                onClick={() => setEditingId(activeProjectId || null)}
+                onClick={() => openEditor(activeProjectId)}
                 className="px-3 py-1.5 rounded-lg text-xs font-medium bg-mes-primary text-white hover:bg-mes-primaryHover transition-colors"
               >
                 {activeProjectId ? '编辑当前项目' : '新建监测项目'}

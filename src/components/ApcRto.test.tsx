@@ -15,6 +15,10 @@ const mocks = vi.hoisted(() => ({
   fetchApcOptimization: vi.fn(),
   fetchApcHistory: vi.fn(),
   fetchApcConfig: vi.fn(),
+  fetchApcProject: vi.fn(),
+  createApcProject: vi.fn(),
+  updateApcProject: vi.fn(),
+  deleteApcProject: vi.fn(),
   saveApcConfig: vi.fn(),
   resetApcConfig: vi.fn(),
   testApcDatabase: vi.fn(),
@@ -30,6 +34,10 @@ vi.mock('../services/apcApi', () => ({
   fetchApcHistory: mocks.fetchApcHistory,
   // 配置面板用到的接口也一并打桩，避免打开配置入口时打到真实网络
   fetchApcConfig: mocks.fetchApcConfig,
+  fetchApcProject: mocks.fetchApcProject,
+  createApcProject: mocks.createApcProject,
+  updateApcProject: mocks.updateApcProject,
+  deleteApcProject: mocks.deleteApcProject,
   saveApcConfig: mocks.saveApcConfig,
   resetApcConfig: mocks.resetApcConfig,
   testApcDatabase: mocks.testApcDatabase,
@@ -236,11 +244,27 @@ const HISTORY: ApcHistoryResponse = {
   points: SERIES,
 }
 
+/** 项目摘要（服务端 /api/apc/status 里的 projects 元素） */
+const PROJECT_P1 = {
+  id: 'p1',
+  name: '注液量监测',
+  description: '监测注液工序的过程数据',
+  dbSlot: 'db1',
+  paramCount: 1,
+  hasQueries: true,
+  createdAt: null,
+  updatedAt: null,
+}
+
 beforeEach(() => {
+  // 选中项目的记忆存在 localStorage 里，用例之间必须隔离
+  localStorage.clear()
   mocks.fetchApcStatus.mockReset().mockResolvedValue(STATUS)
   mocks.fetchApcOverview.mockReset().mockResolvedValue(OVERVIEW)
   mocks.fetchApcOptimization.mockReset().mockResolvedValue(OPTIMIZATION)
   mocks.fetchApcHistory.mockReset().mockResolvedValue(HISTORY)
+  mocks.fetchApcConfig.mockReset().mockResolvedValue({ catalogFileLocked: false, database: { slots: [] } })
+  mocks.fetchApcProject.mockReset().mockResolvedValue({ project: { ...PROJECT_P1, queries: null, params: [] } })
 })
 
 describe('ApcRto 页面', () => {
@@ -347,5 +371,50 @@ describe('ApcRto 页面', () => {
     render(<ApcRto />)
     expect(await screen.findByText('读取过程数据失败')).toBeInTheDocument()
     expect(screen.getByText(/HANA 连接失败/)).toBeInTheDocument()
+  })
+})
+
+describe('ApcRto · 选中项目的记忆与校验', () => {
+  it('本地记忆的项目有效时，「编辑项目」按该项目打开编辑器', async () => {
+    localStorage.setItem('mes-ai-apc-project', 'p1')
+    mocks.fetchApcStatus.mockResolvedValue({ ...STATUS, projects: [PROJECT_P1] })
+    render(<ApcRto />)
+    await screen.findByText('APC 和 RTO')
+
+    const editBtn = screen.getByRole('button', { name: /编辑项目/ })
+    await waitFor(() => expect(editBtn).toBeEnabled())
+    fireEvent.click(editBtn)
+
+    expect(await screen.findByDisplayValue('注液量监测')).toBeInTheDocument()
+    expect(mocks.fetchApcProject).toHaveBeenCalledWith('p1')
+  })
+
+  it('本地记忆的项目已不存在时自动清理，并回落到第一个真实项目取数', async () => {
+    // 典型场景：旧版本自动迁移出来的 p_default 已被删除，浏览器里还记着它
+    localStorage.setItem('mes-ai-apc-project', 'p_default')
+    mocks.fetchApcStatus.mockResolvedValue({ ...STATUS, projects: [PROJECT_P1] })
+    render(<ApcRto />)
+    await screen.findByText('APC 和 RTO')
+
+    await waitFor(() => expect(localStorage.getItem('mes-ai-apc-project')).toBeNull())
+    await waitFor(() => {
+      const calls = mocks.fetchApcOverview.mock.calls
+      expect(calls[calls.length - 1][0].project).toBe('p1')
+    })
+  })
+
+  it('一个项目也没有时，「编辑项目」禁用且不会去读不存在的项目', async () => {
+    localStorage.setItem('mes-ai-apc-project', 'p_default')
+    mocks.fetchApcStatus.mockResolvedValue({ ...STATUS, projects: [] })
+    render(<ApcRto />)
+    await screen.findByText('APC 和 RTO')
+
+    await waitFor(() => expect(localStorage.getItem('mes-ai-apc-project')).toBeNull())
+    expect(screen.getByRole('button', { name: /编辑项目/ })).toBeDisabled()
+
+    // 「新建项目」始终可用，且打开的是空表单（不读任何项目详情）
+    fireEvent.click(screen.getByRole('button', { name: /新建项目/ }))
+    expect(await screen.findByText('新建监测项目')).toBeInTheDocument()
+    expect(mocks.fetchApcProject).not.toHaveBeenCalled()
   })
 })
