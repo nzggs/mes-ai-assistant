@@ -21,6 +21,12 @@ const LLM_TIMEOUT_MS = 30000
 export function fetchWithTimeout(url: string, options?: RequestInit, ms: number = LLM_TIMEOUT_MS): Promise<Response> {
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), ms)
+  // 支持外部传入 signal（如问答的"停止生成"按钮）：外部 abort 时联动内部 controller
+  const external = options?.signal
+  if (external) {
+    if (external.aborted) controller.abort()
+    else external.addEventListener('abort', () => controller.abort(), { once: true })
+  }
   return fetch(url, { ...options, signal: controller.signal }).finally(() => clearTimeout(timer))
 }
 
@@ -65,6 +71,8 @@ export interface StreamCallbacks {
   onContent: (text: string) => void
   onError: (error: string) => void
   onDone: () => void
+  /** 用户主动停止生成（AbortSignal 触发）：保留已生成内容，不按错误处理 */
+  onAborted?: () => void
 }
 
 // ===== 提供商与 API Key 管理 =====
@@ -310,7 +318,7 @@ async function streamChatViaBackend(
   apiKey: string,
   messages: ChatMessageDto[],
   callbacks: StreamCallbacks,
-  options?: { useThinking?: boolean; knowledgeContext?: string; modelId?: string }
+  options?: { useThinking?: boolean; knowledgeContext?: string; modelId?: string; signal?: AbortSignal }
 ): Promise<void> {
   const provider = getProvider()
   // 本地模型「等待首字」上限 320s：实测宿主机 CPU 推理 deepseek-r1:1.5b（思考型）处理
@@ -335,6 +343,8 @@ async function streamChatViaBackend(
       // 让后端比前端早 20s 超时，使其能先发回干净的 SSE error 事件，避免前端 abort 误报
       timeoutMs: isLocal ? 300000 : undefined,
     }),
+    // "停止生成"按钮：用户主动中断
+    signal: options?.signal,
   }, frontendTimeout)
 
   if (!res.ok) {
@@ -351,39 +361,66 @@ async function streamChatViaBackend(
   const decoder = new TextDecoder()
   let buffer = ''
 
-  while (true) {
-    const { done, value } = await reader.read()
-    if (done) break
-
-    buffer += decoder.decode(value, { stream: true })
-    const lines = buffer.split('\n')
-    buffer = lines.pop() || ''
-
-    for (const line of lines) {
-      const trimmed = line.trim()
-      if (!trimmed || !trimmed.startsWith('data: ')) continue
-
-      const data = trimmed.slice(6)
-      if (data === '[DONE]') {
-        callbacks.onDone()
-        return
-      }
-
-      try {
-        const parsed = JSON.parse(data)
-        if (parsed.type === 'thinking') {
-          callbacks.onThinking?.(parsed.content)
-        } else if (parsed.type === 'content') {
-          callbacks.onContent(parsed.content)
-        } else if (parsed.type === 'error') {
-          callbacks.onError(parsed.content)
-        }
-      } catch {
-        // 忽略解析错误
-      }
-    }
+  // ===== 流式停滞看门狗：连续 STALL_MS 没有任何新分片（连接挂起 / 模型只思考不吐字且流未关闭）
+  // 时主动断开，根治"一直思考下去不输出结果"的无限等待。本地思考型模型首字/停顿天然较慢，放宽到 300s。
+  const STALL_MS = isLocal ? 300000 : 120000
+  let stalled = false
+  let stallTimer: ReturnType<typeof setTimeout> | null = null
+  const clearStall = () => { if (stallTimer) { clearTimeout(stallTimer); stallTimer = null } }
+  const armStall = () => {
+    clearStall()
+    stallTimer = setTimeout(() => {
+      stalled = true
+      try { reader.cancel().catch(() => {}) } catch { /* 忽略 */ }
+    }, STALL_MS)
   }
 
+  try {
+    while (true) {
+      armStall()
+      const { done, value } = await reader.read()
+      if (done) break
+
+      buffer += decoder.decode(value, { stream: true })
+      const lines = buffer.split('\n')
+      buffer = lines.pop() || ''
+
+      for (const line of lines) {
+        const trimmed = line.trim()
+        if (!trimmed || !trimmed.startsWith('data: ')) continue
+
+        const data = trimmed.slice(6)
+        if (data === '[DONE]') {
+          clearStall()
+          callbacks.onDone()
+          return
+        }
+
+        try {
+          const parsed = JSON.parse(data)
+          if (parsed.type === 'thinking') {
+            callbacks.onThinking?.(parsed.content)
+          } else if (parsed.type === 'content') {
+            callbacks.onContent(parsed.content)
+          } else if (parsed.type === 'error') {
+            clearStall()
+            callbacks.onError(parsed.content)
+            return
+          }
+        } catch {
+          // 忽略解析错误
+        }
+      }
+    }
+  } finally {
+    clearStall()
+  }
+
+  if (stalled) {
+    const limit = Math.round(STALL_MS / 1000)
+    callbacks.onError(`模型连续 ${limit} 秒没有任何输出（连接疑似挂起），已自动中断。请重试，或在深度思考模式下耐心等待。`)
+    return
+  }
   callbacks.onDone()
 }
 
@@ -395,7 +432,7 @@ async function streamChatViaBackend(
 export async function streamChat(
   messages: ChatMessageDto[],
   callbacks: StreamCallbacks,
-  options?: { useThinking?: boolean; knowledgeContext?: string; modelId?: string }
+  options?: { useThinking?: boolean; knowledgeContext?: string; modelId?: string; signal?: AbortSignal }
 ): Promise<void> {
   const apiKey = getApiKey()
   if (!apiKey) {
@@ -406,6 +443,11 @@ export async function streamChat(
   try {
     await streamChatViaBackend(apiKey, messages, callbacks, options)
   } catch (err: any) {
+    // 用户主动停止：按"已停止"处理（保留已生成内容），不当作连接错误
+    if (options?.signal?.aborted) {
+      callbacks.onAborted?.()
+      return
+    }
     const provider = getProvider()
     callbacks.onError(
       `后端代理不可用（${provider.name} 问答需经后端转发）：\n` +

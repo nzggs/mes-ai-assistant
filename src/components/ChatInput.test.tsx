@@ -72,4 +72,24 @@ describe('ChatInput', () => {
     fireEvent.click(screen.getByText('深度思考'))
     expect(onToggleDeepThink).toHaveBeenCalled()
   })
+
+  it('回复中且提供 onStop 时显示「停止生成」按钮，点击触发 onStop', () => {
+    const onStop = vi.fn()
+    renderInput({ disabled: true, onStop })
+    const stopBtn = screen.getByTitle('停止生成')
+    expect(stopBtn).toBeInTheDocument()
+    fireEvent.click(stopBtn)
+    expect(onStop).toHaveBeenCalledTimes(1)
+  })
+
+  it('回复中但无 onStop 时不显示停止按钮（回退为禁用的发送按钮）', () => {
+    renderInput({ disabled: true })
+    expect(screen.queryByTitle('停止生成')).toBeNull()
+  })
+
+  it('非回复中不显示停止按钮', () => {
+    const onStop = vi.fn()
+    renderInput({ disabled: false, onStop })
+    expect(screen.queryByTitle('停止生成')).toBeNull()
+  })
 })

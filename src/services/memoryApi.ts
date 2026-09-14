@@ -68,11 +68,12 @@ export async function deleteUserMemory(username: string, id: string): Promise<{ 
   return requestJson(`${BACKEND_BASE}/api/memories/${encodeURIComponent(id)}?${q}`, buildInit('DELETE'))
 }
 
-/** 把记忆列表压成注入上下文的文本块（无记忆时返回空串） */
+/** 把记忆列表压成注入上下文的文本块（含"记住偏好"时的保存机制约定；无记忆时只注入机制说明） */
 export function buildMemoryContext(memories: UserMemory[] | null | undefined): string {
-  if (!memories || memories.length === 0) return ''
-  const items = memories
+  const items = (memories || [])
     .map(m => `- ${String(m.content || '').replace(/\s+/g, ' ').slice(0, 200)}`)
     .join('\n')
-  return `\n\n## 用户记忆（该用户的长期个性化偏好，请在本轮回答中遵守）\n${items}\n`
+  return `\n\n## 用户记忆（当前用户的长期个性化偏好，请在本轮回答中遵守）\n${items || '（暂无）'}\n
+### 记忆保存机制（重要）
+当用户要求你"记住 / 记一下 / 以后遵守"某个偏好或规则时：不要只口头答应，必须输出**恰好一个** \`\`\`user-memory 代码块，块内只写要记住的规则原文（≤500 字，不加解释、不加代码块标记以外的内容）。系统会自动把它保存到该用户的记忆管理并在界面回显确认。只有输出了该代码块，才可以对用户说"已记住"；未输出代码块时不得声称已记住。与用户当前问题无关的闲聊、普通问答一律不要输出该代码块。`
 }

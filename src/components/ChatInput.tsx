@@ -19,6 +19,8 @@ interface ChatInputProps {
   mesSource?: MesSource
   mesSlots?: MesSlotInfo[]
   onMesSourceChange?: (s: MesSource) => void
+  /** AI 回复中时的"停止生成"回调（提供后，回复中发送按钮会变为停止按钮） */
+  onStop?: () => void
 }
 
 export function ChatInput({
@@ -31,6 +33,7 @@ export function ChatInput({
   mesSource = 'off',
   mesSlots = [],
   onMesSourceChange,
+  onStop,
 }: ChatInputProps) {
   const [text, setText] = useState('')
   const textareaRef = useRef<HTMLTextAreaElement>(null)
@@ -142,21 +145,33 @@ export function ChatInput({
             </div>
           </div>
 
-          {/* 发送按钮 */}
-          <button
-            onClick={handleSend}
-            disabled={!text.trim() || disabled}
-            className={`p-2 rounded-lg transition-all-smooth ${
-              text.trim() && !disabled
-                ? 'bg-mes-primary text-white hover:bg-mes-primaryHover shadow-sm'
-                : 'bg-gray-200 text-mes-textTertiary cursor-not-allowed'
-            }`}
-          >
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <line x1="22" y1="2" x2="11" y2="13" />
-              <polygon points="22 2 15 22 11 13 2 9 22 2" />
-            </svg>
-          </button>
+          {/* 发送按钮：AI 回复中且有 onStop 时变为「停止生成」按钮 */}
+          {disabled && onStop ? (
+            <button
+              onClick={onStop}
+              title="停止生成"
+              className="p-2 rounded-lg bg-red-500 text-white hover:bg-red-600 shadow-sm transition-all-smooth"
+            >
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
+                <rect x="6" y="6" width="12" height="12" rx="2" />
+              </svg>
+            </button>
+          ) : (
+            <button
+              onClick={handleSend}
+              disabled={!text.trim() || disabled}
+              className={`p-2 rounded-lg transition-all-smooth ${
+                text.trim() && !disabled
+                  ? 'bg-mes-primary text-white hover:bg-mes-primaryHover shadow-sm'
+                  : 'bg-gray-200 text-mes-textTertiary cursor-not-allowed'
+              }`}
+            >
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                <line x1="22" y1="2" x2="11" y2="13" />
+                <polygon points="22 2 15 22 11 13 2 9 22 2" />
+              </svg>
+            </button>
+          )}
         </div>
       </div>
     </div>

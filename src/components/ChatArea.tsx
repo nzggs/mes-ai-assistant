@@ -15,6 +15,8 @@ interface ChatAreaProps {
   mesSource?: MesSource
   mesSlots?: MesSlotInfo[]
   onMesSourceChange?: (s: MesSource) => void
+  /** "停止生成"：中断当前流式回答（保留已生成内容） */
+  onStopStreaming?: () => void
 }
 
 export function ChatArea({
@@ -28,6 +30,7 @@ export function ChatArea({
   mesSource = 'off',
   mesSlots = [],
   onMesSourceChange,
+  onStopStreaming,
 }: ChatAreaProps) {
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const scrollContainerRef = useRef<HTMLDivElement>(null)
@@ -102,6 +105,7 @@ export function ChatArea({
             mesSource={mesSource}
             mesSlots={mesSlots}
             onMesSourceChange={onMesSourceChange}
+            onStop={onStopStreaming}
           />
         </div>
       </div>

@@ -10,7 +10,7 @@ import { UserManagement } from './components/UserManagement'
 import { DatabaseManage } from './components/DatabaseManage'
 import { ChangePasswordModal } from './components/ChangePasswordModal'
 import { MemoryManage } from './components/MemoryManage'
-import { fetchUserMemories, buildMemoryContext, type UserMemory } from './services/memoryApi'
+import { fetchUserMemories, addUserMemory, buildMemoryContext, type UserMemory } from './services/memoryApi'
 import ErrorToasts from './components/ErrorToasts'
 import { generateResponse, initialConversations, presetQuestions } from './data/mockData'
 import { streamChat, hasApiKey, getProvider, getReasoningModelId, resolveModelId, summarizeHistory, type ChatMessageDto } from './services/llmApi'
@@ -64,6 +64,12 @@ function trimAfterMesSqlBlock(text: string): string {
   return text.slice(0, end + 3)
 }
 
+// 提取/替换 ```user-memory 代码块（记忆自动保存）。
+// 注意：用 RegExp 构造器而不是含反引号的正则字面量——babel 在「嵌套箭头 + 三元」里
+// 解析含反引号的正则字面量会误报语法错误（build 实测）。
+const USER_MEMORY_EXTRACT_RE = new RegExp('```user-memory\\s*([\\s\\S]*?)```')
+const USER_MEMORY_FENCE_RE = new RegExp('```user-memory[\\s\\S]*?```')
+
 /** 从 mes-sql 代码块之前的文本里提取「来源：xxx」标注（SQL 取自哪篇文档/哪个脚本） */
 function extractMesSource(text: string): string | null {
   const m = text.match(/来源\s*[：:]\s*([^\n`]{1,120})/)
@@ -115,6 +121,9 @@ export default function App() {
   const [userMemories, setUserMemories] = useState<UserMemory[]>([])
   const userMemoriesRef = useRef<UserMemory[]>([])
   useEffect(() => { userMemoriesRef.current = userMemories }, [userMemories])
+  // "停止生成"：当前流式回答的 AbortController（回答结束/中断后置空）
+  const chatAbortRef = useRef<AbortController | null>(null)
+  const stopGenerating = useCallback(() => { chatAbortRef.current?.abort() }, [])
   // 登录用户变化时拉取该用户的记忆（未登录/后端不可达时静默置空）
   useEffect(() => {
     const uname = user?.username
@@ -342,6 +351,10 @@ export default function App() {
     let hasContent = false
     let hasThinking = false
     let llmFailed = false
+    // 本轮回答被用户手动停止（"停止生成"按钮）：跳过重试/二段查询，保留已生成内容
+    let aborted = false
+    const abortCtl = new AbortController()
+    chatAbortRef.current = abortCtl
     // 累计正文（用于 MES 直查：从第一轮回答里提取 mes-sql 推荐查询）
     let answerAccum = ''
 
@@ -501,6 +514,31 @@ export default function App() {
     // 封装流式请求，便于"仅推理无正文"时自动重试一次；msgs 可指定（MES 第二轮会追加查询结果）
     const runStream = async (msgs: ChatMessageDto[] = llmMessages, useThinking = deepThink): Promise<void> => {
       await streamChat(msgs, {
+      onAborted: () => {
+        aborted = true
+        setConversations(prev => prev.map(c => {
+          if (c.id !== convId) return c
+          return {
+            ...c,
+            messages: c.messages.map(m => {
+              if (m.id !== aiMsgId) return m
+              if (hasContent) {
+                // 已有部分内容：保留并在末尾追加停止标记
+                return {
+                  ...m,
+                  contents: [...m.contents, { type: 'text' as const, text: '\n\n> ⛔ 已停止生成。' }],
+                  isStreaming: false,
+                }
+              }
+              return {
+                ...m,
+                contents: [{ type: 'text' as const, text: '> ⛔ 已停止生成。' }],
+                isStreaming: false,
+              }
+            }),
+          }
+        }))
+      },
       onThinking: (chunk) => {
         hasThinking = true
         setConversations(prev => prev.map(c => {
@@ -608,13 +646,14 @@ export default function App() {
       knowledgeContext: finalKnowledgeContext,
       useThinking,
       modelId: reasoningModelId,
+      signal: abortCtl.signal,
     })
   }
 
   await runStream()
 
   // 仅返回推理过程、无正文：自动重试一次（模型首次可能只输出推理而未生成正文）
-  if (hasThinking && !hasContent && !llmFailed) {
+  if (hasThinking && !hasContent && !llmFailed && !aborted) {
     hasThinking = false
     hasContent = false
     answerAccum = ''
@@ -632,7 +671,7 @@ export default function App() {
   // ===== MES 数据直查第二轮 =====
   // 模型在第一轮回答里给出了 ```mes-sql 推荐查询：按硬性要求（仅 SELECT / 行数上限 /
   // 连接与语句超时，走所选数据库槽位）执行，把真实结果回灌，让模型基于具体数据作答。
-  if (mesActive && hasContent && !llmFailed) {
+  if (mesActive && hasContent && !llmFailed && !aborted) {
     const mesSql = extractMesSql(answerAccum)
     if (mesSql) {
       // 防护：截掉 mes-sql 代码块之后的多余输出（复述历史结果 / 编造数据），
@@ -675,6 +714,7 @@ export default function App() {
       }))
       try {
         const result = await queryMesData({ slot: mesSource, sql: mesSql })
+        if (aborted) return
         const doneNote = `已在「${result.slotName}」执行只读查询（${result.rowCount} 行 / ${result.elapsedMs}ms${result.truncated ? '，已按行数上限截断' : ''}）`
         setConversations(prev => prev.map(c => {
           if (c.id !== convId) return c
@@ -719,8 +759,47 @@ export default function App() {
     }
   }
 
+  // ===== 记忆自动保存：模型输出 ```user-memory 代码块时，系统落库到该用户的记忆管理 =====
+  // （此前模型只口头说"已记住"，记忆管理里并没有记录；现在必须输出代码块才被视为"已记住"）
+  if (hasContent && !llmFailed && !aborted && user?.username) {
+    const memMatch = answerAccum.match(USER_MEMORY_EXTRACT_RE)
+    const memText = memMatch ? memMatch[1].trim() : ''
+    if (memText) {
+      const shortNote = memText.replace(/\s+/g, ' ').slice(0, 200)
+      let savedNote: string
+      try {
+        const saved = await addUserMemory(user.username, memText.slice(0, 500))
+        if (Array.isArray(saved?.memories)) {
+          setUserMemories(saved.memories)
+          userMemoriesRef.current = saved.memories
+        }
+        savedNote = `> ✅ 已保存到记忆管理：${shortNote}`
+      } catch (e: any) {
+        savedNote = `> ⚠️ 记忆保存失败：${e?.message || e}（可到 设置 → 记忆管理 手动添加：${shortNote}）`
+      }
+      const finalNote = savedNote
+      setConversations(prev => prev.map(c => {
+        if (c.id !== convId) return c
+        return {
+          ...c,
+          messages: c.messages.map(m => {
+            if (m.id !== aiMsgId) return m
+            return {
+              ...m,
+              contents: m.contents.map(ct => ct.type === 'text'
+                ? { ...ct, text: (ct.text || '').replace(USER_MEMORY_FENCE_RE, finalNote) } : ct),
+            }
+          }),
+        }
+      }))
+    }
+  }
+
+  // 本轮流程结束：清空停止控制器（仅当仍是本轮的控制器，避免误清新一轮）
+  if (chatAbortRef.current === abortCtl) chatAbortRef.current = null
+
     // LLM 完全无响应（无正文且无推理过程）且未报错时：生产环境明确报错，DEV 环境降级到 Mock
-    if (!hasContent && !hasThinking && !llmFailed) {
+    if (!hasContent && !hasThinking && !llmFailed && !aborted) {
       if (import.meta.env.PROD) {
         setConversations(prev => prev.map(c => {
           if (c.id !== convId) return c
@@ -755,7 +834,7 @@ export default function App() {
       }
     }
     // 仅返回了推理过程、无正文：保留思考内容，追加提示（不要覆盖为欢迎语）
-    else if (hasThinking && !hasContent && !llmFailed) {
+    else if (hasThinking && !hasContent && !llmFailed && !aborted) {
       setConversations(prev => prev.map(c => {
         if (c.id !== convId) return c
         return {
@@ -775,6 +854,7 @@ export default function App() {
       }))
     }
   } catch (err: any) {
+    if (chatAbortRef.current === abortCtl) chatAbortRef.current = null
     const msg = err?.message || String(err)
     if (aiMsgId && convId) {
       setConversations(prev => prev.map(c => {
@@ -792,7 +872,7 @@ export default function App() {
       console.error('handleSendMessage error:', err)
     }
   }
-}, [activeId, openApiKeyModal, useKnowledgeBase, documents, deepThink, mesSource, mesSlots])
+}, [activeId, openApiKeyModal, useKnowledgeBase, documents, deepThink, mesSource, mesSlots, user])
 
   // 删除对话
   const handleDeleteConversation = useCallback((id: string) => {
@@ -959,6 +1039,7 @@ export default function App() {
               mesSource={mesSource}
               mesSlots={mesSlots}
               onMesSourceChange={handleMesSourceChange}
+              onStopStreaming={stopGenerating}
             />
           )}
         </div>
