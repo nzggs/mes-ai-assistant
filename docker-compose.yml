@@ -51,7 +51,7 @@ services:
       MES_DATA_DIR: /data
       # host 网络下 127.0.0.1 即宿主机 → 直连宿主机 Ollama
       OLLAMA_API_URL: ${OLLAMA_BASE:-http://127.0.0.1:11434}/v1/chat/completions
-      # ===== APC / RTO（只读 HANA 数据源；未配置 HANA_* 时自动回退内置仿真源）=====
+      # ===== APC / RTO（只读 HANA 数据源；监测项目在页面创建，未配置时页面显示空态，不内置仿真源）=====
       # 取数 SQL 与参数目录见 server/apc.catalog.json，只读安全边界见 DEPLOY.md 3.4
       APC_ENABLED: ${APC_ENABLED:-1}
       HANA_HOST: ${HANA_HOST:-}

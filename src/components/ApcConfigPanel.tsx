@@ -297,7 +297,6 @@ export function ApcConfigPanel({ projectId, onClose, onSaved }: {
       objective: 'quality',
       processGain: 1,
       column: '',
-      sim: { sigmaScale: 9, offsetSigma: 0 },
     }
     setPDraft(list => [...list, next])
     setSelected(pDraft.length)
@@ -490,7 +489,7 @@ export function ApcConfigPanel({ projectId, onClose, onSaved }: {
                           ? 'bg-green-50 text-green-700'
                           : 'bg-gray-100 text-mes-textTertiary'
                       }`}>
-                        {config.database.slots.find(s => s.id === sDbSlot)?.configured ? '已配置连接' : '尚未配置连接（取数将回退仿真）'}
+                        {config.database.slots.find(s => s.id === sDbSlot)?.configured ? '已配置连接' : '尚未配置连接（取数不可用）'}
                       </span>
                     </div>
                   </FieldShell>

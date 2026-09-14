@@ -5,20 +5,26 @@ import os from 'os'
 import path from 'path'
 import {
   assertReadOnlySql, applyRowLimit, stripSqlComments, maskSql,
-  pickColumn, queryReadOnly, isHanaConfigured,
+  pickColumn, queryReadOnly,
 } from './hanaClient.js'
 import {
-  basicStats, linearSlope, roundTo, optimizeParam, simulateValueAt,
-  loadCatalog, getSourceMode, getOverview, getOptimization, getApcStatus,
+  basicStats, linearSlope, roundTo, optimizeParam,
+  loadCatalog, getSourceMode, getSourceReadiness, getOverview, getOptimization, getApcStatus,
   clearApcCache, listParams, getMesGuide, queryMesSql,
 } from './apcService.js'
-import { saveParams } from './apcConfig.js'
+import { saveParams, createProject, deleteProject, listProjects } from './apcConfig.js'
 
 // 测试隔离：把运行期配置指向一个不存在的临时文件。
-// 否则开发者本机数据卷里的 apc.config.json（可能配了真实库地址）会让这些用例
-// 从「仿真数据源」切成「真实数据源」，导致结果不确定。配置有关的行为另见 apcConfig.test.js。
+// 否则开发者本机数据卷里的 apc.config.json（可能配了真实库地址）会让这些用例结果不确定。
+// 配置有关的行为另见 apcConfig.test.js。
 process.env.APC_CONFIG_FILE = path.join(os.tmpdir(), `apc-config-unused-${process.pid}.json`)
 fs.rmSync(process.env.APC_CONFIG_FILE, { force: true })
+
+/** 清空全部监测项目（测试里用来构造「无项目」等干净前置状态） */
+function clearProjects() {
+  for (const p of listProjects()) deleteProject(p.id)
+  clearApcCache()
+}
 
 /** 压平空白，便于比较 SQL 文本 */
 function flat(s) {
@@ -274,25 +280,19 @@ describe('apcService · 优化建议引擎', () => {
 
 // ===== 数据源与聚合接口 =====
 describe('apcService · 数据源与聚合', () => {
-  // 种子目录现为空（监测项由管理员在页面自行增删），先建一个参数，
-  // 让「仿真数据源 / listParams / getOverview / getOptimization」等用例有数据可验证。
+  // 系统不预置任何项目：测试里显式建一个可控项目作为前置状态。
+  // 注意测试环境没有真实 HANA 连接，因此数据源必然是「未配置」——这正是要验证的：
+  // 系统不再用内置仿真数据兜底，未就绪时只返回空结果 + 明确原因。
   beforeEach(() => {
-    clearApcCache()
-    saveParams([{ code: 'P1', name: '参数1', lsl: 0.9, usl: 1.1, min: 0.5, max: 1.5, setpoint: 1 }])
+    clearProjects()
+    createProject({
+      name: '测试项目',
+      dbSlot: 'db1',
+      params: [{ code: 'P1', name: '参数1', lsl: 0.9, usl: 1.1, min: 0.5, max: 1.5, setpoint: 1 }],
+    })
   })
 
-  it('未配置 HANA 时回退到内置仿真数据源', () => {
-    // 测试环境 .env 不含 HANA_* 配置 → 必须走仿真分支
-    if (!isHanaConfigured()) {
-      expect(getSourceMode()).toBe('simulated')
-    }
-    const st = getApcStatus()
-    expect(st.enabled).toBe(true)
-    expect(st.catalogError).toBe('')
-    expect(st.paramCount).toBeGreaterThan(0)
-  })
-
-  it('参数目录字段合法（编码唯一、规格上下限与可调范围有序）', () => {
+  it('参数目录字段合法（编码唯一、规格上下限与可调范围有序，且不含仿真配置）', () => {
     const params = listParams()
     expect(params.length).toBeGreaterThan(0)
     const codes = new Set()
@@ -304,52 +304,53 @@ describe('apcService · 数据源与聚合', () => {
       expect(p.min).toBeLessThan(p.max)
       expect(p.maxStepPct).toBeGreaterThan(0)
       expect(Number.isFinite(p.setpoint)).toBe(true)
+      // 内置仿真数据源已移除：参数定义里不再有 sim 配置
+      expect(p.sim).toBeUndefined()
     }
   })
 
-  it('仿真值对同一时间戳稳定、随时间变化', () => {
-    const p = listParams()[0]
-    const t = 1_700_000_000_000
-    expect(simulateValueAt(p, t)).toBe(simulateValueAt(p, t))
-    expect(simulateValueAt(p, t)).not.toBe(simulateValueAt(p, t + 600_000))
-  })
+  it('未配置数据源时：明确 unconfigured + 空结果，绝不返回伪造数据', async () => {
+    // 项目已建但未配 SQL 模板 → no-template（不是「回退仿真」）
+    expect(getSourceReadiness().ready).toBe(false)
+    expect(getSourceMode()).toBe('unconfigured')
 
-  it('getOverview 返回全部参数的实时值与曲线', async () => {
     const ov = await getOverview({ minutes: 60 })
-    expect(ov.params.length).toBe(listParams().length)
-    expect(ov.windowMinutes).toBe(60)
-    expect(ov.rowCount).toBeGreaterThan(0)
-    expect(ov.source.label).toBeTruthy()
-    for (const p of ov.params) {
-      expect(p.series.length).toBeGreaterThan(1)
-      expect(p.recommendation).toBeTruthy()
-      expect(p.latest).not.toBeNull()
-    }
-  })
+    expect(ov.mode).toBe('unconfigured')
+    expect(ov.ready).toBe(false)
+    expect(ov.params).toEqual([])
+    expect(ov.rowCount).toBe(0)
+    expect(ov.source.label).toBe('未配置数据源')
+    expect(ov.source.ready).toBe(false)
+    expect(ov.source.note).toMatch(/SQL 模板|数据库管理|新建项目/)
 
-  it('getOptimization 汇总口径与条目一致，需调整项排在保持项之前', async () => {
     const op = await getOptimization({ minutes: 60 })
-    expect(op.items.length).toBe(op.summary.total)
-    expect(op.summary.actionable).toBe(op.items.filter(i => !i.recommendation.hold).length)
-    expect(op.summary.danger).toBe(op.items.filter(i => i.status === 'danger').length)
-    const firstHold = op.items.findIndex(i => i.recommendation.hold)
-    if (firstHold >= 0) {
-      expect(op.items.slice(firstHold).every(i => i.recommendation.hold)).toBe(true)
-    }
+    expect(op.mode).toBe('unconfigured')
+    expect(op.items).toEqual([])
+    expect(op.summary.total).toBe(0)
   })
 
-  it('按参数编码过滤只返回指定参数', async () => {
-    const all = listParams()
-    const code = all[0].code
-    const op = await getOptimization({ minutes: 30, codes: [code] })
-    expect(op.items.length).toBe(1)
-    expect(op.items[0].code).toBe(code)
+  it('没有任何监测项目时：原因为 no-project，状态接口不报错也不预置项目', () => {
+    clearProjects()
+    expect(listProjects()).toEqual([])
+    expect(getSourceReadiness().reason).toBe('no-project')
+    const st = getApcStatus()
+    expect(st.enabled).toBe(true)
+    expect(st.mode).toBe('unconfigured')
+    expect(st.ready).toBe(false)
+    expect(st.reason).toBe('no-project')
+    expect(st.paramCount).toBe(0)
+    expect(st.projects).toEqual([])
+    expect(st.catalogError).toBe('')
   })
 })
 
 // ===== 按参数绑定数据库槽位（dbSlot）与 MES 直查 =====
 describe('apcService · 按参数绑定数据库与 MES 直查', () => {
-  beforeEach(() => clearApcCache())
+  beforeEach(() => {
+    // saveParams 不再隐式创建项目：先显式建一个项目
+    clearProjects()
+    createProject({ name: 'MES 直查测试项目', dbSlot: 'db1' })
+  })
 
   it('项目绑定数据库：参数 dbSlot 统一为项目槽位，非法槽位被拒绝', () => {
     saveParams([

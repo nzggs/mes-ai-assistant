@@ -1089,7 +1089,7 @@ app.get('/api/apc/status', apcEnabledGuard, (_req, res) => {
   }
 })
 
-/** 参数概览：实时值 + 统计量 + 趋势（?project=<id> 指定监测项目，缺省默认项目） */
+/** 参数概览：实时值 + 统计量 + 趋势（?project=<id> 指定监测项目，缺省取第一个项目） */
 app.get('/api/apc/overview', apcEnabledGuard, apcRateLimit, async (req, res) => {
   try {
     if (boolParam(req.query.refresh)) clearApcCache()
@@ -1170,7 +1170,7 @@ app.put('/api/apc/projects/:id', requireAdmin, apcProbeRateLimit, (req, res) => 
   }
 })
 
-/** 删除项目（仅管理员；默认项目不可删） */
+/** 删除项目（仅管理员；项目可自由删除，系统不预置任何项目） */
 app.delete('/api/apc/projects/:id', requireAdmin, apcProbeRateLimit, (req, res) => {
   try {
     const projects = deleteProject(req.params.id)
@@ -1277,7 +1277,7 @@ app.get('/api/apc/config', requireAdmin, (_req, res) => {
 })
 
 /** 保存配置：body 可含 databases（按槽位）/ queries / params / meta / limits 任意组合。
- * queries/params 可带 projectId 指定项目（缺省默认项目）。 */
+ * queries/params 可带 projectId 指定项目（缺省取第一个监测项目；无项目时明确报错）。 */
 app.put('/api/apc/config', requireAdmin, async (req, res) => {
   const body = req.body && typeof req.body === 'object' ? req.body : {}
   const saved = new Set()
@@ -1422,7 +1422,7 @@ if (isMain) {
         ? '已关闭'
         : apc.mode === 'hana'
           ? `只读数据源 ${apc.hana.host}:${apc.hana.port}（${modeDesc}取数 · ${apc.paramCount} 个过程参数）`
-          : `内置仿真数据源（${apc.paramCount} 个过程参数）· 可在页面「数据源配置」中填写连接信息`
+          : `未配置数据源（${apc.paramCount} 个过程参数）· 请新建监测项目并配置数据库连接与取数 SQL`
       console.log(`  APC/RTO:   ${apcDesc}${apc.catalogError ? `  [目录异常] ${apc.catalogError}` : ''}`)
     } catch { /* 状态打印失败不影响启动 */ }
     console.log(`========================================\n`)

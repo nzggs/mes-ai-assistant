@@ -2,9 +2,10 @@
  * APC / RTO 领域服务
  * ============================================================================
  * 职责：
- *  1) 读取「过程参数目录」（server/apc.catalog.json，可用 APC_CATALOG_FILE 覆盖）；
- *  2) 即时读取 HANA 中记录的过程数据列值（只读），未配置 HANA 时回退到内置仿真源，
- *     保证功能在任何环境下都能演示与自测；
+ *  1) 读取「过程参数目录」（监测项目各自一套：SQL 模板 + 参数定义）；
+ *  2) 即时读取 HANA 中记录的过程数据列值（只读）。**系统不内置任何仿真/演示数据源**：
+ *     未创建监测项目、项目未配 SQL 模板、或绑定的数据库未配置连接时，一律视为
+ *     「未配置数据源」并返回空结果 + 明确原因，由页面展示空态引导；
  *  3) 依据数据变化（均值偏移、波动、趋势）计算优化后的过程参数设定值建议，
  *     并给出量化的置信度、约束说明与中文理由。
  *
@@ -18,7 +19,7 @@
  * 「整数」与「目录内白名单参数编码」，不接受任何客户端传入的裸 SQL。
  */
 import fs from 'fs'
-import { isHanaConfigured, isDataSourceConfigured, queryReadOnly, getHanaStatus, pickColumn } from './hanaClient.js'
+import { isDataSourceConfigured, queryReadOnly, getHanaStatus, pickColumn } from './hanaClient.js'
 import * as apcConfig from './apcConfig.js'
 import { CODE_RE, normalizeQueries, normalizeParams, queryTemplateWarnings } from './apcCatalog.js'
 import { quoteIdent, renderSqlTemplate, assertIdent, assertReadOnlySql, applyRowLimit } from './sqlGuard.js'
@@ -48,21 +49,6 @@ function clamp(v, lo, hi) {
 function num(v, fallback) {
   const n = Number(v)
   return Number.isFinite(n) ? n : fallback
-}
-
-function hashCode(str) {
-  let h = 2166136261
-  for (let i = 0; i < str.length; i++) {
-    h ^= str.charCodeAt(i)
-    h = Math.imul(h, 16777619)
-  }
-  return h >>> 0
-}
-
-/** 稳定伪随机（-1..1）：同一 seed+ts 永远得到同一值，保证刷新之间曲线连续 */
-function noiseAt(seed, ts) {
-  const h = (Math.imul(seed ^ (ts >>> 16), 2654435761) >>> 0)
-  return (h / 4294967296) * 2 - 1
 }
 
 export function basicStats(values) {
@@ -118,8 +104,8 @@ function catalogFile() {
   return apcConfig.isCatalogFileLocked() ? apcConfig.seedFilePath() : apcConfig.configFilePath()
 }
 
-/** 读取参数目录（带缓存；force=true 强制重载；projectId 指定监测项目，缺省默认项目） */
-export function loadCatalog(force = false, projectId = apcConfig.DEFAULT_PROJECT_ID) {
+/** 读取参数目录（带缓存；force=true 强制重载；projectId 缺省取第一个监测项目） */
+export function loadCatalog(force = false, projectId) {
   catalogError = ''
   try {
     return apcConfig.getCatalogForProject(projectId, force)
@@ -137,19 +123,36 @@ export function isApcEnabled() {
   return toBool(process.env.APC_ENABLED, true)
 }
 
-/** 当前数据源模式：项目配了取数模板且目标库已配置 → hana，否则 simulated。
- * 全局口径：任一槽位已配置即视为 hana（个别参数绑定的槽位未配置时，该参数自动回退仿真）。 */
-export function getSourceMode(projectId = apcConfig.DEFAULT_PROJECT_ID) {
-  const cat = loadCatalog(false, projectId)
-  const hasTemplate = Boolean(cat.queries && cat.queries.history)
-  return isHanaConfigured() && hasTemplate ? 'hana' : 'simulated'
+/**
+ * 项目就绪判定：必须有监测项目 + 该项目自己配了取数 SQL 模板 + 绑定的数据库已配置连接。
+ * 三者缺一即视为「未配置数据源」——系统不再有内置仿真数据源兜底，未就绪时页面显示空态引导，
+ * 绝不展示任何伪造/推测的数据。
+ * @returns {{ready:boolean, reason:'no-project'|'no-template'|'no-connection'|'', projectId:string, slot:string, projectName:string}}
+ */
+export function getSourceReadiness(projectId) {
+  const pid = apcConfig.resolveProjectId(projectId)
+  const project = pid ? apcConfig.getProject(pid) : null
+  const base = {
+    projectId: pid || '',
+    projectName: (project && project.name) || '',
+    slot: (project && project.dbSlot) || 'db1',
+  }
+  if (!project) return { ...base, ready: false, reason: 'no-project' }
+  if (!(project.queries && project.queries.history)) return { ...base, ready: false, reason: 'no-template' }
+  if (!isDataSourceConfigured(base.slot)) return { ...base, ready: false, reason: 'no-connection' }
+  return { ...base, ready: true, reason: '' }
 }
 
-export function listParams(projectId = apcConfig.DEFAULT_PROJECT_ID) {
+/** 当前数据源模式：项目就绪 → hana；否则 unconfigured */
+export function getSourceMode(projectId) {
+  return getSourceReadiness(projectId).ready ? 'hana' : 'unconfigured'
+}
+
+export function listParams(projectId) {
   return loadCatalog(false, projectId).params
 }
 
-export function findParam(code, projectId = apcConfig.DEFAULT_PROJECT_ID) {
+export function findParam(code, projectId) {
   const target = String(code || '').trim()
   return loadCatalog(false, projectId).params.find((p) => p.code === target) || null
 }
@@ -283,40 +286,10 @@ function sanitizeCell(v) {
   return v
 }
 
-// ===== 仿真数据源（未配置 HANA 时使用）=====
-
-function simSigma(param) {
-  const scale = num(param.sim && param.sim.sigmaScale, 3)
-  return (param.usl - param.lsl) / (scale > 0 ? scale : 3)
-}
-
-/**
- * 仿真值 = RTO 理想操作点 + 参数固有偏移(offsetSigma·S) + 平滑漂移 + 少量噪声。
- * 全部是时间戳的确定性函数，因此「连续刷新看到连续变化」，符合真实趋势的表现。
- * 其中 S = simSigma（规格带宽 / sigmaScale），偏移项模拟现场工况对理想点的稳态偏离。
- */
-export function simulateValueAt(param, ts) {
-  const S = simSigma(param)
-  const seed = hashCode(param.code)
-  const t = ts / 1000
-  const smooth = (Math.sin(t / 900 + (seed % 31)) + Math.sin(t / 2600 + (seed % 17))) / 2
-  const jitter = noiseAt(seed, Math.floor(ts / 1000))
-  const offset = num(param.sim && param.sim.offsetSigma, 0)
-  return param.optimalTarget + (offset + smooth * 0.35 + jitter * 0.15) * S
-}
-
-function simulateSeries(param, { minutes, sampleIntervalSec, now }) {
-  const windowMs = minutes * 60 * 1000
-  const natural = Math.round(windowMs / (sampleIntervalSec * 1000))
-  const count = Math.max(6, Math.min(900, natural || 6))
-  // 采样点严格铺满所选窗口，保证前端时间轴与统计口径与窗口一致
-  const stepMs = count > 1 ? windowMs / (count - 1) : windowMs
-  const out = []
-  for (let i = 0; i < count; i++) {
-    const ts = Math.round(now - windowMs + i * stepMs)
-    out.push({ t: ts, v: simulateValueAt(param, ts) })
-  }
-  return out
+/** 规格带宽对应的过程波动基准（常规 ±3σ 口径）：用于置信度里判断实测波动是否偏大 */
+function specSigma(param) {
+  const width = num(param.usl, 0) - num(param.lsl, 0)
+  return width > 0 ? width / 3 : 0
 }
 
 // ===== 取数（对外唯一入口）=====
@@ -371,9 +344,8 @@ function normalizeWideSeries(rows, tsColumn, params) {
  * @returns {Promise<{mode:string, series:Map<string,{t:number,v:number}[]>, meta:object}>}
  */
 export async function fetchProcessSeries(options = {}) {
-  const projectId = options.project || apcConfig.DEFAULT_PROJECT_ID
+  const projectId = apcConfig.resolveProjectId(options.project)
   const cat = loadCatalog(false, projectId)
-  const now = Date.now()
   const minutes = Math.max(1, Math.round(num(options.minutes, cat.defaultWindowMinutes)))
   const requested = Array.isArray(options.codes) && options.codes.length > 0
     ? options.codes.map((c) => String(c))
@@ -381,23 +353,22 @@ export async function fetchProcessSeries(options = {}) {
   // 只允许目录内已定义的编码，杜绝任意编码进入 SQL
   const codes = requested.filter((c) => CODE_RE.test(c) && cat.params.some((p) => p.code === c))
 
-  const mode = getSourceMode(projectId)
+  const readiness = getSourceReadiness(projectId)
+  const mode = readiness.ready ? 'hana' : 'unconfigured'
 
-  if (mode === 'simulated') {
-    const series = new Map()
-    for (const p of cat.params) {
-      if (!codes.includes(p.code)) continue
-      series.set(p.code, simulateSeries(p, { minutes, sampleIntervalSec: cat.sampleIntervalSec, now }))
-    }
+  // 未就绪（无项目 / 未配 SQL 模板 / 数据库未配置连接）：不取数、更不造数，
+  // 返回空序列 + 明确原因，由页面渲染空态引导。
+  if (!readiness.ready) {
     return {
       mode,
-      series,
-      queryMode: (cat.queries && cat.queries.mode) || null,
+      series: new Map(),
+      queryMode: null,
       meta: {
         windowMinutes: minutes,
         sampleIntervalSec: cat.sampleIntervalSec,
-        rowCount: Array.from(series.values()).reduce((a, b) => a + b.length, 0),
+        rowCount: 0,
         truncated: false,
+        reason: readiness.reason,
       },
     }
   }
@@ -407,7 +378,7 @@ export async function fetchProcessSeries(options = {}) {
 
   // 按参数各自绑定的数据库槽位分组取数：dbSlot 缺省视为 db1。
   // 每个槽位独立一条连接 + 串行队列，两个系统的查询互不阻塞。
-  // 某参数绑定的槽位未配置连接时，该参数回退仿真值（其余参数照常走库）。
+  // 某参数绑定的槽位未配置连接时，该参数本次无数据（绝不伪造）。
   const bySlot = new Map()
   for (const p of selectedParams) {
     const slotId = p.dbSlot === 'db2' ? 'db2' : 'db1'
@@ -424,10 +395,9 @@ export async function fetchProcessSeries(options = {}) {
 
   for (const [slotId, slotParams] of bySlot) {
     if (!isDataSourceConfigured(slotId)) {
+      // 该槽位未配置连接：这些参数本次返回空序列（不生成任何替代数据）
       skippedSlots.push(slotId)
-      for (const p of slotParams) {
-        series.set(p.code, simulateSeries(p, { minutes, sampleIntervalSec: cat.sampleIntervalSec, now }))
-      }
+      for (const p of slotParams) series.set(p.code, [])
       continue
     }
     usedSlots.push(slotId)
@@ -513,7 +483,7 @@ export function optimizeParam(param, series, opts = {}) {
   const points = Array.isArray(series) ? series : []
   const values = points.map((p) => p.v).filter((v) => Number.isFinite(v))
   const stats = basicStats(values)
-  const sigmaSpec = simSigma(param)
+  const sigmaSpec = specSigma(param)
   const latest = values.length > 0 ? values[values.length - 1] : NaN
   const slope = linearSlope(values)
   const cpk = computeCpk(param, stats.mean, stats.std)
@@ -720,21 +690,23 @@ function cacheTtl() {
 
 // ===== 对外聚合接口 =====
 
-/** 参数概览：当前值、统计量、趋势、状态（含压缩曲线） */
+/** 参数概览：当前值、统计量、趋势、状态（含压缩曲线）；未配置数据源时返回空态 */
 export async function getOverview({ minutes, project } = {}) {
-  const projectId = project || apcConfig.DEFAULT_PROJECT_ID
+  const projectId = apcConfig.resolveProjectId(project)
   const cat = loadCatalog(false, projectId)
   const ttl = cacheTtl()
   const key = `overview:${projectId}:${minutes || 'default'}`
   const loader = async () => {
     const started = Date.now()
     const { mode, series, meta } = await fetchProcessSeries({ minutes, project: projectId })
-    const params = cat.params.map((p) => optimizeParam(p, series.get(p.code) || [], { sparkPoints: 60 }))
+    const ready = mode === 'hana'
     return {
       project: projectId,
       projectName: (apcConfig.getProject(projectId) || {}).name || '',
-      station: cat.station,
+      station: ready ? cat.station : '',
       mode,
+      ready,
+      reason: meta.reason || '',
       generatedAt: new Date().toISOString(),
       elapsedMs: Date.now() - started,
       windowMinutes: meta.windowMinutes,
@@ -742,22 +714,24 @@ export async function getOverview({ minutes, project } = {}) {
       rowCount: meta.rowCount,
       truncated: meta.truncated,
       source: describeSource(mode, meta),
-      params,
+      // 未就绪时不展示任何参数卡（页面据此渲染空态引导）
+      params: ready ? cat.params.map((p) => optimizeParam(p, series.get(p.code) || [], { sparkPoints: 60 })) : [],
     }
   }
   if (ttl <= 0) return loader()
   return withCache(key, ttl, loader)
 }
 
-/** 优化建议：按紧急度排序，只返回需要动作或需要关注的项 */
+/** 优化建议：按紧急度排序，只返回需要动作或需要关注的项；未配置数据源时返回空列表 */
 export async function getOptimization({ minutes, codes, project } = {}) {
-  const projectId = project || apcConfig.DEFAULT_PROJECT_ID
+  const projectId = apcConfig.resolveProjectId(project)
   const cat = loadCatalog(false, projectId)
   const ttl = cacheTtl()
   const key = `optimize:${projectId}:${minutes || 'default'}:${(codes || []).join(',')}`
   const loader = async () => {
     const { mode, series, meta } = await fetchProcessSeries({ minutes, codes, project: projectId })
-    const all = cat.params.map((p) => optimizeParam(p, series.get(p.code) || [], { sparkPoints: 72 }))
+    const ready = mode === 'hana'
+    const all = ready ? cat.params.map((p) => optimizeParam(p, series.get(p.code) || [], { sparkPoints: 72 })) : []
     const order = { high: 0, medium: 1, low: 2, none: 3 }
     const items = all
       .filter((it) => Array.isArray(codes) && codes.length > 0 ? codes.includes(it.code) : true)
@@ -769,8 +743,10 @@ export async function getOptimization({ minutes, codes, project } = {}) {
     return {
       project: projectId,
       projectName: (apcConfig.getProject(projectId) || {}).name || '',
-      station: cat.station,
+      station: ready ? cat.station : '',
       mode,
+      ready,
+      reason: meta.reason || '',
       generatedAt: new Date().toISOString(),
       windowMinutes: meta.windowMinutes,
       source: describeSource(mode, meta),
@@ -793,7 +769,7 @@ export async function getOptimization({ minutes, codes, project } = {}) {
 
 /** 单个参数的历史曲线（供详情面板） */
 export async function getHistory({ code, minutes, project } = {}) {
-  const projectId = project || apcConfig.DEFAULT_PROJECT_ID
+  const projectId = apcConfig.resolveProjectId(project)
   const param = findParam(code, projectId)
   if (!param) {
     const err = new Error(`未找到参数：${code}`)
@@ -842,12 +818,19 @@ export async function getHistory({ code, minutes, project } = {}) {
   return withCache(key, ttl, loader)
 }
 
+/** 未就绪时按具体原因给出下一步动作（页面空态引导文案） */
+const SOURCE_REASON_NOTE = {
+  'no-project': '尚未创建监测项目。请点击「新建项目」，选择数据库系统，并配置取数 SQL 模板与过程参数。',
+  'no-template': '当前项目尚未配置取数 SQL 模板。请在项目的「SQL 模板」页填写取数语句并保存。',
+  'no-connection': '当前项目绑定的数据库系统尚未配置连接信息。请在侧边栏「数据库管理」页填写连接参数。',
+}
+
 function describeSource(mode, meta) {
   if (mode === 'hana') {
     const wide = meta && meta.queryMode === 'wide'
     const skipped = Array.isArray(meta && meta.skippedSlots) ? meta.skippedSlots : []
     const skippedNote = skipped.length > 0
-      ? `（数据库系统 ${skipped.map((s) => s.replace('db', '')).join('、')} 未配置连接，绑定这些系统的参数展示仿真数据）`
+      ? `（数据库系统 ${skipped.map((s) => s.replace('db', '')).join('、')} 未配置连接，绑定这些系统的参数本次无数据）`
       : ''
     return {
       label: `SAP HANA（只读 · ${wide ? '宽表取数' : '窄表取数'} · 按参数绑定数据库系统）`,
@@ -855,15 +838,16 @@ function describeSource(mode, meta) {
         '实时读取 HANA 中记录的过程数据列值；每个参数项各自绑定使用数据库系统 1 或 2，仅执行 SELECT，' +
         '单次读取行数与执行时间均受服务端限制。' +
         `当前取数模式：${wide ? '宽表（一行一个时间戳，各参数各占一列）' : '窄表（一行一个参数值，按编码列分组）'}。${skippedNote}`,
-      simulated: false,
+      ready: true,
+      reason: '',
     }
   }
+  const reason = (meta && meta.reason) || 'no-project'
   return {
-    label: '内置仿真数据源',
-    note:
-      '未检测到可用的数据库配置或项目未配置取数模板，当前展示内置仿真过程数据（仅用于功能验证与演示）。' +
-      '可在侧边栏「数据库管理」填写连接信息，或在项目的「SQL 模板」中配置取数语句，保存后立即生效，无需重启服务。',
-    simulated: true,
+    label: '未配置数据源',
+    note: SOURCE_REASON_NOTE[reason] || SOURCE_REASON_NOTE['no-project'],
+    ready: false,
+    reason,
   }
 }
 
@@ -886,6 +870,8 @@ export function getApcStatus() {
   return {
     enabled: isApcEnabled(),
     mode: cat ? getSourceMode() : 'unavailable',
+    ready: cat ? getSourceReadiness().ready : false,
+    reason: cat ? getSourceReadiness().reason : 'no-project',
     station: cat ? cat.station : '',
     paramCount: cat ? cat.params.length : 0,
     queryMode: cat && cat.queries ? cat.queries.mode : null,

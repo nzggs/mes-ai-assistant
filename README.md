@@ -322,7 +322,9 @@ SQL 模板占位符 `minutes / limit / codeFilter / columns / schema` 均按白�
 管理接口（`/api/apc/config`、`/api/apc/projects/*`、`/api/apc/ping` 等）均要求 `X-Admin-Token`；
 数据接口（`/api/apc/status|overview|history|optimize`）限流 60 次/分/IP + 5s 缓存，`?refresh=1` 可绕过缓存。
 
-> 未配置 HANA 时，系统自动回退到**内置仿真数据源**用于功能验证，页面会明确标注「未启用（仿真源）」。
+> **系统不内置任何仿真/演示数据源，也不预置任何监测项目**：项目全部由管理员在「APC和RTO」页创建。
+> 未创建项目、项目未配取数 SQL 模板、或绑定的数据库未配置连接时，页面按「未配置数据源」展示
+> 空态引导（含下一步动作），**不展示任何曲线、统计与优化建议**，绝不返回推测数据。
 
 ---
 

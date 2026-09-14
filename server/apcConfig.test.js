@@ -51,6 +51,8 @@ beforeEach(() => {
   fs.rmSync(TMP_CONFIG, { force: true })
   process.env.APC_CONFIG_FILE = TMP_CONFIG
   invalidateConfigCache()
+  // 系统不预置任何项目：测试里显式建一个项目，供 saveParams / saveQueries / resetSection 缺省使用
+  createProject({ name: '测试项目', dbSlot: 'db1' })
 })
 
 afterEach(() => {
@@ -74,7 +76,8 @@ describe('apcConfig · 取值优先级', () => {
     expect(c.useTLS).toBe(false)
     expect(c.useLimit).toBe(true)
     expect(isDataSourceConfigured()).toBe(false)
-    expect(getConfigForClient().configFileExists).toBe(false)
+    // 两个数据库槽位都还没配连接（与是否已建监测项目无关）
+    expect(getConfigForClient().database.slots.every(s => s.configured === false)).toBe(true)
   })
 
   it('环境变量提供取值，地址 + 用户名齐备即视为已配置', () => {
@@ -436,7 +439,7 @@ describe('apcService · SQL 试运行', () => {
 const P_BASE = { lsl: 0, usl: 1, min: -1, max: 2, setpoint: 0.5 }
 
 describe('apcConfig · 监测项目（dbSlot + SQL 模板 + 参数自成一套）', () => {
-  it('新建/更新/删除项目；参数 dbSlot 跟随项目槽位；默认项目不可删除', () => {
+  it('新建/更新/删除项目；参数 dbSlot 跟随项目槽位；项目可自由删除', () => {
     const p = createProject({
       name: '注液量监测',
       description: '示例项目',
@@ -454,10 +457,12 @@ describe('apcConfig · 监测项目（dbSlot + SQL 模板 + 参数自成一套�
     expect(u.params).toHaveLength(2) // 未传 params 时保留原值
     expect(u.dbSlot).toBe('db2')
 
-    expect(() => deleteProject(DEFAULT_PROJECT_ID)).toThrow(/不可删除/)
+    // 系统不预置任何项目：所有项目都可删除（不存在「默认项目不可删」的约束）
     deleteProject(p.id)
     expect(getProject(p.id)).toBeNull()
     expect(listProjects().find(x => x.id === p.id)).toBeUndefined()
+    // 删除不存在的项目要明确报错
+    expect(() => deleteProject(p.id)).toThrow(/不存在/)
   })
 
   it('项目名必填；dbSlot 非法拒绝', () => {
@@ -466,7 +471,7 @@ describe('apcConfig · 监测项目（dbSlot + SQL 模板 + 参数自成一套�
     expect(() => createProject(null)).toThrow()
   })
 
-  it('历史全局 catalog 自动迁移为默认项目', () => {
+  it('历史全局 catalog 段不再迁移为项目（系统不凭空造出演示项目）', () => {
     fs.writeFileSync(TMP_CONFIG, JSON.stringify({
       version: 1,
       catalog: {
@@ -475,9 +480,10 @@ describe('apcConfig · 监测项目（dbSlot + SQL 模板 + 参数自成一套�
       },
     }))
     invalidateConfigCache()
-    expect(getProject(DEFAULT_PROJECT_ID).params[0].code).toBe('Z1')
-    expect(getProject(DEFAULT_PROJECT_ID).queries.history).toBe(OK_SQL)
-    expect(getEffectiveCatalog().params[0].code).toBe('Z1')
+    // 旧 catalog 段被直接忽略：既不生成项目，也不进入生效目录
+    expect(listProjects()).toEqual([])
+    expect(getProject(DEFAULT_PROJECT_ID)).toBeNull()
+    expect(getEffectiveCatalog().params).toEqual([])
   })
 
   it('saveLimits 校验范围并生效；reset limits 回默认', () => {
@@ -490,15 +496,26 @@ describe('apcConfig · 监测项目（dbSlot + SQL 模板 + 参数自成一套�
     expect(getEffectiveLimits().chatRows).toBe(DEFAULT_CHAT_ROWS)
   })
 
-  it('项目的 queries 按项目隔离：改默认项目不影响新项目', () => {
+  it('项目的 queries 按项目隔离：改一个项目不影响另一个', () => {
+    const first = listProjects()[0]
     const p = createProject({ name: '独立项目', dbSlot: 'db1' })
-    saveQueries({ mode: 'long', history: OK_SQL, columns: OK_COLUMNS })
-    expect(getProject(DEFAULT_PROJECT_ID).queries).toBeTruthy()
-    expect(getProject(p.id).queries === undefined || getProject(p.id).queries === null).toBe(true)
+    saveQueries({ mode: 'long', history: OK_SQL, columns: OK_COLUMNS }, first.id)
+    expect(getProject(first.id).queries).toBeTruthy()
+    expect(getProject(p.id).queries == null).toBe(true)
     // 配置视图的项目摘要正确
     const view = getConfigForClient()
-    expect(view.projects.find(x => x.id === DEFAULT_PROJECT_ID)).toBeTruthy()
+    expect(view.projects.find(x => x.id === first.id)).toBeTruthy()
     expect(view.projects.find(x => x.id === p.id).name).toBe('独立项目')
     expect(view.limits.chatRows).toBe(DEFAULT_CHAT_ROWS)
+  })
+
+  it('没有监测项目时：写入类操作明确报错，而不是隐式造一个项目', () => {
+    for (const x of listProjects()) deleteProject(x.id)
+    expect(listProjects()).toEqual([])
+    expect(() => saveQueries({ mode: 'long', history: OK_SQL, columns: OK_COLUMNS })).toThrow(/尚未创建监测项目/)
+    expect(() => saveParams([{ code: 'A', ...P_BASE }])).toThrow(/尚未创建监测项目/)
+    expect(() => resetSection('params')).toThrow(/尚未创建监测项目/)
+    // 报错后依然没有任何项目被悄悄创建
+    expect(listProjects()).toEqual([])
   })
 })

@@ -55,7 +55,6 @@ const PARAMS = [
     processGain: 1,
     column: '',
     dbSlot: 'db1',
-    sim: { sigmaScale: 3 },
   },
   {
     code: 'CALENDER_GAP',

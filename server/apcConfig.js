@@ -40,8 +40,9 @@ export const DB_DEFAULT_NAMES = { db1: '数据库系统 1', db2: '数据库系�
  * 监测项目：每个项目自带一套「用哪个数据库 + 用哪个 SQL 模板取数 + 参数怎么设」。
  * 数据库连接（怎么连）与查询限制（怎么限）是公用配置，在「数据库管理」页维护；
  * 项目只引用数据库槽位（dbSlot），不重复存连接信息。
- * 历史的单目录配置（catalog.queries / catalog.params）自动迁移为「默认项目」。
+ * **系统不预置任何项目**：项目全部由管理员在页面创建，未创建时页面显示空态引导。
  */
+/** 历史遗留的默认项目 id（旧版本曾用它做迁移兜底；现行版本不再预置项目，仅保留常量兼容） */
 export const DEFAULT_PROJECT_ID = 'p_default'
 export const DEFAULT_PROJECT_NAME = '默认项目'
 /** 问答环节直查行数上限的默认值（可在「数据库管理」页调整） */
@@ -154,28 +155,16 @@ export function readConfig(force = false) {
         let databases = {}
         if (parsed.databases && typeof parsed.databases === 'object') databases = parsed.databases
         else if (parsed.database && typeof parsed.database === 'object') databases = { db1: parsed.database }
-        // 项目模型（v2）：projects 各自带 queries/params；历史全局 catalog 自动迁移为默认项目
+        // 项目模型（v2）：监测项目全部由管理员在页面创建，**系统不预置任何项目**。
+        // 历史的全局 catalog 段不再迁移为项目（该字段直接忽略），避免凭空造出演示项目。
         let projects = {}
         let meta = {}
         let limits = {}
-        const legacyCatalog = parsed.catalog && typeof parsed.catalog === 'object' ? parsed.catalog : {}
         if (parsed.projects && typeof parsed.projects === 'object') {
           projects = parsed.projects
-        } else if ((legacyCatalog.queries || legacyCatalog.params) && !parsed.projects) {
-          projects = {
-            [DEFAULT_PROJECT_ID]: {
-              id: DEFAULT_PROJECT_ID,
-              name: DEFAULT_PROJECT_NAME,
-              description: '由历史单目录配置自动迁移',
-              dbSlot: 'db1',
-              queries: legacyCatalog.queries || null,
-              params: Array.isArray(legacyCatalog.params) ? legacyCatalog.params : [],
-              createdAt: parsed.updatedAt || null,
-              updatedAt: parsed.updatedAt || null,
-            },
-          }
         }
-        // 全局 meta：优先读顶层 meta；历史上平铺在 catalog 里的四个键迁移过来
+        // 全局 meta：优先读顶层 meta；历史上平铺在 catalog 里的四个键仍可识别
+        const legacyCatalog = parsed.catalog && typeof parsed.catalog === 'object' ? parsed.catalog : {}
         const metaSrc = parsed.meta && typeof parsed.meta === 'object' ? parsed.meta : legacyCatalog
         for (const k of ['station', 'sampleIntervalSec', 'defaultWindowMinutes', 'deadbandPctDefault']) {
           if (metaSrc[k] !== undefined) meta[k] = metaSrc[k]
@@ -327,7 +316,7 @@ export function isDataSourceConfigured(id) {
   return Boolean(c.host && c.user)
 }
 
-/** 是否至少有一个数据库槽位已完成配置（供「是否回退仿真源」判断） */
+/** 是否至少有一个数据库槽位已完成配置（供「数据源是否可用」判断） */
 export function isAnyDatabaseConfigured() {
   return DB_SLOTS.some((id) => isDataSourceConfigured(id))
 }
@@ -416,6 +405,22 @@ export function getProject(id) {
   return p && typeof p === 'object' ? p : null
 }
 
+/** 解析实际项目 id：显式传入优先；缺省取列表第一个项目；一个都没有时返回空串 */
+export function resolveProjectId(id) {
+  const explicit = String(id == null ? '' : id).trim()
+  if (explicit) return explicit
+  const list = listProjects()
+  return list.length > 0 ? list[0].id : ''
+}
+
+/** 解析并校验目标项目：必须是一个已存在的监测项目（用于写入类操作） */
+function requireProject(projectId) {
+  const pid = resolveProjectId(projectId)
+  if (!pid) throw projectIdError('尚未创建监测项目，请先新建项目再配置')
+  if (!getProject(pid)) throw projectIdError(`监测项目不存在：${pid}`)
+  return pid
+}
+
 /** 校验并规范化项目（部分字段可缺省，便于增量保存） */
 function normalizeProject(input, { partial = false } = {}) {
   if (!input || typeof input !== 'object') throw projectIdError('项目配置格式非法（应为对象）')
@@ -436,7 +441,7 @@ function normalizeProject(input, { partial = false } = {}) {
     out.dbSlot = input.dbSlot
   }
   if (input.queries !== undefined) {
-    // null 表示清空取数模板（项目暂不取数，回退仿真）
+    // null 表示清空取数模板（项目暂不取数，页面按「未配置数据源」展示）
     out.queries = input.queries === null ? null : normalizeQueries(input.queries)
   }
   if (input.params !== undefined) {
@@ -485,13 +490,13 @@ export function updateProject(id, input) {
   return projects[existing.id]
 }
 
-/** 删除监测项目（默认项目不可删除，只能清空内容） */
+/** 删除监测项目（项目可由管理员自由删除，系统不预置不可删的项目） */
 export function deleteProject(id) {
   const cur = readConfig(true)
   const projects = { ...(cur.projects || {}) }
-  const key = String(id || '')
-  if (key === DEFAULT_PROJECT_ID) throw projectIdError('默认项目不可删除（可在项目内清空参数与模板）')
-  if (!projects[key]) throw projectIdError(`监测项目不存在：${key || '(空)'}`)
+  const key = String(id || '').trim()
+  if (!key) throw projectIdError('缺少要删除的项目 id')
+  if (!projects[key]) throw projectIdError(`监测项目不存在：${key}`)
   delete projects[key]
   persist({ ...cur, projects })
   return listProjects()
@@ -501,7 +506,8 @@ export function deleteProject(id) {
 function rawCatalogFor(projectId, overrides) {
   const seedRaw = readSeedRaw()
   if (isCatalogFileLocked()) return seedRaw
-  const project = { ...(getProject(projectId) || {}), ...(overrides || {}) }
+  const pid = resolveProjectId(projectId)
+  const project = { ...((pid ? getProject(pid) : null) || {}), ...(overrides || {}) }
   const meta = { ...(savedMeta()) }
   const seedParams = Array.isArray(seedRaw.params) ? seedRaw.params : []
   return {
@@ -515,20 +521,21 @@ function rawCatalogFor(projectId, overrides) {
 let catalogCache = null
 let catalogCacheKey = ''
 
-/** 校验并返回某个项目的生效目录（带缓存） */
-export function getCatalogForProject(projectId = DEFAULT_PROJECT_ID, force = false) {
-  const key = `${seedFilePath()}|${configFilePath()}|${revision}|${projectId}`
+/** 校验并返回某个项目的生效目录（带缓存；projectId 缺省取第一个监测项目） */
+export function getCatalogForProject(projectId, force = false) {
+  const pid = resolveProjectId(projectId)
+  const key = `${seedFilePath()}|${configFilePath()}|${revision}|${pid}`
   if (!force && catalogCache && catalogCacheKey === key) return catalogCache
-  const raw = rawCatalogFor(projectId)
+  const raw = rawCatalogFor(pid)
   const catalog = validateCatalog(raw, isCatalogFileLocked() ? seedFilePath() : configFilePath())
   catalogCache = catalog
   catalogCacheKey = key
   return catalog
 }
 
-/** 校验并返回生效的参数目录（默认项目；兼容历史调用签名 getEffectiveCatalog(force)） */
+/** 校验并返回生效的参数目录（第一个监测项目；兼容历史调用签名 getEffectiveCatalog(force)） */
 export function getEffectiveCatalog(force = false) {
-  return getCatalogForProject(DEFAULT_PROJECT_ID, force)
+  return getCatalogForProject(undefined, force)
 }
 
 /** 参数目录来源：env-file（环境变量指定文件） | saved（页面保存/种子+覆盖） */
@@ -536,64 +543,60 @@ export function getCatalogOrigin() {
   return isCatalogFileLocked() ? 'env-file' : 'saved'
 }
 
-/** 保存某个项目的 queries 段（projectId 缺省 = 默认项目，兼容历史调用） */
-export function saveQueries(input, projectId = DEFAULT_PROJECT_ID) {
+/** 保存某个项目的 queries 段（projectId 缺省取第一个监测项目；不存在则报错，不再隐式创建项目） */
+export function saveQueries(input, projectId) {
   if (isCatalogFileLocked()) {
     throw configError('当前由 APC_CATALOG_FILE 指定参数目录文件，页面保存不生效；请先移除该环境变量')
   }
+  const pid = requireProject(projectId)
   const queries = normalizeQueries(input)
   // 先按「保存后」的目录整体校验（例如宽表而参数未配列名时立即拦下），再落盘
-  validateCatalog(rawCatalogFor(projectId, { queries }), configFilePath())
+  validateCatalog(rawCatalogFor(pid, { queries }), configFilePath())
   const cur = readConfig(true)
   const projects = { ...(cur.projects || {}) }
-  const existing = projects[projectId] || {
-    id: projectId, name: DEFAULT_PROJECT_NAME, dbSlot: 'db1', createdAt: new Date().toISOString(),
-  }
-  projects[projectId] = { ...existing, queries, updatedAt: new Date().toISOString() }
+  projects[pid] = { ...projects[pid], queries, updatedAt: new Date().toISOString() }
   persist({ ...cur, projects })
   catalogCache = null
   return queries
 }
 
-/** 保存某个项目的 params 段（projectId 缺省 = 默认项目，兼容历史调用） */
-export function saveParams(input, projectId = DEFAULT_PROJECT_ID) {
+/** 保存某个项目的 params 段（projectId 缺省取第一个监测项目；不存在则报错，不再隐式创建项目） */
+export function saveParams(input, projectId) {
   if (isCatalogFileLocked()) {
     throw configError('当前由 APC_CATALOG_FILE 指定参数目录文件，页面保存不生效；请先移除该环境变量')
   }
-  const project = getProject(projectId)
+  const pid = requireProject(projectId)
+  const project = getProject(pid)
   const mode = (() => {
     try {
       const q = project && project.queries ? project.queries : (input && input.queries) || null
       if (q && q.mode) return q.mode
-      const eff = getEffectiveCatalog()
+      const eff = getCatalogForProject(pid)
       if (eff.queries && eff.queries.mode) return eff.queries.mode
     } catch { /* 现有目录不合法时按窄表校验，下面整体校验会给出准确报错 */ }
     return 'long'
   })()
   const deadbandPctDefault = (() => {
-    try { return getEffectiveCatalog().deadbandPctDefault } catch { return 10 }
+    try { return getCatalogForProject(pid).deadbandPctDefault } catch { return 10 }
   })()
 
   // 参数未显式填工艺死区时，要继承目录级默认值，避免保存一次就被重置成 10%
   const params = normalizeParams(Array.isArray(input) ? input : [], { mode, deadbandPctDefault })
   const cur = readConfig(true)
   const projects = { ...(cur.projects || {}) }
-  const existing = projects[projectId] || {
-    id: projectId, name: DEFAULT_PROJECT_NAME, dbSlot: 'db1', createdAt: new Date().toISOString(),
-  }
   // 项目绑定数据库：参数的 dbSlot 统一为项目槽位
-  const slot = existing.dbSlot || 'db1'
+  const slot = project.dbSlot || 'db1'
   const slotParams = params.map(p => ({ ...p, dbSlot: slot }))
   // 先按「保存后」的目录整体校验（例如宽表而参数未配列名时立即拦下），再落盘
-  validateCatalog(rawCatalogFor(projectId, { params: slotParams }), configFilePath())
-  projects[projectId] = {
-    ...existing,
+  validateCatalog(rawCatalogFor(pid, { params: slotParams }), configFilePath())
+  projects[pid] = {
+    ...projects[pid],
     params: slotParams,
     updatedAt: new Date().toISOString(),
   }
   persist({ ...cur, projects })
   catalogCache = null
-  return projects[projectId].params
+  return projects[pid].params
 }
 
 /** 保存 meta（装置名 / 采样间隔 / 默认窗口 / 默认死区）——全局公用，不属于任何项目 */
@@ -756,9 +759,9 @@ const META_KEYS = ['station', 'sampleIntervalSec', 'defaultWindowMinutes', 'dead
 /** 把某一段恢复为「种子文件 / 环境变量」提供的默认值
  * @param {string} section
  * @param {string} [databaseId] 仅 reset 'database' 时有效：指定清空某个槽位；缺省清空全部槽位
- * @param {string} [projectId] 仅 reset 'queries'/'params' 时有效：指定项目；缺省 = 默认项目
+ * @param {string} [projectId] 仅 reset 'queries'/'params' 时有效：指定项目；缺省取第一个监测项目
  */
-export function resetSection(section, databaseId, projectId = DEFAULT_PROJECT_ID) {
+export function resetSection(section, databaseId, projectId) {
   const key = String(section || '').trim()
   if (!RESET_SECTIONS.includes(key)) {
     throw configError(`不支持重置的配置段：${key || '(空)'}（可选：${RESET_SECTIONS.join(' / ')}）`)
@@ -784,12 +787,10 @@ export function resetSection(section, databaseId, projectId = DEFAULT_PROJECT_ID
   } else if (key === 'limits') {
     next.limits = {}
   } else {
-    // queries / params：清空指定项目（缺省默认项目）的对应段
+    // queries / params：清空指定项目（缺省取第一个监测项目）的对应段
+    const pid = requireProject(projectId)
     const projects = { ...(cur.projects || {}) }
-    const existing = projects[projectId] || {
-      id: projectId, name: DEFAULT_PROJECT_NAME, dbSlot: 'db1', createdAt: new Date().toISOString(),
-    }
-    projects[projectId] = { ...existing, [key]: key === 'params' ? [] : null, updatedAt: new Date().toISOString() }
+    projects[pid] = { ...projects[pid], [key]: key === 'params' ? [] : null, updatedAt: new Date().toISOString() }
     next.projects = projects
   }
   persist(next)

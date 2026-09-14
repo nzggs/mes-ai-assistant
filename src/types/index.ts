@@ -222,8 +222,8 @@ export type ApcTrend = 'up' | 'down' | 'stable'
 /** 优化建议紧急度 */
 export type ApcUrgency = 'high' | 'medium' | 'low' | 'none'
 
-/** 数据源模式：hana=实时读取 HANA 只读库；simulated=内置仿真数据 */
-export type ApcSourceMode = 'hana' | 'simulated'
+/** 数据源模式：hana=实时读取 HANA 只读库；unconfigured=未配置数据源（不展示任何数据） */
+export type ApcSourceMode = 'hana' | 'unconfigured'
 
 /** 历史数据点（列值 + 时间戳） */
 export interface ApcSeriesPoint {
@@ -293,13 +293,21 @@ export interface ApcParamItem {
 export interface ApcSourceInfo {
   label: string
   note: string
-  simulated: boolean
+  /** 数据源是否就绪（true=可实时取数；false=未配置，页面按空态引导展示） */
+  ready: boolean
+  /** 未就绪原因：no-project / no-template / no-connection */
+  reason?: string
 }
 
 /** 参数概览响应（GET /api/apc/overview） */
 export interface ApcOverview {
+  project?: string
+  projectName?: string
   station: string
   mode: ApcSourceMode
+  /** 数据源是否就绪；未就绪时 params 为空、页面显示空态引导 */
+  ready: boolean
+  reason?: string
   generatedAt: string
   elapsedMs: number
   windowMinutes: number
@@ -316,6 +324,8 @@ export interface ApcOptimization {
   projectName?: string
   station: string
   mode: ApcSourceMode
+  ready: boolean
+  reason?: string
   generatedAt: string
   windowMinutes: number
   source: ApcSourceInfo
@@ -362,6 +372,9 @@ export interface ApcHanaStatus {
 export interface ApcStatusResponse {
   enabled: boolean
   mode: ApcSourceMode | 'unavailable'
+  /** 数据源是否就绪（项目存在 + 已配 SQL 模板 + 数据库已配连接） */
+  ready: boolean
+  reason?: string
   station: string
   paramCount: number
   /** 当前取数模式：long=窄表 / wide=宽表 / null=未配置 */
@@ -449,7 +462,6 @@ export interface ApcParamConfig {
   column?: string
   /** 该参数的数据取自哪个数据库系统（db1 / db2），缺省 db1 */
   dbSlot?: 'db1' | 'db2'
-  sim?: Record<string, number>
 }
 
 /** 目录元信息 */

@@ -42,9 +42,16 @@ import { ApcRto } from './ApcRto'
 
 const STATION = '消费类聚合物锂离子电池 · 极片与电芯产线'
 const SOURCE = {
-  label: '内置仿真数据源',
-  note: '未检测到可用的 HANA 配置，当前展示内置仿真过程数据。',
-  simulated: true,
+  label: 'SAP HANA（只读 · 窄表取数 · 按参数绑定数据库系统）',
+  note: '实时读取 HANA 中记录的过程数据列值；每个参数项各自绑定使用数据库系统 1 或 2，仅执行 SELECT。',
+  ready: true,
+  reason: '',
+}
+const UNCONFIGURED_SOURCE = {
+  label: '未配置数据源',
+  note: '尚未创建监测项目。请点击「新建项目」，选择数据库系统，并配置取数 SQL 模板与过程参数。',
+  ready: false,
+  reason: 'no-project',
 }
 
 const SERIES = Array.from({ length: 12 }, (_, i) => ({ t: 1_700_000_000_000 + i * 60_000, v: 12.6 + i * 0.01 }))
@@ -126,7 +133,8 @@ const HOLD_ITEM = makeItem({
 
 const OVERVIEW: ApcOverview = {
   station: STATION,
-  mode: 'simulated',
+  mode: 'hana',
+  ready: true,
   generatedAt: '2026-09-11T02:00:00.000Z',
   elapsedMs: 6,
   windowMinutes: 120,
@@ -139,7 +147,8 @@ const OVERVIEW: ApcOverview = {
 
 const OPTIMIZATION: ApcOptimization = {
   station: STATION,
-  mode: 'simulated',
+  mode: 'hana',
+  ready: true,
   generatedAt: '2026-09-11T02:00:00.000Z',
   windowMinutes: 120,
   source: SOURCE,
@@ -149,7 +158,8 @@ const OPTIMIZATION: ApcOptimization = {
 
 const STATUS: ApcStatusResponse = {
   enabled: true,
-  mode: 'simulated',
+  mode: 'hana',
+  ready: true,
   station: STATION,
   paramCount: 2,
   queryMode: 'long',
@@ -219,7 +229,7 @@ const HISTORY: ApcHistoryResponse = {
     min: 11.8,
     max: 13.4,
   },
-  mode: 'simulated',
+  mode: 'hana',
   windowMinutes: 120,
   source: SOURCE,
   stats: { n: 12, mean: 12.66, std: 0.05, min: 12.6, max: 12.71, cpk: 1.2, trend: 'stable', status: 'warning' },
@@ -240,9 +250,39 @@ describe('ApcRto 页面', () => {
     expect(screen.getByText('先进过程控制 · 实时优化')).toBeInTheDocument()
     // 只读安全边界必须在界面上明确展示
     expect(screen.getByText('仅 SELECT · 禁增删改')).toBeInTheDocument()
-    expect(screen.getByText('内置仿真数据源')).toBeInTheDocument()
-    // 仿真源要给出说明，避免被误当成真实数据
-    expect(screen.getByText(/未检测到可用的 HANA 配置/)).toBeInTheDocument()
+    expect(screen.getByText(/SAP HANA（只读/)).toBeInTheDocument()
+  })
+
+  it('未配置数据源时展示空态引导，不展示任何参数、统计与优化建议', async () => {
+    mocks.fetchApcOverview.mockResolvedValue({
+      ...OVERVIEW,
+      mode: 'unconfigured',
+      ready: false,
+      reason: 'no-project',
+      station: '',
+      rowCount: 0,
+      params: [],
+      source: UNCONFIGURED_SOURCE,
+    })
+    mocks.fetchApcOptimization.mockResolvedValue({
+      ...OPTIMIZATION,
+      mode: 'unconfigured',
+      ready: false,
+      reason: 'no-project',
+      station: '',
+      items: [],
+      summary: { total: 0, actionable: 0, high: 0, medium: 0, danger: 0, avgConfidence: 0 },
+      source: UNCONFIGURED_SOURCE,
+    })
+    render(<ApcRto />)
+    // 提示同时出现在数据源状态条与空态引导卡片中
+    expect((await screen.findAllByText(/尚未创建监测项目/)).length).toBeGreaterThan(0)
+    expect(screen.getAllByText('未配置数据源').length).toBeGreaterThan(0)
+    // 空态下不得出现参数卡片、汇总指标与优化条目
+    expect(screen.queryByText('涂布工序')).not.toBeInTheDocument()
+    expect(screen.queryByText('正极涂布面密度')).not.toBeInTheDocument()
+    expect(screen.queryByText('过程参数')).not.toBeInTheDocument()
+    expect(screen.queryByText('平均置信度')).not.toBeInTheDocument()
   })
 
   it('渲染汇总指标与读取统计', async () => {

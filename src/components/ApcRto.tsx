@@ -5,7 +5,8 @@
 //   - 依据数据变化（均值偏移、波动、趋势）优化过程参数设定值，给出建议值；
 //   - 全程只读，不做任何写库操作；数据源与安全边界在后端统一约束。
 //
-// 数据源未配置 HANA 时后端回退到内置仿真数据源，页面会明确标注，仅用于功能验证。
+// 数据源：系统不内置仿真/演示数据源。未创建监测项目、项目未配 SQL 模板、或绑定的
+// 数据库未配置连接时，一律按「未配置数据源」展示空态引导，绝不展示任何推测数据。
 
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import {
@@ -140,7 +141,7 @@ export function ApcRto({ initialProjectId }: { initialProjectId?: string | null 
     }
   }, [windowMinutes, activeProjectId])
 
-  // 配置保存后：重新拉状态（数据源模式可能已从仿真切到真实库）并立即刷新数据
+  // 配置保存后：重新拉状态（数据源就绪与否可能已变化）并立即刷新数据
   const handleConfigSaved = useCallback(() => {
     loadStatus()
     load({ refresh: true })
@@ -360,7 +361,7 @@ export function ApcRto({ initialProjectId }: { initialProjectId?: string | null 
 
             <button
               onClick={handleCopy}
-              disabled={!optimization}
+              disabled={!optimization || !optimization.ready}
               className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border border-mes-border bg-white text-mes-textSecondary hover:border-mes-primary hover:text-mes-primary disabled:opacity-50 transition-colors"
             >
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
@@ -372,7 +373,7 @@ export function ApcRto({ initialProjectId }: { initialProjectId?: string | null 
 
             <button
               onClick={handleExportCsv}
-              disabled={!optimization}
+              disabled={!optimization || !optimization.ready}
               className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border border-mes-border bg-white text-mes-textSecondary hover:border-mes-primary hover:text-mes-primary disabled:opacity-50 transition-colors"
             >
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
@@ -415,7 +416,7 @@ export function ApcRto({ initialProjectId }: { initialProjectId?: string | null 
                     </span>
                   </span>
                 ))}
-                {overview?.mode !== 'hana' && <span className="text-mes-textSecondary">未启用（仿真源）</span>}
+                {overview?.mode !== 'hana' && <span className="text-mes-textSecondary">未配置（不展示数据）</span>}
               </div>
             )}
             {overview && (
@@ -436,18 +437,9 @@ export function ApcRto({ initialProjectId }: { initialProjectId?: string | null 
               </span>
             )}
           </div>
-          {overview?.source?.simulated && (
+          {overview && !overview.ready && (
             <div className="mt-3 pt-3 border-t border-mes-border text-[11px] text-mes-textTertiary leading-relaxed">
-              {overview.source.note}
-              <div className="mt-2 flex flex-wrap items-center gap-2">
-                <button
-                  onClick={() => setEditingId(null)}
-                  className="px-2.5 py-1 rounded-lg text-[11px] font-medium bg-mes-primary text-white hover:bg-mes-primaryHover"
-                >
-                  新建监测项目
-                </button>
-                <span>在项目里选好数据库并配置 SQL 模板后，即可从仿真切换为真实数据。</span>
-              </div>
+              {overview.source?.note}
             </div>
           )}
           {status?.hana?.slots?.some(s => s.lastError) && overview?.mode === 'hana' && (
@@ -468,8 +460,8 @@ export function ApcRto({ initialProjectId }: { initialProjectId?: string | null 
           </div>
         )}
 
-        {/* ===== 汇总指标 ===== */}
-        {summary && (
+        {/* ===== 汇总指标（仅在数据源就绪时展示）===== */}
+        {summary && overview?.ready && (
           <div className="grid grid-cols-2 sm:grid-cols-5 gap-px bg-mes-border rounded-xl overflow-hidden border border-mes-border mb-4">
             <MetricCell label="过程参数" value={String(summary.total)} hint="纳入优化范围" />
             <MetricCell label="需调整" value={String(summary.actionable)} hint="超出工艺死区" tone={summary.actionable > 0 ? 'primary' : 'normal'} />
@@ -483,7 +475,7 @@ export function ApcRto({ initialProjectId }: { initialProjectId?: string | null 
         <div className="flex items-center gap-1 mb-3 border-b border-mes-border">
           <TabButton active={tab === 'overview'} onClick={() => setTab('overview')}>
             实时概览
-            {overview ? <span className="ml-1 text-[11px] text-mes-textTertiary">{overview.params.length}</span> : null}
+            {overview?.ready ? <span className="ml-1 text-[11px] text-mes-textTertiary">{overview.params.length}</span> : null}
           </TabButton>
           <TabButton active={tab === 'optimize'} onClick={() => setTab('optimize')}>
             优化建议
@@ -500,7 +492,43 @@ export function ApcRto({ initialProjectId }: { initialProjectId?: string | null 
           </div>
         )}
 
-        {overview && tab === 'overview' && (
+        {/* ===== 未配置数据源：空态引导（不展示任何曲线、统计与优化建议）===== */}
+        {overview && !overview.ready && (
+          <div className="rounded-xl border border-dashed border-mes-border bg-white px-6 py-12 text-center">
+            <div className="w-12 h-12 mx-auto mb-3 rounded-full bg-mes-tagBg text-mes-tagText flex items-center justify-center">
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
+                <ellipse cx="12" cy="5" rx="9" ry="3" />
+                <path d="M3 5v14c0 1.66 4.03 3 9 3s9-1.34 9-3V5" />
+                <path d="M3 12c0 1.66 4.03 3 9 3s9-1.34 9-3" />
+              </svg>
+            </div>
+            <h3 className="text-sm font-semibold text-mes-text mb-1.5">未配置数据源</h3>
+            <p className="text-xs text-mes-textSecondary leading-relaxed max-w-[600px] mx-auto">
+              {overview.source?.note || '请先新建监测项目，并配置数据库连接与取数 SQL 模板。'}
+            </p>
+            <div className="mt-5 flex flex-wrap items-center justify-center gap-2">
+              <button
+                onClick={() => setEditingId(activeProjectId || null)}
+                className="px-3 py-1.5 rounded-lg text-xs font-medium bg-mes-primary text-white hover:bg-mes-primaryHover transition-colors"
+              >
+                {activeProjectId ? '编辑当前项目' : '新建监测项目'}
+              </button>
+              <button
+                onClick={() => { loadStatus(); load({ refresh: true }) }}
+                disabled={loading}
+                className="px-3 py-1.5 rounded-lg text-xs font-medium border border-mes-border bg-white text-mes-textSecondary hover:border-mes-primary hover:text-mes-primary disabled:opacity-50 transition-colors"
+              >
+                重新检测
+              </button>
+            </div>
+            <p className="mt-3 text-[11px] text-mes-textTertiary">
+              {projects.length === 0 ? '当前还没有任何监测项目' : `当前共 ${projects.length} 个监测项目`}
+              {activeProjectMeta && activeProjectMeta.hasQueries === false ? ' · 该项目尚未配置取数 SQL 模板' : ''}
+            </p>
+          </div>
+        )}
+
+        {overview && overview.ready && tab === 'overview' && (
           <div className="space-y-5">
             {/* 监测项目卡片：创建的项目显示在实时概览，点击切换 */}
             {projects.length > 0 && (
@@ -565,7 +593,7 @@ export function ApcRto({ initialProjectId }: { initialProjectId?: string | null 
           </div>
         )}
 
-        {optimization && tab === 'optimize' && (
+        {optimization && optimization.ready && tab === 'optimize' && (
           <div className="space-y-3">
             {optimization.items.length === 0 && (
               <div className="py-16 text-center text-sm text-mes-textTertiary">窗口内没有可用的过程数据</div>

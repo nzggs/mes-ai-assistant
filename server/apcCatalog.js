@@ -174,7 +174,6 @@ export function normalizeParam(p, index, opts = {}) {
     // 宽表模式下的取值列名；窄表模式留空（由 columns.code 决定分组）
     column: p.column ? assertIdent(p.column, `参数 ${code} 的数据列名`) : '',
     dbSlot,
-    sim: p.sim && typeof p.sim === 'object' ? p.sim : {},
   }
 }
 
