@@ -638,7 +638,7 @@ export default function App() {
       // 防护：截掉 mes-sql 代码块之后的多余输出（复述历史结果 / 编造数据），
       // 避免「查询失败却在报错前列出查询结果」。展示与回灌历史均用截断后的文本。
       const trimmedRound1 = trimAfterMesSqlBlock(answerAccum)
-      const hiddenNote = '\n\n> ⏳ 已提取推荐 SQL。SQL 之后模型多余输出的内容已隐藏，真实结果以下方系统回传为准。'
+      const hiddenNote = '\n\n> ⏳ 已提取到推荐 SQL，查询结果以下方系统回传为准。'
       if (trimmedRound1 !== answerAccum) {
         answerAccum = trimmedRound1
         setConversations(prev => prev.map(c => {
