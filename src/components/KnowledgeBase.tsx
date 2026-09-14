@@ -148,6 +148,9 @@ export function KnowledgeBase({ documents, currentUser, onDocumentsChange, onReq
       onDocumentsChange(prev => prev.map(d => (d.id === doc.id ? { ...d, content: pages, contentOmitted: false } : d)))
       setSelectedDoc(prev => patch(prev))
       setReaderDoc(prev => patch(prev))
+      // 「阅读原文」弹窗同样持有文档对象快照：不在此回填，直接点卡片的「阅读原文」
+      // 会拿到正文被剥离的旧对象，XML 预览区渲染为空（白板）。
+      setOriginalDoc(prev => patch(prev))
     } catch (e) {
       console.warn('超大文档正文按需加载失败:', e)
     } finally {
@@ -157,6 +160,7 @@ export function KnowledgeBase({ documents, currentUser, onDocumentsChange, onReq
 
   useEffect(() => { if (selectedDoc) ensureDocContent(selectedDoc) }, [selectedDoc?.id, ensureDocContent])
   useEffect(() => { if (readerDoc) ensureDocContent(readerDoc) }, [readerDoc?.id, ensureDocContent])
+  useEffect(() => { if (originalDoc) ensureDocContent(originalDoc) }, [originalDoc?.id, ensureDocContent])
 
   // 记录知识库操作日志（上传/删除/审核/总结 的人员与时间），后端共享、静默失败
   const recordLog = useCallback((
@@ -1649,22 +1653,24 @@ function OriginalDocModal({ doc, onClose }: { doc: KnowledgeDoc; onClose: () => 
     const container = previewRef.current
     if (canPdfPreview || !url || !container) return
     let cancelled = false
-    setPreviewLoading(true)
     setPreviewError(null)
 
     const render = async () => {
       try {
-        const res = await fetch(url)
-        if (!res.ok) throw new Error('fetch failed')
-        const blob = await res.blob()
-        if (cancelled) return
-
         if (doc.type === 'xml') {
           // XML 数据导出：以「一条记录一块」的等宽文本展示。
           // 只渲染前 200 条：完整导出常含数千条记录，全量渲染会卡死页面。
+          // 正文通常不随知识库列表下发（超大文档 contentOmitted，由父级按需回填），
+          // 故此处不再下载原文件，只渲染已就绪的正文；未就绪时给出提示，避免整页留白（白板）。
           const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
           const MAX_PREVIEW_RECORDS = 200
-          const shown = doc.content.slice(0, MAX_PREVIEW_RECORDS)
+          const records = Array.isArray(doc.content) ? doc.content : []
+          if (records.length === 0) {
+            container.innerHTML =
+              '<p class="pptx-para" style="color:#9ca3af;text-align:center;padding:32px 12px;">正在加载原文内容……若长时间无响应，请点击右上角「下载原文件」查看。</p>'
+            return
+          }
+          const shown = records.slice(0, MAX_PREVIEW_RECORDS)
           const inner = shown
             .map(
               p =>
@@ -1676,11 +1682,20 @@ function OriginalDocModal({ doc, onClose }: { doc: KnowledgeDoc; onClose: () => 
             )
             .join('')
           const more =
-            doc.content.length > MAX_PREVIEW_RECORDS
-              ? `<p class="pptx-para">…… 仅预览前 ${MAX_PREVIEW_RECORDS} 条，共 ${doc.content.length} 条记录。完整内容请在问答中检索，或下载原文件查看。</p>`
+            records.length > MAX_PREVIEW_RECORDS
+              ? `<p class="pptx-para">…… 仅预览前 ${MAX_PREVIEW_RECORDS} 条，共 ${records.length} 条记录。完整内容请在问答中检索，或下载原文件查看。</p>`
               : ''
           container.innerHTML = inner + more
-        } else if (doc.type === 'word') {
+          return
+        }
+
+        setPreviewLoading(true)
+        const res = await fetch(url)
+        if (!res.ok) throw new Error('fetch failed')
+        const blob = await res.blob()
+        if (cancelled) return
+
+        if (doc.type === 'word') {
           // Word：docx-preview 渲染原始排版
           await renderDocx(blob, container, undefined, {
             inWrapper: false,

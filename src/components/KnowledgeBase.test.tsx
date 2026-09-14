@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
-import { render, screen, fireEvent } from '@testing-library/react'
+import { render, screen, fireEvent, waitFor } from '@testing-library/react'
 import { KnowledgeBase } from './KnowledgeBase'
+import { fetchAllDocPages } from '../services/docStore'
 import type { KnowledgeDoc } from '../types'
 
 vi.mock('docx-preview', () => ({
@@ -17,6 +18,7 @@ vi.mock('../services/docStore', async (importOriginal) => {
     removeDoc: vi.fn(() => Promise.resolve()),
     saveTableSummary: vi.fn(() => Promise.resolve({ tableSummaries: {} })),
     appendDocLog: vi.fn(() => Promise.resolve()),
+    fetchAllDocPages: vi.fn(() => Promise.resolve([])),
   }
 })
 
@@ -105,5 +107,31 @@ describe('KnowledgeBase', () => {
     // 无 API Key 时走既有的「请先配置 API Key」分支，不应出现 XML 提示
     expect(screen.getByText(/请先在设置中配置 API Key/)).toBeInTheDocument()
     expect(screen.queryByText(/无需进行 AI 总结/)).not.toBeInTheDocument()
+  })
+
+  // 回归：超大 XML 的正文不随列表下发（contentOmitted）。此前只有 selectedDoc / readerDoc
+  // 会触发按需补全，直接点列表卡片右上角「阅读原文」拿到的是正文被剥离的快照 →
+  // 弹窗渲染为空（白板）。此用例锁定「originalDoc 也必须补全」。
+  it('超大 XML 文档：直接点卡片「阅读原文」会按需补全正文，不再白板', async () => {
+    vi.mocked(fetchAllDocPages).mockResolvedValueOnce([
+      { pageNum: 1, title: 'Z_WIDGET · 部件主数据', paragraphs: ['对象编号：Z_WIDGET', '描述：测试记录'] },
+    ] as any)
+
+    const xmlDoc: KnowledgeDoc = {
+      id: 'x2', name: 'Z_WIDGET_202609101235.xml', type: 'xml', status: 'approved',
+      summary: '', keywords: [], content: [], chunks: 0, pages: 1265,
+      fileUrl: 'blob:fake-original.xml', contentOmitted: true, pageCount: 1265,
+      tableSummaries: {}, summaryChunks: [],
+      uploadDate: '2026-09-10', approvedDate: '2026-09-10', uploader: 'admin',
+    } as any
+    renderKB([xmlDoc], { username: 'admin', displayName: '管理员', department: 'IT部', role: 'admin' })
+
+    // 不打开详情弹窗，直接点列表卡片上的「阅读原文」
+    fireEvent.click(screen.getByText('阅读原文'))
+
+    expect(vi.mocked(fetchAllDocPages)).toHaveBeenCalledWith('x2')
+    await waitFor(() => {
+      expect(document.body.textContent).toContain('第 1 条 · Z_WIDGET · 部件主数据')
+    })
   })
 })
