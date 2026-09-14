@@ -19,6 +19,7 @@ interface SidebarProps {
   onLogout: () => void
   onRequestChangePassword: () => void
   onOpenApiSettings: () => void
+  onOpenMemories?: () => void
 }
 
 export function Sidebar({
@@ -37,6 +38,7 @@ export function Sidebar({
   onLogout,
   onRequestChangePassword,
   onOpenApiSettings,
+  onOpenMemories,
 }: SidebarProps) {
   const [searchTerm, setSearchTerm] = useState('')
 
@@ -225,7 +227,7 @@ export function Sidebar({
       {/* 底部用户信息 */}
       <div className="border-t border-mes-border p-3">
         {user ? (
-          <UserMenu user={user} onLogout={onLogout} onRequestChangePassword={onRequestChangePassword} onOpenApiSettings={onOpenApiSettings} />
+          <UserMenu user={user} onLogout={onLogout} onRequestChangePassword={onRequestChangePassword} onOpenApiSettings={onOpenApiSettings} onOpenMemories={onOpenMemories} />
         ) : (
           <button
             onClick={onOpenAuth}
@@ -327,7 +329,7 @@ function ConversationItem({
   )
 }
 
-function UserMenu({ user, onLogout, onRequestChangePassword, onOpenApiSettings }: { user: User; onLogout: () => void; onRequestChangePassword: () => void; onOpenApiSettings: () => void }) {
+function UserMenu({ user, onLogout, onRequestChangePassword, onOpenApiSettings, onOpenMemories }: { user: User; onLogout: () => void; onRequestChangePassword: () => void; onOpenApiSettings: () => void; onOpenMemories?: () => void }) {
   const [showMenu, setShowMenu] = useState(false)
   const [showInfo, setShowInfo] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
@@ -472,6 +474,18 @@ function UserMenu({ user, onLogout, onRequestChangePassword, onOpenApiSettings }
           <div className="bg-white rounded-2xl shadow-xl w-[360px] max-w-[92vw] p-6" onClick={e => e.stopPropagation()}>
             <h3 className="text-base font-semibold text-mes-text mb-4">设置</h3>
             <div className="space-y-2">
+              <button
+                onClick={() => { setShowSettings(false); onOpenMemories?.() }}
+                className="w-full flex items-center justify-between px-3 py-3 rounded-lg border border-mes-border hover:bg-gray-50 transition-colors text-left"
+              >
+                <span>
+                  <span className="block text-sm font-medium text-mes-text">记忆管理</span>
+                  <span className="block text-xs text-mes-textTertiary">管理你的使用偏好，问答时自动遵守</span>
+                </span>
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="text-mes-textTertiary shrink-0">
+                  <polyline points="9 18 15 12 9 6" />
+                </svg>
+              </button>
               <button
                 onClick={() => { setShowSettings(false); onOpenApiSettings() }}
                 className="w-full flex items-center justify-between px-3 py-3 rounded-lg border border-mes-border hover:bg-gray-50 transition-colors text-left"

@@ -25,6 +25,7 @@ import {
   listProjects, getProject, createProject, updateProject, deleteProject,
 } from './apcConfig.js'
 import { registerDocIndexRoutes } from './docIndexRoute.js'
+import { listMemories, addMemory, updateMemory, deleteMemory, MEMORY_LIMITS } from './memoryStore.js'
 
 // 优先加载项目根目录 .env，再用 server/.env 覆盖（server/.env 为后端配置真相源）。
 dotenv.config()
@@ -570,6 +571,66 @@ app.post('/api/doc-logs', async (req, res) => {
     res.json({ ok: true, log: entry })
   } catch (err) {
     return internalError(res, err)
+  }
+})
+
+// ===== 用户记忆（个性化偏好，如"生成的 SQL 列名注释要加双引号"） =====
+// 按登录用户归属（前端会话携带 username），内容为非敏感偏好文本；
+// 服务端硬限制：单条 ≤500 字、每人 ≤50 条，另加每 IP 限流防刷。
+const MEMORY_RATE_LIMIT = Number(process.env.MEMORY_RATE_LIMIT || 60)
+const memRateMap = new Map() // ip -> { count, resetAt }
+function memoryRateLimit(req, res, next) {
+  const ip = (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.socket.remoteAddress || 'unknown'
+  const now = Date.now()
+  let entry = memRateMap.get(ip)
+  if (!entry || entry.resetAt <= now) {
+    entry = { count: 0, resetAt: now + 60 * 1000 }
+    memRateMap.set(ip, entry)
+  }
+  entry.count++
+  if (entry.count > MEMORY_RATE_LIMIT) {
+    return res.status(429).json({ error: '记忆操作过于频繁，请稍后再试' })
+  }
+  next()
+}
+setInterval(() => {
+  const now = Date.now()
+  for (const [ip, e] of memRateMap) {
+    if (e.resetAt <= now) memRateMap.delete(ip)
+  }
+}, 5 * 60 * 1000).unref()
+
+app.get('/api/memories', memoryRateLimit, (req, res) => {
+  try {
+    res.json({ ok: true, memories: listMemories(String(req.query.username || '')), limits: MEMORY_LIMITS })
+  } catch (err) {
+    return fail(res, err)
+  }
+})
+app.post('/api/memories', memoryRateLimit, async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {}
+    const memories = await addMemory(body.username, body.content)
+    res.json({ ok: true, memories })
+  } catch (err) {
+    return fail(res, err)
+  }
+})
+app.put('/api/memories/:id', memoryRateLimit, async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {}
+    const memories = await updateMemory(body.username, req.params.id, body.content)
+    res.json({ ok: true, memories })
+  } catch (err) {
+    return fail(res, err)
+  }
+})
+app.delete('/api/memories/:id', memoryRateLimit, async (req, res) => {
+  try {
+    const memories = await deleteMemory(String(req.query.username || ''), req.params.id)
+    res.json({ ok: true, memories })
+  } catch (err) {
+    return fail(res, err)
   }
 })
 

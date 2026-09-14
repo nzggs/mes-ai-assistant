@@ -9,6 +9,8 @@ import { AuthModal, getSession, clearSession, type User } from './components/Aut
 import { UserManagement } from './components/UserManagement'
 import { DatabaseManage } from './components/DatabaseManage'
 import { ChangePasswordModal } from './components/ChangePasswordModal'
+import { MemoryManage } from './components/MemoryManage'
+import { fetchUserMemories, buildMemoryContext, type UserMemory } from './services/memoryApi'
 import ErrorToasts from './components/ErrorToasts'
 import { generateResponse, initialConversations, presetQuestions } from './data/mockData'
 import { streamChat, hasApiKey, getProvider, getReasoningModelId, resolveModelId, summarizeHistory, type ChatMessageDto } from './services/llmApi'
@@ -94,8 +96,27 @@ export default function App() {
   const [sidebarOpen, setSidebarOpen] = useState(true)
   const [apiKeyReady, setApiKeyReady] = useState(hasApiKey())
   const [showApiKeyModal, setShowApiKeyModal] = useState(false)
+  // 记忆管理（个性化偏好）：弹窗开关 + 当前用户记忆（问答注入用 ref 保证发送回调读到最新）
+  const [showMemoryManage, setShowMemoryManage] = useState(false)
   const [apiKeyModalForce, setApiKeyModalForce] = useState(false)
   const [user, setUser] = useState<User | null>(getSession())
+  const [userMemories, setUserMemories] = useState<UserMemory[]>([])
+  const userMemoriesRef = useRef<UserMemory[]>([])
+  useEffect(() => { userMemoriesRef.current = userMemories }, [userMemories])
+  // 登录用户变化时拉取该用户的记忆（未登录/后端不可达时静默置空）
+  useEffect(() => {
+    const uname = user?.username
+    if (!uname) {
+      setUserMemories([])
+      userMemoriesRef.current = []
+      return
+    }
+    let cancelled = false
+    fetchUserMemories(uname)
+      .then(r => { if (!cancelled) setUserMemories(r.memories || []) })
+      .catch(() => { if (!cancelled) setUserMemories([]) })
+    return () => { cancelled = true }
+  }, [user?.username])
   const [showAuthModal, setShowAuthModal] = useState(false)
   const [showChangePassword, setShowChangePassword] = useState(false)
   const [forceChangePassword, setForceChangePassword] = useState(false)
@@ -450,6 +471,10 @@ export default function App() {
       : ''
     finalKnowledgeContext += kbMissHint
 
+    // 用户记忆（个性化偏好）：无论知识库开关，始终注入当前用户的长期偏好，
+    // 使生成内容（尤其是 MES 直查 SQL 的列名注释/别名写法）符合个人习惯
+    finalKnowledgeContext += buildMemoryContext(userMemoriesRef.current)
+
     // MES 数据直查指引：问答栏选择了数据库1/数据库2 时，注入推荐 SQL 模板与硬性要求，
     // 允许模型输出一个 ```mes-sql 推荐查询，由系统按只读护栏执行后再回灌真实数据
     const mesActive = mesSource === 'db1' || mesSource === 'db2'
@@ -791,6 +816,7 @@ export default function App() {
         onLogout={handleLogout}
         onRequestChangePassword={() => { setForceChangePassword(false); setShowChangePassword(true) }}
         onOpenApiSettings={() => openApiKeyModal(false)}
+        onOpenMemories={() => setShowMemoryManage(true)}
       />
 
       {/* 主内容区域 */}
@@ -930,6 +956,15 @@ export default function App() {
           force={forceChangePassword}
           onClose={() => { if (!forceChangePassword) setShowChangePassword(false) }}
           onChanged={handlePasswordChanged}
+        />
+      )}
+
+      {/* 记忆管理（个性化偏好，仅当前登录用户自己的记忆） */}
+      {showMemoryManage && user && (
+        <MemoryManage
+          username={user.username}
+          onClose={() => setShowMemoryManage(false)}
+          onChanged={list => setUserMemories(list)}
         />
       )}
 
