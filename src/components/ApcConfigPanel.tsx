@@ -216,8 +216,29 @@ export function ApcConfigPanel({ projectId, onClose, onSaved }: {
   }, [projectId, onSaved])
 
   const handleReset = useCallback(async (section: ApcConfigSection) => {
-    setSaving(true)
     setNotice(null)
+    // 新建项目（尚未保存，projectId 为空）时只重置本地草稿：
+    // 服务端的 reset 在缺省 projectId 时会解析到「第一个监测项目」，
+    // 直接调用会误清已保存项目的 SQL 模板 / 参数，这里必须拦住。
+    if (isNew) {
+      if (section === 'queries') {
+        setQDraft({ mode: 'long', history: '', columns: {} })
+        setQDirty(true)
+        setPreview(null)
+        setPreviewErr('')
+      } else if (section === 'params') {
+        setPDraft([])
+        setPDirty(true)
+        setSelected(0)
+        setJsonText('[]')
+        setJsonErr('')
+      } else {
+        return
+      }
+      setNotice({ kind: 'ok', text: `已清空：${TABS.find(t => t.key === section)?.label || section}` })
+      return
+    }
+    setSaving(true)
     try {
       await resetApcConfig(section, undefined, projectId || undefined)
       await load()
@@ -228,7 +249,7 @@ export function ApcConfigPanel({ projectId, onClose, onSaved }: {
     } finally {
       setSaving(false)
     }
-  }, [projectId, load, onSaved])
+  }, [isNew, projectId, load, onSaved])
 
   const handlePreview = useCallback(async () => {
     setPreviewing(true)

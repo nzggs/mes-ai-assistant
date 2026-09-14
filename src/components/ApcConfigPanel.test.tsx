@@ -368,3 +368,34 @@ describe('ApcConfigPanel · 参数配置', () => {
     expect(patch.params[1].name).toBe('辊压辊缝（JSON）')
   })
 })
+
+describe('ApcConfigPanel · 重置的归属项目', () => {
+  it('编辑模式：重置带上当前项目 id，不会落到别的项目上', async () => {
+    mocks.resetApcConfig.mockResolvedValue({ ok: true, section: 'params', config: makeConfig() })
+    renderEditor('p1')
+    await screen.findByDisplayValue('注液量监测')
+    fireEvent.click(screen.getByRole('button', { name: '参数配置' }))
+    fireEvent.click(screen.getByRole('button', { name: '清空参数' }))
+
+    await waitFor(() => expect(mocks.resetApcConfig).toHaveBeenCalledTimes(1))
+    expect(mocks.resetApcConfig.mock.calls[0]).toEqual(['params', undefined, 'p1'])
+  })
+
+  it('新建模式：重置只清本地草稿，绝不调用服务端 reset（否则会误清第一个项目）', async () => {
+    renderEditor(null)
+    await screen.findByText('新建监测项目')
+
+    fireEvent.click(screen.getByRole('button', { name: '参数配置' }))
+    fireEvent.click(screen.getByRole('button', { name: '清空参数' }))
+    expect(await screen.findByText(/已清空：参数配置/)).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: 'SQL 模板' }))
+    fireEvent.click(screen.getByRole('button', { name: '恢复默认模板' }))
+    expect(await screen.findByText(/已清空：SQL 模板/)).toBeInTheDocument()
+
+    // 关键断言：项目还没保存，任何一次重置都不能打到服务端
+    expect(mocks.resetApcConfig).not.toHaveBeenCalled()
+    // 也仍然没有隐式创建项目
+    expect(mocks.createApcProject).not.toHaveBeenCalled()
+  })
+})
