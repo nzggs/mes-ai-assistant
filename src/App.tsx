@@ -885,6 +885,9 @@ export default function App() {
               onToggleKnowledgeBase={() => setUseKnowledgeBase(!useKnowledgeBase)}
               deepThink={deepThink}
               onToggleDeepThink={() => setDeepThink(d => !d)}
+              mesSource={mesSource}
+              mesSlots={mesSlots}
+              onMesSourceChange={handleMesSourceChange}
             />
           ) : (
             <ChatArea

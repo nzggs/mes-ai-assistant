@@ -1,5 +1,5 @@
 import type { PresetQuestion } from '../types'
-import { ChatInput } from './ChatInput'
+import { ChatInput, type MesSource, type MesSlotInfo } from './ChatInput'
 
 interface WelcomeScreenProps {
   presetQuestions: PresetQuestion[]
@@ -8,6 +8,10 @@ interface WelcomeScreenProps {
   onToggleKnowledgeBase: () => void
   deepThink: boolean
   onToggleDeepThink: () => void
+  /** 问答环节的数据源选择：关闭 / 数据库系统1 / 数据库系统2（与 ChatArea 保持一致） */
+  mesSource?: MesSource
+  mesSlots?: MesSlotInfo[]
+  onMesSourceChange?: (s: MesSource) => void
 }
 
 export function WelcomeScreen({
@@ -17,6 +21,9 @@ export function WelcomeScreen({
   onToggleKnowledgeBase,
   deepThink,
   onToggleDeepThink,
+  mesSource = 'off',
+  mesSlots = [],
+  onMesSourceChange,
 }: WelcomeScreenProps) {
   return (
     <div className="h-full flex flex-col items-center justify-center px-4 overflow-y-auto">
@@ -72,6 +79,9 @@ export function WelcomeScreen({
             onToggleKnowledgeBase={onToggleKnowledgeBase}
             deepThink={deepThink}
             onToggleDeepThink={onToggleDeepThink}
+            mesSource={mesSource}
+            mesSlots={mesSlots}
+            onMesSourceChange={onMesSourceChange}
           />
         </div>
 
