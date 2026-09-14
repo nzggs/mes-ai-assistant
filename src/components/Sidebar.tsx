@@ -498,25 +498,10 @@ function UserMenu({ user, onLogout, onRequestChangePassword, onOpenApiSettings, 
                   <polyline points="9 18 15 12 9 6" />
                 </svg>
               </button>
-              <button
-                onClick={() => { setShowSettings(false); setShowInfo(true) }}
-                className="w-full flex items-center justify-between px-3 py-3 rounded-lg border border-mes-border hover:bg-gray-50 transition-colors text-left"
-              >
-                <span>
-                  <span className="block text-sm font-medium text-mes-text">账户信息</span>
-                  <span className="block text-xs text-mes-textTertiary">查看当前登录用户的资料</span>
-                </span>
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className="text-mes-textTertiary shrink-0">
-                  <polyline points="9 18 15 12 9 6" />
-                </svg>
-              </button>
-            </div>
-            <div className="mt-4 p-3 rounded-lg bg-gray-50 text-xs text-mes-textTertiary leading-relaxed">
-              提示：API Key 仅保存在本机浏览器，不会上传服务器。修改密码、退出登录请在上方菜单操作。
             </div>
             <button
               onClick={() => setShowSettings(false)}
-              className="mt-5 w-full py-2 rounded-lg bg-mes-primary text-white text-sm font-medium hover:opacity-90 transition-opacity"
+              className="mt-4 w-full py-2 rounded-lg bg-mes-primary text-white text-sm font-medium hover:opacity-90 transition-opacity"
             >
               关闭
             </button>
