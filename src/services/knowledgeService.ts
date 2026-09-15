@@ -743,6 +743,96 @@ async function extractOfficeText(doc: KnowledgeDoc): Promise<ExtractResult> {
   }
 }
 
+// ===== 纯文本文件（.txt）解析 =====
+
+/** 纯文本单页字符上限：超出则在行边界切分为多页，避免一页渲染几万行把浏览器卡死 */
+const TXT_PAGE_CHARS = 4000
+
+/**
+ * 解码纯文本文件字节。
+ * 与 Office 内部 XML 同理：先看 BOM，再严格按 UTF-8 试解（失败即说明不是 UTF-8），
+ * 最后回退 GBK。现场导出的 .txt（日志、工艺说明、老系统导出）常见 GBK/GB2312，
+ * 直接按 UTF-8 解码会整篇乱码，而乱码文本进库后会污染检索与总结。
+ */
+export function decodePlainText(bytes: Uint8Array): string {
+  if (bytes.length >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) {
+    return decodeText(bytes.subarray(3), 'utf-8') // 带 BOM 的 UTF-8
+  }
+  if (bytes.length >= 2 && bytes[0] === 0xff && bytes[1] === 0xfe) {
+    return decodeText(bytes.subarray(2), 'utf-16le')
+  }
+  if (bytes.length >= 2 && bytes[0] === 0xfe && bytes[1] === 0xff) {
+    return decodeText(bytes.subarray(2), 'utf-16be')
+  }
+  return tryUtf8WithGbkFallback(bytes)
+}
+
+/**
+ * 把纯文本按行分块为可翻页的 DocPage（供「阅读原文」翻页、按页检索与整篇总结使用）。
+ * 切分规则：优先在空行（自然段边界）处收口，其次在行边界收口，绝不把一行从中间劈开；
+ * 遇到超长单行（如老系统导出的整条 SQL/长 JSON）才按字符数硬切，避免整篇只剩一页。
+ * 页标题沿用 Office 系列的「文件名 - 第N段」写法，保证阅读器/详情页展示一致。
+ */
+export function splitPlainTextPages(fileName: string, text: string, pageChars = TXT_PAGE_CHARS): DocPage[] {
+  const normalized = text.replace(/\r\n?/g, '\n')
+  const pages: DocPage[] = []
+  let buf: string[] = []
+  let size = 0
+
+  const pushPage = (body: string) => {
+    if (!body.trim()) return // 全空白页不入库（空文件/仅空行 → 0 页，由调用方报错）
+    pages.push({
+      pageNum: pages.length + 1,
+      title: `${fileName} - 第${pages.length + 1}段`,
+      paragraphs: [body],
+    })
+  }
+  const flush = () => {
+    const body = buf.join('\n').replace(/^\n+|\n+$/g, '')
+    buf = []
+    size = 0
+    pushPage(body)
+  }
+
+  for (const line of normalized.split('\n')) {
+    // 超长单行：先收口当前页，再按字符数硬切成若干满页
+    if (line.length > pageChars) {
+      flush()
+      for (let i = 0; i < line.length; i += pageChars) {
+        pushPage(line.slice(i, i + pageChars))
+      }
+      continue
+    }
+    // 空行视为自然段边界：已攒够半页就收口，让翻页落在语义边界上
+    if (line.trim() === '' && size >= pageChars / 2) {
+      flush()
+      continue
+    }
+    // 加入本行会超出单页上限 → 先收口，保证任何一页都不越界
+    if (buf.length > 0 && size + line.length + 1 > pageChars) flush()
+    buf.push(line)
+    size += line.length + 1
+  }
+  flush()
+  return pages
+}
+
+/**
+ * 解析 .txt 纯文本文件：按 BOM/UTF-8/GBK 解码后分页。
+ * 纯文本无需额外解析依赖，解码即可入库；分页仅为阅读与切片粒度服务。
+ */
+async function extractTxtText(doc: KnowledgeDoc): Promise<ExtractResult> {
+  const url = doc.fileUrl || doc.pdfUrl
+  if (!url) throw new Error('文件 URL 不存在')
+  const res = await fetch(url)
+  if (!res.ok) throw new Error(`读取文件失败: HTTP ${res.status}`)
+  const bytes = new Uint8Array(await res.arrayBuffer())
+  const text = decodePlainText(bytes)
+  const pages = splitPlainTextPages(doc.name, text)
+  if (pages.length === 0) throw new Error('文件内容为空或全为空白字符')
+  return { text, pages }
+}
+
 // ===== XML 数据导出解析 =====
 
 /**
@@ -1645,6 +1735,16 @@ export function isQuotaLikeError(msg: string | undefined): boolean {
   return /quota|rate.?limit|too many requests|429|使用量过大|使用量|额度|余额|稍后再试|请求过于频繁|频率|超限|rate.limit|exceeded/.test(m)
 }
 
+/**
+ * 解析失败时给用户的下一步建议（按文件类型区分）。
+ * 纯文本（.txt）不适用"另存为 .docx/.xlsx/.pptx"这句提示，需单独给出编码/空文件方向的引导。
+ */
+function parseFailHint(doc: KnowledgeDoc): string {
+  if (doc.type === 'pdf') return '请检查文件是否损坏。'
+  if (doc.type === 'txt') return '请确认文件为非空的纯文本（UTF-8 或 GBK 编码），然后重新上传。'
+  return '旧版二进制格式(.doc/.xls/.ppt)支持有限，建议另存为 .docx/.xlsx/.pptx 格式后重新上传。'
+}
+
 export async function processUploadedDoc(
   doc: KnowledgeDoc,
   onUpdate: (updates: Partial<KnowledgeDoc>) => void
@@ -1666,6 +1766,11 @@ export async function processUploadedDoc(
       xmlMeta = await extractXmlText(doc)
       textContent = xmlMeta.text
       extractedPages = xmlMeta.pages
+    } else if (doc.type === 'txt' && (doc.fileUrl || doc.pdfUrl)) {
+      // 纯文本文件（.txt）：按 BOM/UTF-8/GBK 解码后分页，再走与 Office 相同的 AI 归纳
+      const result = await extractTxtText(doc)
+      textContent = result.text
+      extractedPages = result.pages
     } else if ((doc.type === 'word' || doc.type === 'ppt' || doc.type === 'excel') && (doc.fileUrl || doc.pdfUrl)) {
       // Office 文件（Word/Excel/PPT）：使用 JSZip 提取文本
       const result = await extractOfficeText(doc)
@@ -1744,7 +1849,7 @@ export async function processUploadedDoc(
       )
       const needPlaceholder = !doc.content || doc.content.length === 0 || isStub
       onUpdate({
-        summary: `文档上传成功，但解析失败: ${errMsg}。${doc.type !== 'pdf' ? '建议另存为 .docx/.xlsx/.pptx 格式后重新上传。' : ''}`,
+        summary: `文档上传成功，但解析失败: ${errMsg}。${doc.type === 'pdf' ? '' : parseFailHint(doc)}`,
         aiExtracted: false,
         ...(needPlaceholder ? {
           content: [{
@@ -1752,7 +1857,7 @@ export async function processUploadedDoc(
             title: doc.name,
             paragraphs: [
               `文档解析失败: ${errMsg}`,
-              doc.type !== 'pdf' ? '旧版二进制格式(.doc/.xls/.ppt)支持有限，建议另存为 .docx/.xlsx/.pptx 格式后重新上传。' : '请检查文件是否损坏。',
+              doc.type !== 'pdf' ? parseFailHint(doc) : '请检查文件是否损坏。',
             ],
           }],
           pages: 1,
@@ -1814,6 +1919,10 @@ export async function reextractDocMetadata(
         if (doc.type === 'pdf' && doc.pdfUrl) {
           fresh = await extractPdfText(doc.pdfUrl)
           pages = buildPagesFromText(fresh)
+        } else if (doc.type === 'txt' && (doc.fileUrl || doc.pdfUrl)) {
+          const result = await extractTxtText(doc)
+          fresh = result.text
+          pages = result.pages
         } else if ((doc.type === 'word' || doc.type === 'ppt' || doc.type === 'excel') && (doc.fileUrl || doc.pdfUrl)) {
           const result = await extractOfficeText(doc)
           fresh = result.text

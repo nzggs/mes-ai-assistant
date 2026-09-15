@@ -134,4 +134,29 @@ describe('KnowledgeBase', () => {
       expect(document.body.textContent).toContain('第 1 条 · Z_WIDGET · 部件主数据')
     })
   })
+
+  // .txt 纯文本：解析入库后应与其它格式同等可用——列表带 TXT 标签、可打开原文、可总结
+  it('.txt 纯文本：列表显示 TXT 标签，点「阅读原文」直接渲染已解码正文', async () => {
+    const txtDoc: KnowledgeDoc = {
+      id: 't1', name: '注液工艺说明.txt', type: 'txt', fileType: 'txt', status: 'approved',
+      summary: '注液工序参数说明', keywords: ['注液'], content: [
+        { pageNum: 1, title: '注液工艺说明.txt - 第1段', paragraphs: ['注液量控制在 3.2±0.1 g。'] },
+        { pageNum: 2, title: '注液工艺说明.txt - 第2段', paragraphs: ['静置时间不少于 12 小时。'] },
+      ],
+      chunks: 3, pages: 2, size: '1.2 KB', fileUrl: 'blob:fake-original.txt',
+      tableSummaries: {}, summaryChunks: [],
+      uploadDate: '2026-09-15', approvedDate: '2026-09-15', uploader: 'admin',
+    } as any
+    renderKB([txtDoc], { username: 'admin', displayName: '管理员', department: 'IT部', role: 'admin' })
+
+    expect(screen.getByText('TXT')).toBeInTheDocument()
+    expect(screen.getByText('注液工艺说明.txt')).toBeInTheDocument()
+
+    // 直接点卡片右上角「阅读原文」→ 原文弹窗渲染已入库的正文（无需再下载原文件）
+    fireEvent.click(screen.getByText('阅读原文'))
+    await waitFor(() => {
+      expect(document.body.textContent).toContain('注液量控制在 3.2±0.1 g。')
+    })
+    expect(document.body.textContent).toContain('注液工艺说明.txt - 第2段')
+  })
 })

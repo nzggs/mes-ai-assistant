@@ -525,7 +525,8 @@ export function restoreDocsFromRecords(records: StoredDocRecord[]): KnowledgeDoc
         summary: typeof raw.summary === 'string' ? raw.summary : '',
         keywords: Array.isArray(raw.keywords) ? raw.keywords : [],
         content: Array.isArray(raw.content) ? raw.content : [],
-        type: (['word', 'ppt', 'excel', 'pdf', 'xml'].includes(raw.type as string) ? raw.type : 'pdf') as KnowledgeDoc['type'],
+        // txt（纯文本文件）与其它类型同级：缺失/未知类型一律回落 pdf，避免脏数据导致渲染崩溃
+        type: (['word', 'ppt', 'excel', 'pdf', 'xml', 'txt'].includes(raw.type as string) ? raw.type : 'pdf') as KnowledgeDoc['type'],
         status: (['pending', 'approved', 'rejected'].includes(raw.status as string) ? raw.status : 'pending') as KnowledgeDoc['status'],
       }
       if (r.blob) {

@@ -16,6 +16,7 @@ const docTypeConfig = {
   excel: { label: 'Excel', icon: '📈', color: '#16a34a', bg: '#f0fdf4' },
   pdf: { label: 'PDF', icon: '📕', color: '#dc2626', bg: '#fef2f2' },
   xml: { label: 'XML', icon: '🗂️', color: '#7c3aed', bg: '#f5f3ff' },
+  txt: { label: 'TXT', icon: '📝', color: '#0d9488', bg: '#f0fdfa' },
 }
 
 const statusConfig = {
@@ -32,13 +33,15 @@ const XML_NO_SUMMARY_HINT =
   'XML 数据导出为逐条结构化记录，检索已由服务端索引直接命中，无需进行 AI 总结。如需查找某个对象，直接在问答中输入对象编号或功能描述即可（例如「PM1CEMD029」或「转序时间设置」）。'
 
 // 根据文件扩展名判断类型
-function getFileType(filename: string): 'word' | 'ppt' | 'excel' | 'pdf' | 'xml' | null {
+function getFileType(filename: string): 'word' | 'ppt' | 'excel' | 'pdf' | 'xml' | 'txt' | null {
   const ext = filename.toLowerCase().split('.').pop()
   if (ext === 'doc' || ext === 'docx') return 'word'
   if (ext === 'ppt' || ext === 'pptx') return 'ppt'
   if (ext === 'xls' || ext === 'xlsx') return 'excel'
   if (ext === 'pdf') return 'pdf'
   if (ext === 'xml') return 'xml'
+  // 纯文本文件（编码 UTF-8/GBK 自适应，见 knowledgeService.decodePlainText）
+  if (ext === 'txt') return 'txt'
   return null
 }
 
@@ -432,7 +435,7 @@ export function KnowledgeBase({ documents, currentUser, onDocumentsChange, onReq
       const fileUrl = fileType !== 'pdf' ? objectUrl : undefined
 
       // 获取详细扩展名
-      const ext = file.name.toLowerCase().split('.').pop() as 'docx' | 'doc' | 'pptx' | 'ppt' | 'xlsx' | 'xls' | 'pdf' | 'xml'
+      const ext = file.name.toLowerCase().split('.').pop() as 'docx' | 'doc' | 'pptx' | 'ppt' | 'xlsx' | 'xls' | 'pdf' | 'xml' | 'txt'
 
       // 创建文档初始内容（解析前占位）
       const emptyPages: DocPage[] = fileType !== 'pdf' ? [{
@@ -736,7 +739,7 @@ export function KnowledgeBase({ documents, currentUser, onDocumentsChange, onReq
               ref={fileInputRef}
               type="file"
               multiple
-              accept=".doc,.docx,.ppt,.pptx,.xls,.xlsx,.pdf,.xml"
+              accept=".doc,.docx,.ppt,.pptx,.xls,.xlsx,.pdf,.xml,.txt"
               onChange={handleFileInputChange}
               className="hidden"
             />
@@ -788,6 +791,7 @@ export function KnowledgeBase({ documents, currentUser, onDocumentsChange, onReq
                   <span className="text-xs px-2 py-0.5 rounded bg-green-50 text-green-600 font-medium">📈 Excel (.xlsx)</span>
                   <span className="text-xs px-2 py-0.5 rounded bg-red-50 text-red-600 font-medium">📕 PDF (.pdf)</span>
                   <span className="text-xs px-2 py-0.5 rounded bg-cyan-50 text-cyan-600 font-medium">🗄️ XML (.xml)</span>
+                  <span className="text-xs px-2 py-0.5 rounded bg-teal-50 text-teal-600 font-medium">📝 文本 (.txt)</span>
                 </div>
                 <div className="flex items-center gap-2">
                   <button
@@ -1691,6 +1695,39 @@ function OriginalDocModal({ doc, onClose }: { doc: KnowledgeDoc; onClose: () => 
           return
         }
 
+        if (doc.type === 'txt') {
+          // 纯文本文件：等宽字体展示已解码正文（编码已在入库时按 BOM/UTF-8/GBK 归一，
+          // 因此这里直接渲染解析结果即可，不会出现乱码）。长 txt 已按行分页，逐段展示。
+          const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+          const pages = Array.isArray(doc.content) ? doc.content : []
+          if (pages.length === 0) {
+            container.innerHTML = doc.contentOmitted
+              ? '<p class="pptx-para" style="color:#9ca3af;text-align:center;padding:32px 12px;">正在加载原文内容……若长时间无响应，请点击右上角「下载原文件」查看。</p>'
+              : '<p class="pptx-para" style="color:#9ca3af;text-align:center;padding:32px 12px;">该文档暂无可预览的原文内容，可点击右上角「下载原文件」查看。</p>'
+            return
+          }
+          // 只渲染前 20 段（单段上限 4000 字）：完整文本常达数十万字，全量渲染会明显卡顿
+          const MAX_PREVIEW_PAGES = 20
+          const shown = pages.slice(0, MAX_PREVIEW_PAGES)
+          const inner = shown
+            .map(p =>
+              `<div style="margin:0 0 16px;">` +
+              (pages.length > 1
+                ? `<div style="font-size:11px;color:#0d9488;margin-bottom:5px;">${esc(p.title)}</div>`
+                : '') +
+              `<pre style="margin:0;white-space:pre-wrap;word-break:break-word;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:13px;line-height:1.7;color:#1f2937;">${esc(
+                p.paragraphs.join('\n')
+              )}</pre></div>`
+            )
+            .join('')
+          const more =
+            pages.length > MAX_PREVIEW_PAGES
+              ? `<p class="pptx-para" style="color:#9ca3af;">…… 仅预览前 ${MAX_PREVIEW_PAGES} 段，共 ${pages.length} 段。完整内容请点「阅读原文」翻页，或在问答中检索。</p>`
+              : ''
+          container.innerHTML = inner + more
+          return
+        }
+
         setPreviewLoading(true)
         const res = await fetch(url)
         if (!res.ok) throw new Error('fetch failed')
@@ -1806,6 +1843,8 @@ function OriginalDocModal({ doc, onClose }: { doc: KnowledgeDoc; onClose: () => 
       xlsx: { mime: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', label: 'Excel 工作表' },
       xls: { mime: 'application/vnd.ms-excel', label: 'Excel 工作表' },
       pdf: { mime: 'application/pdf', label: 'PDF 文档' },
+      xml: { mime: 'application/xml', label: 'XML 数据文件' },
+      txt: { mime: 'text/plain', label: '文本文件' },
     }
     const typeInfo = mimeMap[ext] || { mime: 'application/octet-stream', label: '原始文档' }
 

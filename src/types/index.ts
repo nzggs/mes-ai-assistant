@@ -15,7 +15,7 @@ export type ContentType =
 /** 来源引用 */
 export interface SourceCitation {
   docName: string
-  docType: 'word' | 'ppt' | 'excel' | 'pdf' | 'web' | 'mes' | 'xml'
+  docType: 'word' | 'ppt' | 'excel' | 'pdf' | 'web' | 'mes' | 'xml' | 'txt'
   page?: string
   section?: string
   uploader: string
@@ -101,7 +101,7 @@ export interface Conversation {
 export interface KnowledgeDoc {
   id: string
   name: string
-  type: 'word' | 'ppt' | 'excel' | 'pdf' | 'xml'
+  type: 'word' | 'ppt' | 'excel' | 'pdf' | 'xml' | 'txt'
   size: string
   uploadDate: string
   uploader: string
@@ -129,7 +129,7 @@ export interface KnowledgeDoc {
   pageCount?: number
   aiExtracting?: boolean // AI 正在提取元数据
   aiExtracted?: boolean // AI 已完成提取
-  fileType?: 'docx' | 'doc' | 'pptx' | 'ppt' | 'xlsx' | 'xls' | 'pdf' | 'xml' // 详细文件格式
+  fileType?: 'docx' | 'doc' | 'pptx' | 'ppt' | 'xlsx' | 'xls' | 'pdf' | 'xml' | 'txt' // 详细文件格式
   /** 整表/整文档 AI 总结缓存（map-reduce 生成并持久化；contentHash 用于内容变更失效） */
   tableSummaries?: { [sheetKey: string]: TableSummary }
   /** 总结生成的可检索切片（整表/整文档总结落库时自动切分生成，纳入普通检索，使总结内容可被常规问答召回） */
