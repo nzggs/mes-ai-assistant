@@ -887,6 +887,48 @@ function AdviceCard({ item, onOpenTrend }: { item: ApcParamItem; onOpenTrend: ()
           <MiniStat label="样本点数" value={String(item.sampleCount)} />
         </div>
 
+        {/* 规格来自列名表达式时的可见性：解析失败、或在哪些点超限，都必须让人一眼看到 */}
+        {item.specResolved && !item.specResolved.ok && (
+          <div className="mb-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-[11px] text-amber-800 leading-relaxed">
+            规格未能确定，本次不做优化判定：{item.specResolved.errors.join('；')}。
+            {item.specResolved.columns.length > 0 && (
+              <> 涉及列：<span className="font-mono">{item.specResolved.columns.join('、')}</span>。</>
+            )}
+          </div>
+        )}
+        {item.specResolved?.ok && Object.keys(item.specResolved.expressions).length > 0 && (
+          <div className="mb-2 text-[10px] text-mes-textTertiary leading-relaxed">
+            规格取自列名表达式：
+            {Object.entries(item.specResolved.expressions).map(([f, src]) => (
+              <span key={f} className="ml-1.5 font-mono">{f} = {src}</span>
+            ))}
+          </div>
+        )}
+        {item.specResolved?.ok && item.pointDeviation && item.pointDeviation.n > 0 && (
+          <div className={`mb-3 rounded-lg border px-3 py-2 text-[11px] leading-relaxed ${
+            item.pointDeviation.outOfSpec > 0
+              ? 'border-red-200 bg-red-50 text-red-700'
+              : 'border-emerald-200 bg-emerald-50 text-emerald-700'
+          }`}
+          >
+            {item.pointDeviation.outOfSpec > 0 ? (
+              <>
+                窗口 {item.pointDeviation.n} 个采样点中 <span className="font-semibold">{item.pointDeviation.outOfSpec}</span> 点超规格
+                （超上限 {item.pointDeviation.outHigh}、低下限 {item.pointDeviation.outLow}）
+                {item.pointDeviation.worst && (
+                  <>
+                    　最差：{fmt(item.pointDeviation.worst.v, item.decimals)}{item.unit}，
+                    偏离 {fmt(item.pointDeviation.worst.deviation, item.decimals)}{item.unit}
+                    （{item.pointDeviation.worst.direction === 'high' ? '超上限' : '低下限'}）
+                  </>
+                )}
+              </>
+            ) : (
+              <>窗口 {item.pointDeviation.n} 个采样点全部落在规格内。</>
+            )}
+          </div>
+        )}
+
         <div className="bg-gray-50 rounded-lg p-2.5">
           <p className="text-xs text-mes-textSecondary leading-relaxed">
             <span className="font-medium text-mes-text">推荐理由：</span>{r.reason}
@@ -956,6 +998,10 @@ function ParamDetail({
   const r = param.recommendation
   const meta = STATUS_META[param.status]
   const points = history?.points || param.series
+  const specInfo = history?.specResolved || param.specResolved
+  const pdev = history?.pointDeviation || param.pointDeviation
+  // 规格若来自列名表达式，横轴切换旁顺带说明来源，免得读者以为规格是写死的
+  const specExprs = specInfo?.ok ? Object.entries(specInfo.expressions || {}) : []
 
   // 时间戳缺失或重复时，用相邻点时间差算出的「采样间隔」会是 0 秒，属于误导性数字，直接给 —。
   const sampleIntervalSec = useMemo(() => {
@@ -1004,6 +1050,24 @@ function ParamDetail({
             </div>
           )}
 
+          {specInfo && !specInfo.ok && (
+            <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800 leading-relaxed">
+              <span className="font-medium">规格未能确定：</span>{specInfo.errors.join('；')}。
+              {specInfo.columns.length > 0 && (
+                <> 涉及列：<span className="font-mono">{specInfo.columns.join('、')}</span>。</>
+              )}
+              请在「数据源配置 → 参数配置」核对规格表达式引用的列名是否已写进取数 SQL 的 SELECT。
+            </div>
+          )}
+          {specExprs.length > 0 && (
+            <div className="text-[10px] text-mes-textTertiary leading-relaxed">
+              规格取自列名表达式（按每行求值）：
+              {specExprs.map(([f, src]) => (
+                <span key={f} className="ml-1.5 font-mono">{f} = {src}</span>
+              ))}
+            </div>
+          )}
+
           <div className="flex items-center justify-end gap-1 text-[11px]">
             <span className="text-mes-textTertiary mr-1">横轴</span>
             {([['auto', '自动'], ['time', '按时间'], ['index', '按序号']] as const).map(([v, label]) => (
@@ -1023,14 +1087,14 @@ function ParamDetail({
 
           <ApcTrendChart
             points={points}
-            lsl={param.lsl}
-            usl={param.usl}
-            setpoint={param.setpoint}
-            optimalTarget={param.optimalTarget}
+            lsl={history?.param.lsl ?? param.lsl}
+            usl={history?.param.usl ?? param.usl}
+            setpoint={history?.param.setpoint ?? param.setpoint}
+            optimalTarget={history?.param.optimalTarget ?? param.optimalTarget}
             unit={param.unit}
             decimals={param.decimals}
             status={param.status}
-            suggested={r.hold ? undefined : r.suggested}
+            suggested={r.hold || r.suggested == null ? undefined : r.suggested}
             height={240}
             axisMode={axisMode}
           />
@@ -1074,6 +1138,24 @@ function ParamDetail({
               {r.risk && <p className="text-xs text-amber-700 leading-relaxed mt-2">{r.risk}</p>}
             </div>
           </div>
+
+          {pdev && pdev.n > 0 && (
+            <div className={`rounded-xl border px-4 py-3 text-[11px] leading-relaxed ${
+              pdev.outOfSpec > 0
+                ? 'border-red-200 bg-red-50 text-red-700'
+                : 'border-emerald-200 bg-emerald-50 text-emerald-700'
+            }`}
+            >
+              <span className="font-medium">点级规格判定（全量 {pdev.n} 点，不受趋势图降采样影响）：</span>
+              {pdev.outOfSpec > 0
+                ? ` ${pdev.outOfSpec} 点超规格（超上限 ${pdev.outHigh}、低下限 ${pdev.outLow}）`
+                : ' 全部落在规格内'}
+              {pdev.worst && (
+                <>；最差点 {fmt(pdev.worst.v, param.decimals)}{param.unit}，偏离 {fmt(pdev.worst.deviation, param.decimals)}{param.unit}（{pdev.worst.direction === 'high' ? '超上限' : '低下限'}）</>
+              )}
+              。超限点在趋势图上以红点标出。
+            </div>
+          )}
 
           <div className="rounded-xl bg-gray-50 px-4 py-3 text-[11px] text-mes-textTertiary leading-relaxed">
             说明：本页所有过程数据均来自只读数据源的 SELECT 查询，不做任何写库操作；

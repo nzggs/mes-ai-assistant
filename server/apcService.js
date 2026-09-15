@@ -23,6 +23,7 @@ import { isDataSourceConfigured, queryReadOnly, getHanaStatus, pickColumn, pingH
 import * as apcConfig from './apcConfig.js'
 import { CODE_RE, normalizeQueries, normalizeParams, queryTemplateWarnings } from './apcCatalog.js'
 import { quoteIdent, renderSqlTemplate, assertIdent, assertReadOnlySql, applyRowLimit } from './sqlGuard.js'
+import { parseExpr, evalExpr } from './specExpr.js'
 
 // ===== 通用工具 =====
 
@@ -205,6 +206,15 @@ export function buildTemplateVars(catalog, { minutes, limit, codes, params }) {
       const tsCol = assertIdent(cols.ts, '时间戳列')
       if (!colNames.some(c => c.toUpperCase() === tsCol.toUpperCase())) colNames.unshift(tsCol)
     }
+    // 规格表达式引用的列（如 `USL_COL - 1` 里的 USL_COL）也要一起 SELECT 出来，
+    // 否则运行期必然求值失败。并入后无需在每个模板里手工维护一份列清单；
+    // 若名字不是真实表列，数据库会直接报错，由「试算」原样透出便于定位。
+    for (const p of targetParams) {
+      for (const ident of specReferencedColumns(compileParamSpec(p))) {
+        const name = assertIdent(ident, `参数 ${p.code} 规格表达式引用的列名`)
+        if (!colNames.some(c => c.toUpperCase() === name.toUpperCase())) colNames.push(name)
+      }
+    }
     vars.columns = colNames.map(quoteIdent).join(', ')
   } else {
     vars.codeFilter = buildCodeFilter(cols.code || 'PARAM_CODE', codes)
@@ -268,12 +278,23 @@ export async function previewQuery({ queries, params, minutes, maxRows, slot } =
   if (rows.length > 0 && !columns.some(c => c.toUpperCase() === String(tsColumn).toUpperCase())) {
     warnings.push(`时间戳列 ${tsColumn} 未出现在查询结果列中（当前返回：${columns.join('、')}），趋势图将无法按时间展开。`)
   }
+  // 规格表达式引用的列是否真的在结果列里：不在就必然求值失败，提前说清楚，不用等到页面上看到「未知」再猜
+  const specColumns = buildSpecColumnReport(draftParams, columns)
+  for (const rep of specColumns) {
+    const missing = rep.columns.filter(c => !c.present).map(c => c.name)
+    if (missing.length > 0) {
+      warnings.push(
+        `参数 ${rep.code} 的规格表达式引用了未出现在结果列中的「${missing.join('、')}」，该参数的规格将无法判定（宽表模式已自动并入；窄表模式请自行写进 SELECT）。`
+      )
+    }
+  }
   return {
     ok: true,
     mode: draftQueries.mode,
     sql: sqlText,
     vars,
     columns,
+    specColumns,
     rows: rows.slice(0, cap).map(sanitizeRow),
     rowCount: rows.length,
     truncated,
@@ -306,6 +327,195 @@ function specSigma(param) {
   return width > 0 ? width / 3 : 0
 }
 
+// ===== 规格表达式（列名变量）=====
+//
+// 现场型号多、交错生产，规格并不固定。与其逐型号维护一份数字配置，不如把规格直接
+// 放进取数 SQL 的结果列随行取回，再允许用「列名 ± 数字」这类表达式微调
+// （例如 `USL_COL - 1`、`(LSL_COL + USL_COL) / 2`）。
+// 表达式由 server/specExpr.js 解析：只认数字/列名/四则/括号，无函数调用、不用 eval。
+//
+// 判定口径：
+//   - 窗口级（Cpk、状态、优化建议）用**最新一行**的规格；
+//   - 点级（超规格计数、最坏点、阶梯规格带）逐点用各自数据行的规格，
+//     且**基于全量数据点**统计——降采样只影响展示形状，不能影响计数。
+
+const SPEC_FIELDS = ['setpoint', 'optimalTarget', 'lsl', 'usl', 'min', 'max']
+
+/**
+ * 编译参数定义里的 6 个规格字段：数字直接留用，表达式解析成 AST（只解析一次，
+ * 逐点求值时复用，避免每个采样点重复解析）。
+ * @returns {{fields:object, expressions:object, errors:string[]}}
+ */
+export function compileParamSpec(param) {
+  const fields = {}
+  const expressions = {}
+  const errors = []
+  for (const f of SPEC_FIELDS) {
+    const raw = param ? param[f] : undefined
+    if (typeof raw === 'number' && Number.isFinite(raw)) {
+      fields[f] = { kind: 'num', value: raw }
+      continue
+    }
+    if (raw === null || raw === undefined || String(raw).trim() === '') {
+      fields[f] = { kind: 'missing' }
+      errors.push(`${f} 未配置`)
+      continue
+    }
+    const src = String(raw).trim()
+    const parsed = parseExpr(src)
+    if (!parsed.ok) {
+      fields[f] = { kind: 'invalid', error: parsed.error }
+      errors.push(`${f} 表达式无效：${parsed.error}`)
+      continue
+    }
+    // 不含列名的表达式（"25" / "(24+26)/2"）不需要数据行，编译期即可定值
+    if (parsed.idents.length === 0) {
+      const ev = evalExpr(parsed.ast, () => undefined)
+      if (ev.ok) {
+        fields[f] = { kind: 'num', value: ev.value }
+      } else {
+        fields[f] = { kind: 'invalid', error: ev.error }
+        errors.push(`${f} 表达式无效：${ev.error}`)
+      }
+      continue
+    }
+    fields[f] = { kind: 'expr', src, ast: parsed.ast, idents: parsed.idents }
+    expressions[f] = src
+  }
+  return { fields, expressions, errors }
+}
+
+/** 该规格字段是否需要按数据行求值（即写成了含列名的表达式） */
+export function specFieldIsExpr(compiled, field) {
+  const f = compiled && compiled.fields ? compiled.fields[field] : null
+  return Boolean(f && f.kind === 'expr')
+}
+
+/** 规格表达式引用到的全部列名（去重）。用于宽表自动并入 {{columns}} 与试算提示 */
+export function specReferencedColumns(compiled) {
+  const out = []
+  for (const f of SPEC_FIELDS) {
+    const fd = compiled && compiled.fields ? compiled.fields[f] : null
+    if (!fd || fd.kind !== 'expr') continue
+    for (const id of fd.idents) if (!out.includes(id)) out.push(id)
+  }
+  return out
+}
+
+/**
+ * 按某一个数据行求值，得到「这一行」的规格数值。
+ * 任何一项取不到就整体 ok=false 并给出可读原因（调用方据此降级为「未知」，而不是硬算）。
+ */
+export function resolveCompiledSpec(compiled, row) {
+  const spec = {}
+  const errors = []
+  for (const f of SPEC_FIELDS) {
+    const fd = compiled && compiled.fields ? compiled.fields[f] : null
+    if (!fd || fd.kind === 'missing') { errors.push(`${f} 未配置`); continue }
+    if (fd.kind === 'invalid') { errors.push(`${f} 表达式无效：${fd.error}`); continue }
+    if (fd.kind === 'num') { spec[f] = fd.value; continue }
+    if (!row) {
+      errors.push(`${f} 需要读取列 ${fd.idents.join('、')}，但当前没有可用的数据行`)
+      continue
+    }
+    const ev = evalExpr(fd.ast, (name) => pickColumn(row, name))
+    if (!ev.ok) { errors.push(`${f} 求值失败：${ev.error}`); continue }
+    spec[f] = ev.value
+  }
+  return { ok: errors.length === 0, spec, errors, expressions: compiled ? compiled.expressions : {} }
+}
+
+/** 便捷入口：编译 + 按行求值（一次性，不含逐点复用） */
+export function resolveParamSpec(param, row) {
+  return resolveCompiledSpec(compileParamSpec(param), row)
+}
+
+/**
+ * 点级超规格判定。**必须传入全量数据点**：计数与最坏点不能因降采样而失真。
+ * 每个点用自己所在数据行的规格判定，因此「随行变化的规格」也能正确统计。
+ */
+export function evaluatePoints(compiled, points) {
+  const list = Array.isArray(points) ? points : []
+  // 没有表达式时规格恒定：解析一次即可，避免为每个点重复走一遍 6 个字段
+  // （概览页有 200 个参数 × 上千个点，逐点重算是白费）。
+  const hasExpr = SPEC_FIELDS.some((f) => specFieldIsExpr(compiled, f))
+  const constant = hasExpr ? null : resolveCompiledSpec(compiled, undefined)
+  const out = []
+  let outOfSpec = 0
+  let outLow = 0
+  let outHigh = 0
+  let worst = null
+  for (const pt of list) {
+    const spec = constant || resolveCompiledSpec(compiled, pt ? pt.rawRow : undefined)
+    const lsl = spec.ok ? spec.spec.lsl : NaN
+    const usl = spec.ok ? spec.spec.usl : NaN
+    const v = pt ? pt.v : NaN
+    let direction = 'unknown'
+    let deviation = 0
+    if (spec.ok && Number.isFinite(v)) {
+      if (Number.isFinite(usl) && v > usl) {
+        direction = 'high'
+        deviation = v - usl
+        outOfSpec++
+        outHigh++
+      } else if (Number.isFinite(lsl) && v < lsl) {
+        direction = 'low'
+        deviation = lsl - v
+        outOfSpec++
+        outLow++
+      } else {
+        direction = 'in'
+      }
+      if ((direction === 'high' || direction === 'low') && (worst === null || deviation > worst.deviation)) {
+        worst = { t: pt.t, v, deviation, direction, lsl, usl }
+      }
+    }
+    out.push({
+      t: pt ? pt.t : NaN,
+      v,
+      lsl: Number.isFinite(lsl) ? lsl : null,
+      usl: Number.isFinite(usl) ? usl : null,
+      direction,
+      deviation,
+    })
+  }
+  return { n: out.length, outOfSpec, outLow, outHigh, worst, points: out }
+}
+
+/**
+ * 展示用曲线点。规格写成列名表达式时按点带上各自解析出的 lsl/usl（阶梯规格带）；
+ * 规格是固定数字时不下发逐点数值（前端直接用顶层 lsl/usl 画横线，省流量）。
+ */
+function buildSeries(pointSpecs, decimals, compiled, maxPoints) {
+  const vary = specFieldIsExpr(compiled, 'lsl') || specFieldIsExpr(compiled, 'usl')
+  return downsample(pointSpecs, maxPoints).map((p) => {
+    const out = { t: p.t, v: roundTo(p.v, decimals) }
+    if (vary) {
+      if (Number.isFinite(p.lsl)) out.lsl = roundTo(p.lsl, decimals)
+      if (Number.isFinite(p.usl)) out.usl = roundTo(p.usl, decimals)
+      if (p.direction === 'low' || p.direction === 'high') out.direction = p.direction
+    }
+    return out
+  })
+}
+
+/** 试算用：每个参数的规格表达式引用了哪些列、这些列是否真的出现在结果列里 */
+function buildSpecColumnReport(params, columns) {
+  const upper = (columns || []).map((c) => String(c).toUpperCase())
+  const out = []
+  for (const p of params) {
+    const compiled = compileParamSpec(p)
+    const cols = specReferencedColumns(compiled)
+    if (cols.length === 0) continue
+    out.push({
+      code: p.code,
+      expressions: compiled.expressions,
+      columns: cols.map((c) => ({ name: c, present: upper.includes(c.toUpperCase()) })),
+    })
+  }
+  return out
+}
+
 // ===== 取数（对外唯一入口）=====
 
 function parseTimestamp(rawTs) {
@@ -316,6 +526,21 @@ function parseTimestamp(rawTs) {
     if (Number.isFinite(parsed)) return parsed
   }
   return NaN
+}
+
+/**
+ * 把产生该点的原始数据行挂在点上，供规格表达式按行求值。
+ * 定义为**不可枚举**属性：任何 JSON 序列化（接口响应、日志）都会自动忽略它，
+ * 原始行数据不可能随曲线点泄漏到前端。
+ */
+function attachRow(point, row) {
+  Object.defineProperty(point, 'rawRow', {
+    value: row,
+    enumerable: false,
+    writable: true,
+    configurable: true,
+  })
+  return point
 }
 
 /** 窄表：一行一个参数值，按「参数编码列」分组 */
@@ -329,7 +554,7 @@ function normalizeSeries(rows, codeColumn, tsColumn, valueColumn) {
     let t = parseTimestamp(pickColumn(row, tsColumn))
     if (!Number.isFinite(t)) t = Date.now()
     if (!map.has(code)) map.set(code, [])
-    map.get(code).push({ t, v: value })
+    map.get(code).push(attachRow({ t, v: value }, row))
   }
   for (const arr of map.values()) arr.sort((a, b) => a.t - b.t)
   return map
@@ -345,7 +570,7 @@ function normalizeWideSeries(rows, tsColumn, params) {
     for (const p of params) {
       const value = Number(pickColumn(row, p.column || p.code))
       if (!Number.isFinite(value)) continue
-      map.get(p.code).push({ t, v: value })
+      map.get(p.code).push(attachRow({ t, v: value }, row))
     }
   }
   for (const arr of map.values()) arr.sort((a, b) => a.t - b.t)
@@ -512,15 +737,42 @@ export function optimizeParam(param, series, opts = {}) {
   const points = Array.isArray(series) ? series : []
   const values = points.map((p) => p.v).filter((v) => Number.isFinite(v))
   const stats = basicStats(values)
-  const sigmaSpec = specSigma(param)
   const latest = values.length > 0 ? values[values.length - 1] : NaN
   const slope = linearSlope(values)
-  const cpk = computeCpk(param, stats.mean, stats.std)
-  const status = statusOf(param, stats)
-  const trend = trendOf(slope, stats.std)
   const decimals = param.decimals
 
-  const base = {
+  // 规格可以写成「取数结果列名表达式」（如 USL_COL - 1）：编译一次后按数据行求值。
+  // 窗口级判定统一用**最新一行**的规格；点级判定逐点用各自所在行（evaluatePoints）。
+  const compiled = compileParamSpec(param)
+  const lastRow = points.length > 0 ? points[points.length - 1].rawRow : undefined
+  const specRow = opts.specRow !== undefined ? opts.specRow : lastRow
+  const spec = resolveCompiledSpec(compiled, specRow)
+  const pointDev = evaluatePoints(compiled, points)
+  const sparkPoints = opts.sparkPoints || 60
+
+  const specResolved = {
+    ok: spec.ok,
+    errors: spec.errors,
+    expressions: compiled.expressions,
+    columns: specReferencedColumns(compiled),
+  }
+  const pointDeviation = {
+    n: pointDev.n,
+    outOfSpec: pointDev.outOfSpec,
+    outLow: pointDev.outLow,
+    outHigh: pointDev.outHigh,
+    worst: pointDev.worst
+      ? {
+        t: pointDev.worst.t,
+        v: roundTo(pointDev.worst.v, decimals),
+        lsl: roundTo(pointDev.worst.lsl, decimals),
+        usl: roundTo(pointDev.worst.usl, decimals),
+        deviation: roundTo(pointDev.worst.deviation, decimals),
+        direction: pointDev.worst.direction,
+      }
+      : null,
+  }
+  const common = {
     code: param.code,
     name: param.name,
     process: param.process,
@@ -528,12 +780,6 @@ export function optimizeParam(param, series, opts = {}) {
     decimals,
     objective: param.objective,
     objectiveLabel: OBJECTIVE_LABEL[param.objective] || '综合',
-    setpoint: param.setpoint,
-    optimalTarget: param.optimalTarget,
-    min: param.min,
-    max: param.max,
-    lsl: param.lsl,
-    usl: param.usl,
     maxStepPct: param.maxStepPct,
     latest: Number.isFinite(latest) ? roundTo(latest, decimals) : null,
     mean: Number.isFinite(stats.mean) ? roundTo(stats.mean, decimals) : null,
@@ -541,14 +787,63 @@ export function optimizeParam(param, series, opts = {}) {
     min_: Number.isFinite(stats.min) ? roundTo(stats.min, decimals) : null,
     max_: Number.isFinite(stats.max) ? roundTo(stats.max, decimals) : null,
     sampleCount: stats.n,
-    cpk: cpk == null ? null : roundTo(cpk, 2),
     slope: roundTo(slope, Math.min(4, decimals + 3)),
-    trend,
+    trend: trendOf(slope, stats.std),
+    specResolved,
+    pointDeviation,
+    series: buildSeries(pointDev.points, decimals, compiled, sparkPoints),
+  }
+
+  // ---- 规格确定不了（表达式引用的列没取回来 / 写法有误）----
+  // 不做任何判定，明确降级为「未知」。绝不拿 NaN 硬算出「正常」「保持」这类会误导现场的结论。
+  if (!spec.ok) {
+    return {
+      ...common,
+      setpoint: null,
+      optimalTarget: null,
+      min: null,
+      max: null,
+      lsl: null,
+      usl: null,
+      cpk: null,
+      status: 'unknown',
+      recommendation: {
+        current: null,
+        suggested: null,
+        delta: 0,
+        deltaPct: null,
+        confidence: 0,
+        urgency: 'none',
+        hold: true,
+        clampedBy: null,
+        predictedMean: null,
+        predictedCpk: null,
+        reason:
+          `规格未能确定，本次不做优化判定：${spec.errors.join('；')}。` +
+          '请在「APC 和 RTO → 数据源配置 → 参数配置」检查规格表达式引用的列名是否已出现在取数 SQL 的结果列中。',
+        risk: '',
+      },
+    }
+  }
+
+  // 规格已确定：把解析出的数值覆盖到参数定义上，后续沿用原有优化逻辑
+  param = { ...param, ...spec.spec }
+
+  const sigmaSpec = specSigma(param)
+  const cpk = computeCpk(param, stats.mean, stats.std)
+  const status = statusOf(param, stats)
+  const trend = common.trend
+
+  const base = {
+    ...common,
+    setpoint: param.setpoint,
+    optimalTarget: param.optimalTarget,
+    min: param.min,
+    max: param.max,
+    lsl: param.lsl,
+    usl: param.usl,
+    cpk: cpk == null ? null : roundTo(cpk, 2),
     status,
-    series: downsample(points, opts.sparkPoints || 60).map((p) => ({
-      t: p.t,
-      v: roundTo(p.v, decimals),
-    })),
   }
 
   // ---- 数据不足：给出「继续观察」建议，不做激进调整 ----
@@ -812,7 +1107,16 @@ export async function getHistory({ code, minutes, project } = {}) {
     const points = series.get(param.code) || []
     const values = points.map((p) => p.v)
     const stats = basicStats(values)
-    const cpk = computeCpk(param, stats.mean, stats.std)
+
+    // 规格可能是列名表达式：按最新一行求值用于窗口级统计，逐点求值用于规格带与偏离点
+    const compiled = compileParamSpec(param)
+    const lastRow = points.length > 0 ? points[points.length - 1].rawRow : undefined
+    const spec = resolveCompiledSpec(compiled, lastRow)
+    const pointDev = evaluatePoints(compiled, points)
+    const resolved = spec.ok ? { ...param, ...spec.spec } : param
+    const cpk = spec.ok ? computeCpk(resolved, stats.mean, stats.std) : null
+    const varySpec = specFieldIsExpr(compiled, 'lsl') || specFieldIsExpr(compiled, 'usl')
+
     return {
       param: {
         code: param.code,
@@ -820,16 +1124,38 @@ export async function getHistory({ code, minutes, project } = {}) {
         process: param.process,
         unit: param.unit,
         decimals: param.decimals,
-        setpoint: param.setpoint,
-        optimalTarget: param.optimalTarget,
-        lsl: param.lsl,
-        usl: param.usl,
-        min: param.min,
-        max: param.max,
+        setpoint: spec.ok ? spec.spec.setpoint : null,
+        optimalTarget: spec.ok ? spec.spec.optimalTarget : null,
+        lsl: spec.ok ? spec.spec.lsl : null,
+        usl: spec.ok ? spec.spec.usl : null,
+        min: spec.ok ? spec.spec.min : null,
+        max: spec.ok ? spec.spec.max : null,
       },
       mode,
       windowMinutes: meta.windowMinutes,
       source: describeSource(mode, meta),
+      specResolved: {
+        ok: spec.ok,
+        errors: spec.errors,
+        expressions: compiled.expressions,
+        columns: specReferencedColumns(compiled),
+      },
+      pointDeviation: {
+        n: pointDev.n,
+        outOfSpec: pointDev.outOfSpec,
+        outLow: pointDev.outLow,
+        outHigh: pointDev.outHigh,
+        worst: pointDev.worst
+          ? {
+            t: pointDev.worst.t,
+            v: roundTo(pointDev.worst.v, param.decimals),
+            lsl: roundTo(pointDev.worst.lsl, param.decimals),
+            usl: roundTo(pointDev.worst.usl, param.decimals),
+            deviation: roundTo(pointDev.worst.deviation, param.decimals),
+            direction: pointDev.worst.direction,
+          }
+          : null,
+      },
       stats: {
         n: stats.n,
         mean: Number.isFinite(stats.mean) ? roundTo(stats.mean, param.decimals) : null,
@@ -838,9 +1164,17 @@ export async function getHistory({ code, minutes, project } = {}) {
         max: Number.isFinite(stats.max) ? roundTo(stats.max, param.decimals) : null,
         cpk: cpk == null ? null : roundTo(cpk, 2),
         trend: trendOf(linearSlope(values), stats.std),
-        status: statusOf(param, stats),
+        status: spec.ok ? statusOf(resolved, stats) : 'unknown',
       },
-      points: points.map((p) => ({ t: p.t, v: roundTo(p.v, param.decimals) })),
+      points: pointDev.points.map((p) => {
+        const out = { t: p.t, v: roundTo(p.v, param.decimals) }
+        if (varySpec) {
+          if (Number.isFinite(p.lsl)) out.lsl = roundTo(p.lsl, param.decimals)
+          if (Number.isFinite(p.usl)) out.usl = roundTo(p.usl, param.decimals)
+          if (p.direction === 'low' || p.direction === 'high') out.direction = p.direction
+        }
+        return out
+      }),
     }
   }
   if (ttl <= 0) return loader()

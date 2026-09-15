@@ -229,14 +229,49 @@ export type ApcSourceMode = 'hana' | 'unconfigured'
 export interface ApcSeriesPoint {
   t: number
   v: number
+  /**
+   * 该点所在数据行解析出的规格上下限。**仅当规格写成列名表达式时才有值**
+   * （规格是固定数字时用参数级的 lsl/usl 画横线即可，无需逐点重复下发）。
+   */
+  lsl?: number
+  usl?: number
+  /** 该点相对其所在行规格的偏离方向（仅表达式规格时下发，用于前端高亮） */
+  direction?: 'in' | 'low' | 'high' | 'unknown'
+}
+
+/** 规格表达式的解析情况 */
+export interface ApcSpecResolved {
+  /** 6 个规格字段是否都求值成功；false 时页面按「未知」展示并给出 errors */
+  ok: boolean
+  errors: string[]
+  /** 写成表达式的字段 → 原始表达式文本（如 { usl: 'USL_COL - 1' }） */
+  expressions: Record<string, string>
+  /** 表达式引用到的列名（宽表会自动并入取数列） */
+  columns: string[]
+}
+
+/** 点级超规格摘要（基于**全量**数据点统计，不受趋势图降采样影响） */
+export interface ApcPointDeviation {
+  n: number
+  outOfSpec: number
+  outLow: number
+  outHigh: number
+  worst: {
+    t: number
+    v: number
+    lsl?: number
+    usl?: number
+    deviation: number
+    direction: 'low' | 'high'
+  } | null
 }
 
 /** 单个过程参数的优化建议 */
 export interface ApcRecommendation {
-  /** 当前设定值 */
-  current: number
-  /** 优化后的建议设定值 */
-  suggested: number
+  /** 当前设定值；规格无法确定时为 null */
+  current: number | null
+  /** 优化后的建议设定值；规格无法确定时为 null */
+  suggested: number | null
   /** 建议调整量（建议值 - 当前值） */
   delta: number
   /** 调整幅度（%） */
@@ -268,12 +303,13 @@ export interface ApcParamItem {
   /** 优化目标：quality / energy / yield / stability */
   objective: string
   objectiveLabel: string
-  setpoint: number
-  optimalTarget: number
-  min: number
-  max: number
-  lsl: number
-  usl: number
+  /** 以下 6 项均为「按最新一行解析后」的数值；规格写成了列名表达式且取不到值时为空 */
+  setpoint: number | null
+  optimalTarget: number | null
+  min: number | null
+  max: number | null
+  lsl: number | null
+  usl: number | null
   maxStepPct: number
   latest: number | null
   mean: number | null
@@ -287,6 +323,10 @@ export interface ApcParamItem {
   status: ApcParamStatus
   series: ApcSeriesPoint[]
   recommendation: ApcRecommendation
+  /** 规格表达式的解析结果（含表达式原文与引用列） */
+  specResolved?: ApcSpecResolved
+  /** 点级超规格摘要 */
+  pointDeviation?: ApcPointDeviation
 }
 
 /** 数据源说明 */
@@ -405,16 +445,19 @@ export interface ApcHistoryResponse {
     process: string
     unit: string
     decimals: number
-    setpoint: number
-    optimalTarget: number
-    lsl: number
-    usl: number
-    min: number
-    max: number
+    /** 按最新一行解析后的数值；规格取不到时为空 */
+    setpoint: number | null
+    optimalTarget: number | null
+    lsl: number | null
+    usl: number | null
+    min: number | null
+    max: number | null
   }
   mode: ApcSourceMode
   windowMinutes: number
   source: ApcSourceInfo
+  specResolved?: ApcSpecResolved
+  pointDeviation?: ApcPointDeviation
   stats: {
     n: number
     mean: number | null
@@ -445,19 +488,23 @@ export interface ApcQueryConfig {
   columns: { code?: string; ts?: string; value?: string }
 }
 
-/** 参数配置（可编辑的完整定义，与 server/apcCatalog.js 的规范化结果一致） */
+/**
+ * 参数配置（可编辑的完整定义，与 server/apcCatalog.js 的规范化结果一致）。
+ * 6 个规格字段既可以是数字，也可以写成**取数结果列名表达式**（如 `USL_COL - 1`），
+ * 运行期按每个数据行求值——现场型号多、规格随行变化时无需逐型号维护数字。
+ */
 export interface ApcParamConfig {
   code: string
   name: string
   process: string
   unit: string
   decimals: number
-  setpoint: number
-  optimalTarget: number
-  lsl: number
-  usl: number
-  min: number
-  max: number
+  setpoint: number | string
+  optimalTarget: number | string
+  lsl: number | string
+  usl: number | string
+  min: number | string
+  max: number | string
   maxStepPct: number
   deadbandPct: number
   objective: string
@@ -629,6 +676,12 @@ export interface ApcQueryPreview {
   sql: string
   vars: Record<string, string>
   columns: string[]
+  /** 规格表达式引用的列是否出现在结果列里（试算时提前暴露「规格判定不了」） */
+  specColumns?: Array<{
+    code: string
+    expressions: Record<string, string>
+    columns: Array<{ name: string; present: boolean }>
+  }>
   rows: Record<string, unknown>[]
   rowCount: number
   truncated: boolean

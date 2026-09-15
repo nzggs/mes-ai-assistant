@@ -8,10 +8,11 @@ import type { ApcParamStatus, ApcSeriesPoint } from '../types'
 
 interface ApcTrendChartProps {
   points: ApcSeriesPoint[]
-  lsl: number
-  usl: number
-  setpoint: number
-  optimalTarget: number
+  /** 规格上下限。规格写成列名表达式且取不到值时为空——此时不画规格线，也不参与纵轴缩放 */
+  lsl: number | null
+  usl: number | null
+  setpoint: number | null
+  optimalTarget: number | null
   unit: string
   decimals: number
   status: ApcParamStatus
@@ -35,8 +36,8 @@ const STATUS_COLOR: Record<ApcParamStatus, string> = {
   unknown: '#94a3b8',
 }
 
-function fmt(v: number, decimals: number): string {
-  if (!Number.isFinite(v)) return '—'
+function fmt(v: number | null | undefined, decimals: number): string {
+  if (v == null || !Number.isFinite(v)) return '—'
   return v.toFixed(decimals)
 }
 
@@ -74,22 +75,39 @@ export function ApcTrendChart({
   const byIndex = axisMode === 'index' || (axisMode === 'auto' && usableTimeCount < 2)
   const degradedToIndex = byIndex && axisMode === 'auto'
 
+  // 规格写成列名表达式时，每个点带各自数据行解析出的 lsl/usl（阶梯规格带）；
+  // 固定数字规格则没有逐点值，用参数级 lsl/usl 画一条横线即可。
+  const hasPointSpec = useMemo(
+    () => points.some(p => Number.isFinite(p.lsl) || Number.isFinite(p.usl)),
+    [points]
+  )
+
   const geo = useMemo(() => {
     const values = points.map(p => p.v).filter(v => Number.isFinite(v))
-    const refs = [lsl, usl, setpoint, optimalTarget]
-    if (values.length === 0) {
-      const lo = Math.min(...refs)
-      const hi = Math.max(...refs)
-      return { lo: lo - (hi - lo || 1) * 0.2, hi: hi + (hi - lo || 1) * 0.2, t0: 0, t1: 1 }
+    // 规格可能是 null（表达式取不到值）→ 必须剔除。否则 Math.min/max 会把 null 当 0
+    // 参与缩放，曲线会被压成贴着顶端的一条线。
+    const refs = [lsl, usl, setpoint, optimalTarget].filter((v): v is number => Number.isFinite(v as number))
+    const bandVals: number[] = []
+    for (const p of points) {
+      if (Number.isFinite(p.lsl)) bandVals.push(p.lsl as number)
+      if (Number.isFinite(p.usl)) bandVals.push(p.usl as number)
     }
-    let lo = Math.min(...values, ...refs)
-    let hi = Math.max(...values, ...refs)
+    const t0 = points[0]?.t ?? 0
+    const t1 = points[points.length - 1]?.t ?? t0 + 1
+    const span0 = { t0, t1: t1 > t0 ? t1 : t0 + 1 }
+    if (values.length === 0) {
+      const pool = [...refs, ...bandVals]
+      if (pool.length === 0) return { lo: 0, hi: 1, ...span0 }
+      const lo = Math.min(...pool)
+      const hi = Math.max(...pool)
+      return { lo: lo - (hi - lo || 1) * 0.2, hi: hi + (hi - lo || 1) * 0.2, ...span0 }
+    }
+    let lo = Math.min(...values, ...refs, ...bandVals)
+    let hi = Math.max(...values, ...refs, ...bandVals)
     const span = hi - lo || Math.abs(hi) * 0.02 || 1
     lo -= span * 0.12
     hi += span * 0.12
-    const t0 = points[0]?.t ?? 0
-    const t1 = points[points.length - 1]?.t ?? t0 + 1
-    return { lo, hi, t0, t1: t1 > t0 ? t1 : t0 + 1 }
+    return { lo, hi, ...span0 }
   }, [points, lsl, usl, setpoint, optimalTarget])
 
   const yOf = (v: number) => PAD.t + innerH - ((v - geo.lo) / (geo.hi - geo.lo)) * innerH
@@ -102,6 +120,31 @@ export function ApcTrendChart({
     }
     return points.map(p => PAD.l + ((p.t - geo.t0) / (geo.t1 - geo.t0)) * innerW)
   }, [points, geo.t0, geo.t1, byIndex, innerW])
+
+  /**
+   * 阶梯规格带：逐点规格（列名表达式）时，规格不再是一条水平线而是一条随行变化的折线。
+   * 缺某个点的规格时回落到参数级数值，保证带子不断开。
+   */
+  const steppedBand = useMemo(() => {
+    if (!hasPointSpec || points.length < 2) return null
+    const uslAt = (p: ApcSeriesPoint) =>
+      Number.isFinite(p.usl) ? (p.usl as number) : (Number.isFinite(usl as number) ? (usl as number) : null)
+    const lslAt = (p: ApcSeriesPoint) =>
+      Number.isFinite(p.lsl) ? (p.lsl as number) : (Number.isFinite(lsl as number) ? (lsl as number) : null)
+    const uslSeg: string[] = []
+    const lslSeg: string[] = []
+    for (let i = 0; i < points.length; i++) {
+      const u = uslAt(points[i])
+      const l = lslAt(points[i])
+      if (u != null) uslSeg.push(`${uslSeg.length === 0 ? 'M' : 'L'}${xs[i].toFixed(2)},${yOf(u).toFixed(2)}`)
+      if (l != null) lslSeg.push(`${lslSeg.length === 0 ? 'M' : 'L'}${xs[i].toFixed(2)},${yOf(l).toFixed(2)}`)
+    }
+    if (uslSeg.length < 2 && lslSeg.length < 2) return null
+    const fill = uslSeg.length >= 2 && lslSeg.length >= 2
+      ? `${uslSeg.join(' ')} ${[...lslSeg].reverse().map(s => `L${s.slice(1)}`).join(' ')} Z`
+      : ''
+    return { uslPath: uslSeg.join(' '), lslPath: lslSeg.join(' '), fill }
+  }, [points, xs, geo, hasPointSpec, lsl, usl])
 
   const linePath = useMemo(() => {
     if (points.length === 0) return ''
@@ -140,9 +183,13 @@ export function ApcTrendChart({
   }
 
   const hoverPoint = hover != null ? points[hover] : null
-  const inSpec = usl > lsl
-  const bandY1 = yOf(usl)
-  const bandY2 = yOf(lsl)
+  const flatLsl = Number.isFinite(lsl as number) ? (lsl as number) : null
+  const flatUsl = Number.isFinite(usl as number) ? (usl as number) : null
+  const flatSetpoint = Number.isFinite(setpoint as number) ? (setpoint as number) : null
+  const flatTarget = Number.isFinite(optimalTarget as number) ? (optimalTarget as number) : null
+  const inSpec = flatLsl != null && flatUsl != null && flatUsl > flatLsl
+  const bandY1 = flatUsl != null ? yOf(flatUsl) : 0
+  const bandY2 = flatLsl != null ? yOf(flatLsl) : 0
 
   return (
     <div className="relative">
@@ -166,8 +213,8 @@ export function ApcTrendChart({
           </linearGradient>
         </defs>
 
-        {/* 规格带 */}
-        {inSpec && bandY2 > bandY1 && (
+        {/* 规格带（固定数字规格 → 水平带；列名表达式规格 → 阶梯带，见下方 LSL/USL） */}
+        {!steppedBand && inSpec && bandY2 > bandY1 && (
           <rect
             x={PAD.l}
             y={bandY1}
@@ -201,26 +248,47 @@ export function ApcTrendChart({
           </g>
         ))}
 
-        {/* LSL / USL */}
-        {inSpec && (
+        {/* LSL / USL：固定数字画横线；列名表达式按点画阶梯折线 */}
+        {steppedBand && (
+          <>
+            {steppedBand.fill && <path d={steppedBand.fill} fill="#22c55e" opacity="0.07" />}
+            <path d={steppedBand.uslPath} fill="none" stroke="#ef4444" strokeWidth="1" strokeDasharray="5 4" opacity="0.65" />
+            <path d={steppedBand.lslPath} fill="none" stroke="#ef4444" strokeWidth="1" strokeDasharray="5 4" opacity="0.65" />
+            {flatUsl != null && (
+              <text x={PAD.l + innerW - 2} y={bandY1 - 4} textAnchor="end" fontSize="9" fill="#ef4444" opacity="0.85">USL {fmt(flatUsl, decimals)}</text>
+            )}
+            {flatLsl != null && (
+              <text x={PAD.l + innerW - 2} y={bandY2 + 11} textAnchor="end" fontSize="9" fill="#ef4444" opacity="0.85">LSL {fmt(flatLsl, decimals)}</text>
+            )}
+          </>
+        )}
+        {!steppedBand && inSpec && (
           <>
             <line x1={PAD.l} y1={bandY1} x2={PAD.l + innerW} y2={bandY1} stroke="#ef4444" strokeWidth="1" strokeDasharray="5 4" opacity="0.65" />
             <line x1={PAD.l} y1={bandY2} x2={PAD.l + innerW} y2={bandY2} stroke="#ef4444" strokeWidth="1" strokeDasharray="5 4" opacity="0.65" />
-            <text x={PAD.l + innerW - 2} y={bandY1 - 4} textAnchor="end" fontSize="9" fill="#ef4444" opacity="0.85">USL {fmt(usl, decimals)}</text>
-            <text x={PAD.l + innerW - 2} y={bandY2 + 11} textAnchor="end" fontSize="9" fill="#ef4444" opacity="0.85">LSL {fmt(lsl, decimals)}</text>
+            <text x={PAD.l + innerW - 2} y={bandY1 - 4} textAnchor="end" fontSize="9" fill="#ef4444" opacity="0.85">USL {fmt(flatUsl, decimals)}</text>
+            <text x={PAD.l + innerW - 2} y={bandY2 + 11} textAnchor="end" fontSize="9" fill="#ef4444" opacity="0.85">LSL {fmt(flatLsl, decimals)}</text>
           </>
         )}
 
-        {/* 当前设定值 */}
-        <line x1={PAD.l} y1={yOf(setpoint)} x2={PAD.l + innerW} y2={yOf(setpoint)} stroke="#94a3b8" strokeWidth="1.2" strokeDasharray="6 4" />
-        <text x={PAD.l + 4} y={yOf(setpoint) - 4} fontSize="9" fill="#64748b">设定值 {fmt(setpoint, decimals)}</text>
+        {/* 当前设定值（规格取不到时为空 → 不画） */}
+        {flatSetpoint != null && (
+          <>
+            <line x1={PAD.l} y1={yOf(flatSetpoint)} x2={PAD.l + innerW} y2={yOf(flatSetpoint)} stroke="#94a3b8" strokeWidth="1.2" strokeDasharray="6 4" />
+            <text x={PAD.l + 4} y={yOf(flatSetpoint) - 4} fontSize="9" fill="#64748b">设定值 {fmt(flatSetpoint, decimals)}</text>
+          </>
+        )}
 
         {/* RTO 理想操作点 */}
-        <line x1={PAD.l} y1={yOf(optimalTarget)} x2={PAD.l + innerW} y2={yOf(optimalTarget)} stroke="#8b5cf6" strokeWidth="1.2" strokeDasharray="2 3" />
-        <text x={PAD.l + 4} y={yOf(optimalTarget) + 11} fontSize="9" fill="#8b5cf6">RTO 理想点 {fmt(optimalTarget, decimals)}</text>
+        {flatTarget != null && (
+          <>
+            <line x1={PAD.l} y1={yOf(flatTarget)} x2={PAD.l + innerW} y2={yOf(flatTarget)} stroke="#8b5cf6" strokeWidth="1.2" strokeDasharray="2 3" />
+            <text x={PAD.l + 4} y={yOf(flatTarget) + 11} fontSize="9" fill="#8b5cf6">RTO 理想点 {fmt(flatTarget, decimals)}</text>
+          </>
+        )}
 
         {/* 建议值（若与当前不同） */}
-        {typeof suggested === 'number' && Math.abs(suggested - setpoint) > 1e-9 && (
+        {typeof suggested === 'number' && flatSetpoint != null && Math.abs(suggested - flatSetpoint) > 1e-9 && (
           <>
             <line x1={PAD.l} y1={yOf(suggested)} x2={PAD.l + innerW} y2={yOf(suggested)} stroke="#4d6bfe" strokeWidth="1.2" strokeDasharray="1 3" />
             <text x={PAD.l + innerW - 2} y={yOf(suggested) - 4} textAnchor="end" fontSize="9" fill="#4d6bfe">建议 {fmt(suggested, decimals)}</text>
@@ -236,6 +304,13 @@ export function ApcTrendChart({
         )}
         {points.length === 1 && (
           <circle cx={xs[0]} cy={yOf(points[0].v)} r="3" fill={lineColor} />
+        )}
+
+        {/* 偏离点高亮：规格写成列名表达式时逐点判定，超限点标红（固定规格由曲线颜色/状态反映） */}
+        {points.map((p, i) =>
+          (p.direction === 'high' || p.direction === 'low') ? (
+            <circle key={`dev-${i}`} cx={xs[i]} cy={yOf(p.v)} r="2.6" fill="#ef4444" />
+          ) : null
         )}
 
         {/* 悬停十字线 */}

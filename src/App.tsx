@@ -265,6 +265,11 @@ export default function App() {
     // 安全网：任何同步/异步异常都转换为可见错误，避免永久卡在「正在分析中」
     let aiMsgId = ''
 
+    // 停止控制器必须在 try **之外**声明：try 与 catch 是两个同级作用域，
+    // 若声明在 try 内，异常路径上引用它会直接抛 ReferenceError，
+    // 把真正的错误（如网络失败）盖掉，用户看到的是「发送失败: abortCtl is not defined」。
+    let abortCtl: AbortController | null = null
+
     try {
     // 添加用户消息
     const userMsg: ChatMessage = {
@@ -339,7 +344,9 @@ export default function App() {
     let llmFailed = false
     // 本轮回答被用户手动停止（"停止生成"按钮）：跳过重试/二段查询，保留已生成内容
     let aborted = false
-    const abortCtl = new AbortController()
+    abortCtl = new AbortController()
+    // 取出 signal 作为常量：runStream 是嵌套闭包，闭包里 `abortCtl.signal` 会丢掉非空收窄
+    const abortSignal = abortCtl.signal
     chatAbortRef.current = abortCtl
     // 累计正文（用于 MES 直查：从第一轮回答里提取 mes-sql 推荐查询）
     let answerAccum = ''
@@ -633,7 +640,7 @@ export default function App() {
       knowledgeContext: finalKnowledgeContext,
       useThinking,
       modelId: reasoningModelId,
-      signal: abortCtl.signal,
+      signal: abortSignal,
     })
   }
 

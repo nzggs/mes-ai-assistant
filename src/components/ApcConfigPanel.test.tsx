@@ -367,6 +367,59 @@ describe('ApcConfigPanel · 参数配置', () => {
     const [, patch] = mocks.updateApcProject.mock.calls[0]
     expect(patch.params[1].name).toBe('辊压辊缝（JSON）')
   })
+
+  // 规格字段支持「取数结果列名表达式」——现场型号多、规格随行变化，写死数字不可维护。
+  it('规格字段可录入列名表达式，原样随 params 段提交', async () => {
+    mocks.updateApcProject.mockResolvedValue({ ok: true, project: makeProject(), projects: [] })
+    renderEditor('p1')
+    await screen.findByDisplayValue('注液量监测')
+    fireEvent.click(screen.getByRole('button', { name: '参数配置' }))
+
+    const lslInput = screen.getByDisplayValue('12.3')
+    fireEvent.change(lslInput, { target: { value: 'USL_COL - 1' } })
+    fireEvent.click(screen.getByRole('button', { name: /^保存/ }))
+
+    await waitFor(() => expect(mocks.updateApcProject).toHaveBeenCalledTimes(1))
+    const [, patch] = mocks.updateApcProject.mock.calls[0]
+    expect(patch.params[0].lsl).toBe('USL_COL - 1')
+  })
+
+  it('规格字段清空后保持为空（不静默变成 0 规格）', async () => {
+    mocks.updateApcProject.mockResolvedValue({ ok: true, project: makeProject(), projects: [] })
+    renderEditor('p1')
+    await screen.findByDisplayValue('注液量监测')
+    fireEvent.click(screen.getByRole('button', { name: '参数配置' }))
+
+    fireEvent.change(screen.getByDisplayValue('12.9'), { target: { value: '' } })
+    fireEvent.click(screen.getByRole('button', { name: /^保存/ }))
+
+    await waitFor(() => expect(mocks.updateApcProject).toHaveBeenCalledTimes(1))
+    const [, patch] = mocks.updateApcProject.mock.calls[0]
+    expect(patch.params[0].usl).toBe('')
+  })
+
+  it('点「试算并核对列名」会带上当前参数草稿请求试运行', async () => {
+    mocks.previewApcQuery.mockResolvedValue({
+      ok: true, mode: 'long', sql: 'SELECT 1 FROM T', vars: {},
+      columns: ['PARAM_CODE', 'TS', 'VALUE', 'USL_COL'],
+      specColumns: [{ code: 'COATING_DENSITY', expressions: { usl: 'USL_COL - 1' }, columns: [{ name: 'USL_COL', present: true }] }],
+      rows: [{ PARAM_CODE: 'A', TS: 'x', VALUE: 1 }], rowCount: 1,
+      truncated: false, elapsedMs: 3, warnings: [],
+    })
+    renderEditor('p1')
+    await screen.findByDisplayValue('注液量监测')
+    fireEvent.click(screen.getByRole('button', { name: '参数配置' }))
+    fireEvent.change(screen.getByDisplayValue('12.9'), { target: { value: 'USL_COL - 1' } })
+
+    fireEvent.click(screen.getByRole('button', { name: '试算并核对列名' }))
+    await waitFor(() => expect(mocks.previewApcQuery).toHaveBeenCalled())
+
+    const payload = mocks.previewApcQuery.mock.calls[0][0]
+    expect(payload.params[0].usl).toBe('USL_COL - 1')
+    // 核对结果里应能看到表达式与「列已取到」
+    expect(await screen.findByText('USL_COL - 1')).toBeInTheDocument()
+    expect(screen.getByText(/✓ USL_COL/)).toBeInTheDocument()
+  })
 })
 
 describe('ApcConfigPanel · 重置的归属项目', () => {

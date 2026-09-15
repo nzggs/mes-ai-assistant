@@ -578,6 +578,10 @@ export function ApcConfigPanel({ projectId, onClose, onSaved }: {
               meta={metaDraft}
               dbSlotLabel={dbSlotNameOf(sDbSlot)}
               slotNames={slotNameMap}
+              preview={preview}
+              previewing={previewing}
+              previewErr={previewErr}
+              onPreview={handlePreview}
               onSelect={setSelected}
               onPatch={patchParam}
               onAdd={addParam}
@@ -926,6 +930,7 @@ function QueriesTab({
 
 function ParamsTab({
   params, selected, current, locked, jsonMode, jsonText, jsonErr, meta, dbSlotLabel, slotNames = {},
+  preview = null, previewing = false, previewErr = '', onPreview,
   onSelect, onPatch, onAdd, onDuplicate, onRemove, onToggleJson, onExportJson, onJsonText, onApplyJson, onReset,
 }: {
   params: ApcParamConfig[]
@@ -940,6 +945,11 @@ function ParamsTab({
   dbSlotLabel: string
   /** 槽位变量 → 系统显示名（列表里按参数自身的 dbSlot 展示，缺省时回落为变量本身） */
   slotNames?: Record<string, string>
+  /** 与「取数 SQL」页共用的试算结果：用于核对规格表达式引用的列是否真的取回来了 */
+  preview?: ApcQueryPreview | null
+  previewing?: boolean
+  previewErr?: string
+  onPreview?: () => void
   onSelect: (i: number) => void
   onPatch: (patch: Partial<ApcParamConfig>) => void
   onAdd: () => void
@@ -965,6 +975,35 @@ function ParamsTab({
       />
     </FieldShell>
   )
+
+  /**
+   * 规格字段（设定值 / 理想操作点 / LSL / USL / 可调下限 / 可调上限）：
+   * 既能填数字，也能填**取数结果列名表达式**（如 `USL_COL - 1`、`(LSL+USL)/2`）。
+   * 所以用文本框而非 number 框；且**空值不强制转 0**——清空就是清空，
+   * 否则手一抖删掉内容就变成「规格 0」，比留空更危险。
+   */
+  const specField = (label: string, key: keyof ApcParamConfig, hint?: string) => {
+    const raw = current ? current[key] : ''
+    const value = raw === null || raw === undefined ? '' : String(raw)
+    const text = value.trim()
+    const isExpr = text !== '' && !/^[+-]?(\d+(\.\d+)?|\.\d+)([eE][+-]?\d+)?$/.test(text)
+    return (
+      <FieldShell label={label} hint={hint}>
+        <input
+          type="text"
+          inputMode="decimal"
+          value={value}
+          onChange={e => onPatch({ [key]: e.target.value } as Partial<ApcParamConfig>)}
+          className={`${inputCls}${isExpr ? ' font-mono' : ''}`}
+          placeholder="数字或列名表达式"
+          disabled={!current}
+        />
+      </FieldShell>
+    )
+  }
+
+  /** 规格表达式核对区：列出各参数引用的列名，标出是否真的出现在试算结果列里 */
+  const specReport = (preview?.specColumns || []).filter(r => params.some(p => p.code === r.code))
 
   return (
     <div className="p-5">
@@ -1063,19 +1102,79 @@ function ParamsTab({
                   </div>
                 </SectionCard>
 
-                <SectionCard title="目标与规格" desc="RTO 理想操作点是寻优目标；规格上下限用于过程能力（Cpk）判定">
+                <SectionCard
+                  title="目标与规格"
+                  desc="RTO 理想操作点是寻优目标；规格上下限用于过程能力（Cpk）判定。每一项都可填数字，或填取数结果里的列名表达式"
+                >
                   <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-                    {numField('当前设定值', 'setpoint', '现场 DCS/PLC 上的设定值')}
-                    {numField('RTO 理想操作点', 'optimalTarget', '该工况下的最优目标值')}
-                    {numField('规格下限 LSL', 'lsl')}
-                    {numField('规格上限 USL', 'usl')}
+                    {specField('当前设定值', 'setpoint', '数字，或列名表达式（如 SET_COL）')}
+                    {specField('RTO 理想操作点', 'optimalTarget', '数字，或列名表达式（如 TGT_COL）')}
+                    {specField('规格下限 LSL', 'lsl', '数字，或列名表达式（如 LSL_COL）')}
+                    {specField('规格上限 USL', 'usl', '数字，或列名表达式（如 USL_COL - 1）')}
+                  </div>
+                  <div className="mt-3 rounded-lg bg-gray-50 px-3 py-2 text-[10px] text-mes-textTertiary leading-relaxed">
+                    列名表达式按<b>每一个数据行</b>求值：宽表模式会把表达式引用的列自动并入取数列表，
+                    窄表模式需要你自己把它写进 SELECT。判定口径为「窗口级用最新一行、点级逐点用各自所在行」。
+                    想知道有哪些列名可用，先点下面的「试算并核对列名」。
+                  </div>
+
+                  <div className="mt-3 border-t border-mes-border pt-3">
+                    <div className="flex items-center justify-between gap-2">
+                      <span className="text-[11px] font-medium text-mes-textSecondary">规格表达式核对</span>
+                      <button
+                        onClick={onPreview}
+                        disabled={previewing || !onPreview}
+                        className={btnGhost}
+                      >
+                        {previewing ? '正在试算…' : '试算并核对列名'}
+                      </button>
+                    </div>
+                    {previewErr && (
+                      <div className="mt-2 rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-[11px] text-red-700">
+                        试算失败：{previewErr}
+                      </div>
+                    )}
+                    {!previewErr && specReport.length === 0 && (
+                      <div className="mt-2 text-[10px] text-mes-textTertiary leading-relaxed">
+                        当前参数的规格都是固定数字（没有表达式），无需核对列名。填写表达式后可在此确认引用列是否已取回。
+                      </div>
+                    )}
+                    {!previewErr && specReport.length > 0 && (
+                      <div className="mt-2 space-y-1.5">
+                        {specReport.map(rep => (
+                          <div key={rep.code} className="rounded-lg border border-mes-border bg-white px-3 py-2">
+                            <div className="text-[10px] font-mono text-mes-textTertiary">{rep.code}</div>
+                            {Object.entries(rep.expressions).map(([field, src]) => (
+                              <div key={field} className="text-[11px] text-mes-textSecondary mt-0.5">
+                                <span className="text-mes-textTertiary">{field}</span> = <span className="font-mono">{src}</span>
+                              </div>
+                            ))}
+                            <div className="mt-1 flex flex-wrap items-center gap-1.5">
+                              {rep.columns.map(c => (
+                                <span
+                                  key={c.name}
+                                  className={`text-[10px] px-1.5 py-0.5 rounded font-mono border ${
+                                    c.present
+                                      ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
+                                      : 'border-red-200 bg-red-50 text-red-700'
+                                  }`}
+                                  title={c.present ? '已出现在试算结果列中' : '未出现在试算结果列中，规格将无法判定'}
+                                >
+                                  {c.present ? '✓' : '✗'} {c.name}
+                                </span>
+                              ))}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
                   </div>
                 </SectionCard>
 
                 <SectionCard title="可调范围与算法" desc="约束优化结果，避免单次调整过大或超出工艺窗口">
                   <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
-                    {numField('可调下限', 'min')}
-                    {numField('可调上限', 'max')}
+                    {specField('可调下限', 'min', '数字，或列名表达式')}
+                    {specField('可调上限', 'max', '数字，或列名表达式')}
                     {numField('单次调整上限（%）', 'maxStepPct', '超过则分步逼近')}
                     {numField('工艺死区（%）', 'deadbandPct', '占规格带宽比例，缺省用目录默认值')}
                     {numField('过程增益 K', 'processGain', '衡量 设定值变化 / 实测变化 的比例，默认 1')}

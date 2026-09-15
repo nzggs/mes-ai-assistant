@@ -12,6 +12,7 @@
  *  - 宽表模式要求每个参数都配了数据列名。
  */
 import { assertReadOnlySql, extractTemplateVars, assertIdent } from './sqlGuard.js'
+import { parseExpr, isPlainNumber } from './specExpr.js'
 
 export const CODE_RE = /^[A-Za-z0-9_]{1,64}$/
 export const OBJECTIVES = ['quality', 'energy', 'yield', 'stability']
@@ -29,6 +30,33 @@ function configError(message) {
   err.code = 'EAPCCONFIG'
   err.status = 400
   return err
+}
+
+function isEmpty(v) {
+  return v === null || v === undefined || String(v).trim() === ''
+}
+
+/**
+ * 规格字段（设定值 / 理想操作点 / LSL / USL / 可调下限 / 可调上限）取值：
+ *  - 数字、或「纯数字字符串」→ 归一为 number；
+ *  - 含列名的四则运算表达式（如 `USL_COL - 1`）→ **只做语法校验，原样保留字符串**，
+ *    等运行期拿到数据行后再求值（现场型号多、规格随行变化，写死数字不可维护）。
+ * 解析器不允许函数调用/属性访问/字符串，因此这里保留字符串不会带来注入风险。
+ */
+function specValue(v, label, code) {
+  if (typeof v === 'number') {
+    if (!Number.isFinite(v)) throw configError(`参数 ${code} 的${label}非法（需为有限数字或列名表达式）`)
+    return v
+  }
+  if (isEmpty(v)) throw configError(`参数 ${code} 缺少${label}`)
+  const s = String(v).trim()
+  if (isPlainNumber(s)) return Number(s)
+  const parsed = parseExpr(s)
+  if (!parsed.ok) throw configError(`参数 ${code} 的${label}表达式无效：${parsed.error}`)
+  if (parsed.idents.length === 0) {
+    throw configError(`参数 ${code} 的${label}必须是数字或含列名的表达式（如 USL_COL - 1）`)
+  }
+  return s
 }
 
 /** 参数编码：会参与 SQL 白名单拼接，必须严格校验（防注入） */
@@ -131,20 +159,23 @@ export function normalizeParam(p, index, opts = {}) {
     throw configError(`${where} code 非法（仅允许字母/数字/下划线）：${code || '(空)'}`)
   }
 
-  const lsl = num(p.lsl, NaN)
-  const usl = num(p.usl, NaN)
-  const min = num(p.min, NaN)
-  const max = num(p.max, NaN)
-  const setpoint = num(p.setpoint, NaN)
-  const optimalTarget = num(p.optimalTarget, setpoint)
+  const setpoint = specValue(p.setpoint, '当前设定值 setpoint', code)
+  const optimalTarget = isEmpty(p.optimalTarget)
+    ? setpoint
+    : specValue(p.optimalTarget, 'RTO 理想操作点 optimalTarget', code)
+  const lsl = specValue(p.lsl, '规格下限 lsl', code)
+  const usl = specValue(p.usl, '规格上限 usl', code)
+  const min = specValue(p.min, '可调下限 min', code)
+  const max = specValue(p.max, '可调上限 max', code)
 
-  if (!Number.isFinite(lsl) || !Number.isFinite(usl) || lsl >= usl) {
+  // lsl < usl / min < max 只在两侧都是纯数字时静态校验；只要有一侧是列名表达式，
+  // 取值要到运行期才知道，交由 resolveCompiledSpec / evaluatePoints 按真实数据行判定。
+  if (isPlainNumber(lsl) && isPlainNumber(usl) && !(Number(lsl) < Number(usl))) {
     throw configError(`参数 ${code} 的规格上下限非法（需 lsl < usl）`)
   }
-  if (!Number.isFinite(min) || !Number.isFinite(max) || min >= max) {
+  if (isPlainNumber(min) && isPlainNumber(max) && !(Number(min) < Number(max))) {
     throw configError(`参数 ${code} 的可调范围非法（需 min < max）`)
   }
-  if (!Number.isFinite(setpoint)) throw configError(`参数 ${code} 缺少有效 setpoint`)
 
   const deadbandDefault = num(opts.deadbandPctDefault, 10)
 
