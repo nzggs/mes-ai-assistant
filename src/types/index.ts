@@ -297,6 +297,8 @@ export interface ApcSourceInfo {
   ready: boolean
   /** 未就绪原因：no-project / no-template / no-connection */
   reason?: string
+  /** 取数可继续、但结果有隐患时的告警（如时间戳列未被 SELECT 出来 → 趋势图只能按序号铺点） */
+  warnings?: string[]
 }
 
 /** 参数概览响应（GET /api/apc/overview） */

@@ -197,9 +197,15 @@ export function buildTemplateVars(catalog, { minutes, limit, codes, params }) {
     if (missing.length > 0) {
       throw new Error(`宽表取数模式下以下参数未配置数据列名：${missing.join('、')}`)
     }
-    vars.columns = targetParams
-      .map(p => quoteIdent(assertIdent(p.column, `参数 ${p.code} 的数据列名`)))
-      .join(', ')
+    const colNames = targetParams.map(p => assertIdent(p.column, `参数 ${p.code} 的数据列名`))
+    // 时间戳列必须出现在结果集里。宽表是「一行一个时间戳」，若 SELECT 列表里没有时间列，
+    // normalizeWideSeries 取不到它就会回落到 Date.now()，整窗口的点会共享同一个时间戳，
+    // 折线图随即塌成一条竖直/水平直线（现场故障）。此处统一并入，避免每个模板各写一遍。
+    if (cols.ts) {
+      const tsCol = assertIdent(cols.ts, '时间戳列')
+      if (!colNames.some(c => c.toUpperCase() === tsCol.toUpperCase())) colNames.unshift(tsCol)
+    }
+    vars.columns = colNames.map(quoteIdent).join(', ')
   } else {
     vars.codeFilter = buildCodeFilter(cols.code || 'PARAM_CODE', codes)
   }
@@ -254,17 +260,25 @@ export async function previewQuery({ queries, params, minutes, maxRows, slot } =
 
   const started = Date.now()
   const { rows, truncated } = await queryReadOnly(sqlText, { maxRows: cap, slotId })
+  const columns = rows.length > 0 ? Object.keys(rows[0]) : []
+  const warnings = queryTemplateWarnings(draftQueries.history, { mode: draftQueries.mode })
+  // 试算也顺手把「时间戳列没取回来」挑出来：这是页面上曲线塌成一条直线的直接原因，
+  // 但只看 SQL 文本是看不出来的（列在 ORDER BY 里出现并不代表它被 SELECT 出来）。
+  const tsColumn = (draftQueries.columns && draftQueries.columns.ts) || 'TS'
+  if (rows.length > 0 && !columns.some(c => c.toUpperCase() === String(tsColumn).toUpperCase())) {
+    warnings.push(`时间戳列 ${tsColumn} 未出现在查询结果列中（当前返回：${columns.join('、')}），趋势图将无法按时间展开。`)
+  }
   return {
     ok: true,
     mode: draftQueries.mode,
     sql: sqlText,
     vars,
-    columns: rows.length > 0 ? Object.keys(rows[0]) : [],
+    columns,
     rows: rows.slice(0, cap).map(sanitizeRow),
     rowCount: rows.length,
     truncated,
     elapsedMs: Date.now() - started,
-    warnings: queryTemplateWarnings(draftQueries.history, { mode: draftQueries.mode }),
+    warnings,
   }
 }
 
@@ -369,6 +383,8 @@ export async function fetchProcessSeries(options = {}) {
         rowCount: 0,
         truncated: false,
         reason: readiness.reason,
+        queryMode: null,
+        warnings: [],
       },
     }
   }
@@ -387,11 +403,14 @@ export async function fetchProcessSeries(options = {}) {
   }
 
   const cols = (cat.queries && cat.queries.columns) || {}
+  const queryMode = (cat.queries && cat.queries.mode) || 'long'
   const series = new Map()
   let totalRows = 0
   let truncated = false
   const skippedSlots = []
   const usedSlots = []
+  // 时间戳列没被取回来 → 折线图只能按序号铺点。记下具体列名，交给页面提示，避免再次静默塌成直线。
+  const tsColumnMissing = new Set()
 
   for (const [slotId, slotParams] of bySlot) {
     if (!isDataSourceConfigured(slotId)) {
@@ -406,16 +425,24 @@ export async function fetchProcessSeries(options = {}) {
     const { rows, truncated: t } = await queryReadOnly(sql, { maxRows, slotId })
     totalRows += rows.length
     truncated = truncated || t
-    const part = cat.queries && cat.queries.mode === 'wide'
-      ? normalizeWideSeries(rows, cols.ts || 'TS', slotParams)
-      : normalizeSeries(rows, cols.code || 'PARAM_CODE', cols.ts || 'TS', cols.value || 'VALUE')
+    const tsColumn = cols.ts || 'TS'
+    if (rows.length > 0 && pickColumn(rows[0], tsColumn) === undefined) tsColumnMissing.add(tsColumn)
+    const part = queryMode === 'wide'
+      ? normalizeWideSeries(rows, tsColumn, slotParams)
+      : normalizeSeries(rows, cols.code || 'PARAM_CODE', tsColumn, cols.value || 'VALUE')
     for (const [code, points] of part) series.set(code, points)
+  }
+
+  const warnings = []
+  for (const col of tsColumnMissing) {
+    warnings.push(`时间戳列 ${col} 未出现在取数结果中，趋势图将无法按时间展开（已回退为按采样点序号显示）。请在取数 SQL 的 SELECT 列表中加入该列。`)
   }
 
   return {
     mode,
     series,
-    queryMode: (cat.queries && cat.queries.mode) || 'long',
+    queryMode,
+    warnings,
     meta: {
       windowMinutes: minutes,
       sampleIntervalSec: cat.sampleIntervalSec,
@@ -423,6 +450,8 @@ export async function fetchProcessSeries(options = {}) {
       truncated,
       usedSlots,
       skippedSlots,
+      queryMode,
+      warnings,
     },
   }
 }
@@ -833,11 +862,12 @@ function describeSource(mode, meta) {
       ? `（数据库系统 ${skipped.map((s) => s.replace('db', '')).join('、')} 未配置连接，绑定这些系统的参数本次无数据）`
       : ''
     return {
-      label: `SAP HANA（只读 · ${wide ? '宽表取数' : '窄表取数'} · 按参数绑定数据库系统）`,
+      label: 'SAP HANA（只读 · 按参数绑定数据库系统）',
       note:
         '实时读取 HANA 中记录的过程数据列值；每个参数项各自绑定使用数据库系统 1 或 2，仅执行 SELECT，' +
         '单次读取行数与执行时间均受服务端限制。' +
         `当前取数模式：${wide ? '宽表（一行一个时间戳，各参数各占一列）' : '窄表（一行一个参数值，按编码列分组）'}。${skippedNote}`,
+      warnings: Array.isArray(meta && meta.warnings) ? meta.warnings : [],
       ready: true,
       reason: '',
     }
@@ -846,6 +876,7 @@ function describeSource(mode, meta) {
   return {
     label: '未配置数据源',
     note: SOURCE_REASON_NOTE[reason] || SOURCE_REASON_NOTE['no-project'],
+    warnings: [],
     ready: false,
     reason,
   }

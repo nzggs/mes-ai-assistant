@@ -49,7 +49,7 @@ const PLACEHOLDERS = [
   { token: '{{minutes}}', desc: '统计窗口分钟数（整数）' },
   { token: '{{limit}}', desc: '行数上限（整数）' },
   { token: '{{codeFilter}}', desc: '窄表：参数编码过滤片段' },
-  { token: '{{columns}}', desc: '宽表：各参数数据列名列表' },
+  { token: '{{columns}}', desc: '宽表：时间戳列 + 各参数数据列名列表（自动生成，无需手写）' },
   { token: '{{schema}}', desc: '模式名（在数据库登录里配置）' },
 ]
 

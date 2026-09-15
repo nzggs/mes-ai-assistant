@@ -53,7 +53,7 @@ import { ApcRto } from './ApcRto'
 
 const STATION = '消费类聚合物锂离子电池 · 极片与电芯产线'
 const SOURCE = {
-  label: 'SAP HANA（只读 · 窄表取数 · 按参数绑定数据库系统）',
+  label: 'SAP HANA（只读 · 按参数绑定数据库系统）',
   note: '实时读取 HANA 中记录的过程数据列值；每个参数项各自绑定使用数据库系统 1 或 2，仅执行 SELECT。',
   ready: true,
   reason: '',

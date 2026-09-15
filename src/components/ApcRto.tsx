@@ -313,8 +313,6 @@ export function ApcRto({ initialProjectId }: { initialProjectId?: string | null 
             </div>
             <p className="text-xs text-mes-textTertiary mt-1 leading-relaxed">
               即时读取只读数据源中记录的过程数据列值，依据数据变化优化过程参数设定值，给出建议值。
-              {activeProjectMeta ? ` · 项目「${activeProjectMeta.name}」（${slotLabel(activeProjectMeta.dbSlot)}）` : ''}
-              {overview ? ` · ${overview.station}` : ''}
             </p>
           </div>
 
@@ -478,6 +476,13 @@ export function ApcRto({ initialProjectId }: { initialProjectId?: string | null 
               </span>
             )}
           </div>
+          {Array.isArray(overview?.source?.warnings) && overview.source.warnings.length > 0 && (
+            <div className="mt-3 pt-3 border-t border-mes-border text-[11px] text-amber-700 leading-relaxed space-y-1">
+              {overview.source.warnings.map((w, i) => (
+                <div key={i}>⚠ {w}</div>
+              ))}
+            </div>
+          )}
           {overview && !overview.ready && (
             <div className="mt-3 pt-3 border-t border-mes-border text-[11px] text-mes-textTertiary leading-relaxed">
               {overview.source?.note}
@@ -910,6 +915,8 @@ function ParamDetail({
   const [history, setHistory] = useState<ApcHistoryResponse | null>(null)
   const [loading, setLoading] = useState(false)
   const [err, setErr] = useState('')
+  /** 横轴口径：默认自动（有时间戳按时间，没有则退化为序号） */
+  const [axisMode, setAxisMode] = useState<'auto' | 'time' | 'index'>('auto')
 
   useEffect(() => {
     let cancelled = false
@@ -925,6 +932,16 @@ function ParamDetail({
   const r = param.recommendation
   const meta = STATUS_META[param.status]
   const points = history?.points || param.series
+
+  // 时间戳缺失或重复时，用相邻点时间差算出的「采样间隔」会是 0 秒，属于误导性数字，直接给 —。
+  const sampleIntervalSec = useMemo(() => {
+    const pts = history?.points || []
+    if (pts.length < 2) return null
+    const span = pts[pts.length - 1].t - pts[0].t
+    const uniq = new Set(pts.map(p => p.t)).size
+    if (!Number.isFinite(span) || span <= 0 || uniq < 2) return null
+    return Math.round(span / (pts.length - 1) / 1000)
+  }, [history])
 
   return (
     <div className="fixed inset-0 z-50 flex items-stretch justify-end bg-black/30" onClick={onClose}>
@@ -963,6 +980,23 @@ function ParamDetail({
             </div>
           )}
 
+          <div className="flex items-center justify-end gap-1 text-[11px]">
+            <span className="text-mes-textTertiary mr-1">横轴</span>
+            {([['auto', '自动'], ['time', '按时间'], ['index', '按序号']] as const).map(([v, label]) => (
+              <button
+                key={v}
+                onClick={() => setAxisMode(v)}
+                className={`px-2 py-0.5 rounded-full border transition-colors ${
+                  axisMode === v
+                    ? 'border-mes-primary text-mes-primary bg-mes-tagBg'
+                    : 'border-mes-border text-mes-textTertiary hover:text-mes-textSecondary'
+                }`}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+
           <ApcTrendChart
             points={points}
             lsl={param.lsl}
@@ -974,6 +1008,7 @@ function ParamDetail({
             status={param.status}
             suggested={r.hold ? undefined : r.suggested}
             height={240}
+            axisMode={axisMode}
           />
 
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-px bg-mes-border rounded-xl overflow-hidden border border-mes-border">
@@ -1019,7 +1054,7 @@ function ParamDetail({
           <div className="rounded-xl bg-gray-50 px-4 py-3 text-[11px] text-mes-textTertiary leading-relaxed">
             说明：本页所有过程数据均来自只读数据源的 SELECT 查询，不做任何写库操作；
             设定值建议仅在页面展示，不会自动下发到 DCS/PLC，需由工艺工程师确认后手动执行。
-            窗口内共 {param.sampleCount} 个采样点，采样间隔 {history ? Math.round((history.points.length > 1 ? (history.points[history.points.length - 1].t - history.points[0].t) / (history.points.length - 1) : 0) / 1000) : '—'} 秒。
+            窗口内共 {param.sampleCount} 个采样点，采样间隔 {sampleIntervalSec == null ? '—（未取到时间列）' : `${sampleIntervalSec} 秒`}。
           </div>
         </div>
       </div>

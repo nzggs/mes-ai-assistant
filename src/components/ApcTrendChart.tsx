@@ -18,6 +18,11 @@ interface ApcTrendChartProps {
   height?: number
   /** 当前建议值（存在时绘制一条虚线参考） */
   suggested?: number
+  /**
+   * 横轴口径：auto=时间戳可用时按时间、否则按采样点序号（默认）；
+   * time=强制按时间；index=强制按序号等距铺开。
+   */
+  axisMode?: 'auto' | 'time' | 'index'
 }
 
 const W = 720
@@ -51,11 +56,23 @@ export function ApcTrendChart({
   status,
   height = 200,
   suggested,
+  axisMode = 'auto',
 }: ApcTrendChartProps) {
   const [hover, setHover] = useState<number | null>(null)
   const H = height
   const innerW = W - PAD.l - PAD.r
   const innerH = H - PAD.t - PAD.b
+
+  // 有效时间戳（有限且互不相同）不足 2 个时，若仍按时间铺点，所有点会挤在同一个横坐标上，
+  // 整条曲线被压成一条竖线。此时退化为「按采样点序号等距铺开」：形状仍可读，
+  // 并在图上方注明口径，避免看图的人把序号当成时间。
+  const usableTimeCount = useMemo(() => {
+    const set = new Set<number>()
+    for (const p of points) if (Number.isFinite(p.t)) set.add(p.t)
+    return set.size
+  }, [points])
+  const byIndex = axisMode === 'index' || (axisMode === 'auto' && usableTimeCount < 2)
+  const degradedToIndex = byIndex && axisMode === 'auto'
 
   const geo = useMemo(() => {
     const values = points.map(p => p.v).filter(v => Number.isFinite(v))
@@ -75,22 +92,29 @@ export function ApcTrendChart({
     return { lo, hi, t0, t1: t1 > t0 ? t1 : t0 + 1 }
   }, [points, lsl, usl, setpoint, optimalTarget])
 
-  const xOf = (t: number) => PAD.l + ((t - geo.t0) / (geo.t1 - geo.t0)) * innerW
   const yOf = (v: number) => PAD.t + innerH - ((v - geo.lo) / (geo.hi - geo.lo)) * innerH
+
+  /** 每个点的横坐标：序号口径等距铺开；时间口径按真实时间戳插值 */
+  const xs = useMemo(() => {
+    const n = points.length
+    if (byIndex) {
+      return points.map((_, i) => (n <= 1 ? PAD.l + innerW / 2 : PAD.l + (i / (n - 1)) * innerW))
+    }
+    return points.map(p => PAD.l + ((p.t - geo.t0) / (geo.t1 - geo.t0)) * innerW)
+  }, [points, geo.t0, geo.t1, byIndex, innerW])
 
   const linePath = useMemo(() => {
     if (points.length === 0) return ''
     return points
-      .map((p, i) => `${i === 0 ? 'M' : 'L'}${xOf(p.t).toFixed(2)},${yOf(p.v).toFixed(2)}`)
+      .map((p, i) => `${i === 0 ? 'M' : 'L'}${xs[i].toFixed(2)},${yOf(p.v).toFixed(2)}`)
       .join(' ')
-  }, [points, geo])
+  }, [points, xs, geo])
 
   const areaPath = useMemo(() => {
     if (points.length === 0) return ''
-    const first = points[0]
-    const last = points[points.length - 1]
-    return `${linePath} L${xOf(last.t).toFixed(2)},${(PAD.t + innerH).toFixed(2)} L${xOf(first.t).toFixed(2)},${(PAD.t + innerH).toFixed(2)} Z`
-  }, [points, linePath, geo])
+    const bottom = (PAD.t + innerH).toFixed(2)
+    return `${linePath} L${xs[xs.length - 1].toFixed(2)},${bottom} L${xs[0].toFixed(2)},${bottom} Z`
+  }, [points, linePath, xs, geo])
 
   const gridLines = useMemo(() => {
     const out: { v: number; y: number }[] = []
@@ -122,6 +146,11 @@ export function ApcTrendChart({
 
   return (
     <div className="relative">
+      {degradedToIndex && (
+        <div className="mb-1.5 text-[10px] text-amber-700">
+          时间列未取到，横轴按采样点序号显示（顺序即数据返回顺序，不代表等时间间隔）
+        </div>
+      )}
       <svg
         viewBox={`0 0 ${W} ${H}`}
         className="w-full h-auto select-none"
@@ -206,26 +235,28 @@ export function ApcTrendChart({
           </>
         )}
         {points.length === 1 && (
-          <circle cx={xOf(points[0].t)} cy={yOf(points[0].v)} r="3" fill={lineColor} />
+          <circle cx={xs[0]} cy={yOf(points[0].v)} r="3" fill={lineColor} />
         )}
 
         {/* 悬停十字线 */}
         {hoverPoint && (
           <>
-            <line x1={xOf(hoverPoint.t)} y1={PAD.t} x2={xOf(hoverPoint.t)} y2={PAD.t + innerH} stroke="#c7c7c7" strokeWidth="1" />
-            <circle cx={xOf(hoverPoint.t)} cy={yOf(hoverPoint.v)} r="4" fill="#ffffff" stroke={lineColor} strokeWidth="2" />
+            <line x1={xs[hover as number]} y1={PAD.t} x2={xs[hover as number]} y2={PAD.t + innerH} stroke="#c7c7c7" strokeWidth="1" />
+            <circle cx={xs[hover as number]} cy={yOf(hoverPoint.v)} r="4" fill="#ffffff" stroke={lineColor} strokeWidth="2" />
           </>
         )}
 
-        {/* x 轴时间 */}
+        {/* x 轴刻度 */}
         {points.length > 1 && (
           <>
-            <text x={PAD.l} y={H - 8} fontSize="10" fill="#999999">{fmtTime(points[0].t)}</text>
+            <text x={PAD.l} y={H - 8} fontSize="10" fill="#999999">
+              {byIndex ? '第 1 个采样点' : fmtTime(points[0].t)}
+            </text>
             <text x={PAD.l + innerW / 2} y={H - 8} textAnchor="middle" fontSize="10" fill="#999999">
-              {fmtTime(points[Math.floor(points.length / 2)].t)}
+              {byIndex ? `第 ${Math.floor(points.length / 2) + 1} 个采样点` : fmtTime(points[Math.floor(points.length / 2)].t)}
             </text>
             <text x={PAD.l + innerW} y={H - 8} textAnchor="end" fontSize="10" fill="#999999">
-              {fmtTime(points[points.length - 1].t)}
+              {byIndex ? `第 ${points.length} 个采样点` : fmtTime(points[points.length - 1].t)}
             </text>
           </>
         )}
@@ -235,9 +266,9 @@ export function ApcTrendChart({
       {hoverPoint && (
         <div
           className="pointer-events-none absolute top-0 px-2 py-1 rounded-md bg-mes-text/85 text-white text-[11px] leading-tight whitespace-nowrap"
-          style={{ left: `${(xOf(hoverPoint.t) / W) * 100}%`, transform: 'translateX(-50%)' }}
+          style={{ left: `${(xs[hover as number] / W) * 100}%`, transform: 'translateX(-50%)' }}
         >
-          <div>{fmtTime(hoverPoint.t)}</div>
+          <div>{byIndex ? `第 ${(hover as number) + 1} 个采样点` : fmtTime(hoverPoint.t)}</div>
           <div className="font-semibold">{fmt(hoverPoint.v, decimals)}{unit ? ` ${unit}` : ''}</div>
         </div>
       )}

@@ -10,9 +10,10 @@ import {
 import {
   basicStats, linearSlope, roundTo, optimizeParam,
   loadCatalog, getSourceMode, getSourceReadiness, getOverview, getOptimization, getApcStatus,
-  clearApcCache, listParams, getMesGuide, queryMesSql,
+  clearApcCache, listParams, getMesGuide, queryMesSql, buildTemplateVars,
 } from './apcService.js'
 import { saveParams, createProject, deleteProject, listProjects } from './apcConfig.js'
+import { renderSqlTemplate } from './sqlGuard.js'
 
 // 测试隔离：把运行期配置指向一个不存在的临时文件。
 // 否则开发者本机数据卷里的 apc.config.json（可能配了真实库地址）会让这些用例结果不确定。
@@ -435,5 +436,63 @@ describe('apcService · 参数目录校验', () => {
     const file = writeCatalog(JSON.stringify({ station: 'x' }))
     process.env.APC_CATALOG_FILE = file
     expect(() => loadCatalog(true)).toThrow(/params/)
+  })
+})
+
+// ===== 宽表取数的列清单 =====
+// 回归：宽表「一行一个时间戳」，SELECT 列表里必须包含时间列。
+// 曾经只由参数列拼出 {{columns}}，结果集里没有时间戳 → normalizeWideSeries 全体回落 Date.now()
+// → 整窗口的点共享同一个时间戳 → 趋势图塌成一条直线（现场故障）。
+describe('apcService · 宽表取数列清单', () => {
+  const wideCatalog = () => ({
+    schema: '',
+    queries: { mode: 'wide', history: 'SELECT {{columns}} FROM T', columns: { ts: 'A008' } },
+    params: [{ code: 'JYL', column: 'A004' }],
+  })
+
+  it('宽表：{{columns}} 自动带上时间戳列（首列）', () => {
+    const vars = buildTemplateVars(wideCatalog(), { minutes: 120, limit: 2000, codes: ['JYL'] })
+    const list = vars.columns.split(',').map((s) => s.trim())
+    expect(list[0]).toBe('"A008"')
+    expect(list).toContain('"A004"')
+    expect(list).toHaveLength(2)
+  })
+
+  it('宽表：时间戳列与参数列同名时不重复展开', () => {
+    const cat = {
+      schema: '',
+      queries: { mode: 'wide', history: 'SELECT {{columns}} FROM T', columns: { ts: 'A008' } },
+      params: [{ code: 'K1', column: 'A008' }],
+    }
+    const vars = buildTemplateVars(cat, { minutes: 60, limit: 100, codes: ['K1'] })
+    expect(vars.columns).toBe('"A008"')
+  })
+
+  it('宽表：拼接后的 SQL 里确实含有时间列名称', () => {
+    const vars = buildTemplateVars(wideCatalog(), { minutes: 120, limit: 2000, codes: ['JYL'] })
+    const sql = renderSqlTemplate(wideCatalog().queries.history, vars)
+    expect(sql).toContain('"A008"')
+    expect(sql).toContain('"A004"')
+  })
+
+  it('窄表：不展开参数列，只给编码过滤片段', () => {
+    const cat = {
+      schema: '',
+      queries: { mode: 'long', history: 'SELECT * FROM T WHERE 1=1 {{codeFilter}}', columns: { code: 'PARAM_CODE', ts: 'TS', value: 'VALUE' } },
+      params: [{ code: 'K1' }],
+    }
+    const vars = buildTemplateVars(cat, { minutes: 60, limit: 100, codes: ['K1'] })
+    expect(vars.columns).toBe('')
+    expect(vars.codeFilter).toContain('IN')
+    expect(vars.codeFilter).toContain('K1')
+  })
+
+  it('宽表：参数缺 column 时明确报错（不靠编码猜列名）', () => {
+    const cat = {
+      schema: '',
+      queries: { mode: 'wide', history: 'SELECT {{columns}} FROM T', columns: { ts: 'A008' } },
+      params: [{ code: 'K1' }],
+    }
+    expect(() => buildTemplateVars(cat, { minutes: 60, limit: 100, codes: ['K1'] })).toThrow(/数据列名/)
   })
 })
