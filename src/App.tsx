@@ -21,6 +21,7 @@ import type { MesGuide } from './types'
 import { ensureSuperAdminSeeded, syncUsersFromBackend, canAccessUserManagement, canAccessDatabaseManagement } from './services/userService'
 import { getAllDocs, restoreDocsFromRecords, syncLocalToBackend, saveTableSummary, fetchAllDocPages } from './services/docStore'
 import { resolveServerHits, fetchObjectIndex, fetchDocumentIndex, type ServerSearchHit, type SearchObject, type DocIndexResult } from './services/searchApi'
+import { extractMesSql, trimAfterMesSqlBlock, extractMesSource } from './utils/mesQuery'
 import { resolveModelProfile, hasSqlIntent } from '../shared/modelProfile.js'
 import type { Conversation, ChatMessage, SidebarView, KnowledgeDoc } from './types'
 import { APP_VERSION } from './version'
@@ -45,36 +46,14 @@ function uid(prefix: string): string {
 // 第二轮：前端提取 SQL → POST /api/mes/query（服务端硬护栏：仅 SELECT / 行数上限 /
 // 连接与语句超时，按所选数据库槽位执行）→ 结果回灌给模型，基于真实数据作答。
 
-/** 从模型回答中提取 mes-sql 推荐查询（只取第一个代码块） */
-function extractMesSql(text: string): string | null {
-  const m = text.match(/```mes-sql\s*([\s\S]*?)```/)
-  const sql = m ? m[1].trim() : ''
-  return sql || null
-}
-
-/** 截掉 mes-sql 代码块之后的所有输出。
- * 第一轮模型在给出 SQL 后若继续输出"结果表格 / 数值 / 结论"，必然不是真实查询结果
- * （真实结果要等第二轮系统回传），多为对历史成功回答的复述或编造——曾导致
- * 「查询失败却在报错前列出查询结果」的误导。展示与回灌历史时一律只保留到代码块结束。 */
-function trimAfterMesSqlBlock(text: string): string {
-  const start = text.indexOf('```mes-sql')
-  if (start === -1) return text
-  const end = text.indexOf('```', start + 10)
-  if (end === -1) return text.slice(0, start)
-  return text.slice(0, end + 3)
-}
+// mes-sql 文本解析（提取 SQL / 截断块后输出 / 取来源标注）见 ./utils/mesQuery.ts，
+// 因含纯函数逻辑、便于单测，已从本文件抽出。
 
 // 提取/替换 ```user-memory 代码块（记忆自动保存）。
 // 注意：用 RegExp 构造器而不是含反引号的正则字面量——babel 在「嵌套箭头 + 三元」里
 // 解析含反引号的正则字面量会误报语法错误（build 实测）。
 const USER_MEMORY_EXTRACT_RE = new RegExp('```user-memory\\s*([\\s\\S]*?)```')
 const USER_MEMORY_FENCE_RE = new RegExp('```user-memory[\\s\\S]*?```')
-
-/** 从 mes-sql 代码块之前的文本里提取「来源：xxx」标注（SQL 取自哪篇文档/哪个脚本） */
-function extractMesSource(text: string): string | null {
-  const m = text.match(/来源\s*[：:]\s*([^\n`]{1,120})/)
-  return m ? m[1].trim() : null
-}
 
 /** 构建注入给模型的 MES 直查指引（随所选槽位变化；不注入任何项目 SQL 模板） */
 function buildMesInstruction(guide: MesGuide | null, slotId: 'db1' | 'db2', slotName: string): string {
@@ -86,8 +65,12 @@ function buildMesInstruction(guide: MesGuide | null, slotId: 'db1' | 'db2', slot
   lines.push(`2. 结果行数上限 ${limits?.chatRows ?? 100} 行；请在 SQL 里写好 LIMIT 并合理取数。`)
   lines.push(`3. 不得残留任何 {{...}} 模板占位符——占位符必须代入具体值。`)
   lines.push(`4. 只查询与用户问题相关的数据，不要把所有列全查出来。`)
+  lines.push(`5. **先判断用户意图，再决定要不要查库（重要）**：`)
+  lines.push(`   - 用户问的是**分析思路 / 排查方法**（如"如何分析…为什么不合格""怎么排查…""可能有哪些原因""从哪几方面入手"），且**没有给出具体对象**（电池 SN／码号、工单号、批次号、料号、设备号、时间区间等）时，**不要输出 mes-sql 代码块**，也不要编造数值；只给分析建议：分析对象与判定标准、需要看哪些报表/工具/关键参数、按什么顺序排查、每一步的判定依据。`)
+  lines.push(`   - 这类回答的**最后一句**必须主动引导用户补充码号，例如："如果你能提供问题电池的 SN（码号）／工单号／批次，我可以直接到「${slotName}」把它对应的实测值与规格上下限拉出来对比。"`)
+  lines.push(`   - 只有当用户给出具体码号、或明确要求"帮我查数据／查一下这支电池"时，才输出 mes-sql 代码块发起查询。`)
   lines.push(`SQL 从哪里来：**优先使用上方知识库上下文里出现的 SQL 查询/脚本片段**（包括其表名、列名与过滤写法），按用户问题改写成一条完整 SELECT；知识库中没有可用的 SQL 时，基于上下文里的表结构信息谨慎编写，并明确说明该 SQL 未经现场验证。`)
-  lines.push(`输出格式：需要查库时，先用一句话说明查询意图与 **来源**（格式：来源：<文档名/脚本名>；若无来源写 来源：知识库未命中，SQL 为自行编写），然后输出一个 \`\`\`mes-sql 代码块（内含完整 SQL）。输出该代码块后**必须立即停止**，不得再输出任何表格、数值、结论或示例结果——真实结果只能来自系统回传，提前写出的任何数据都会被系统隐藏并视为编造。除此之外**不要编造任何具体数值**。无需查库即可回答时，不要输出 mes-sql 代码块。`)
+  lines.push(`输出格式：需要查库时，先用一句话说明查询意图与 **来源**（格式：来源：<文档名/脚本名>；若无来源写 来源：知识库未命中，SQL 为自行编写），然后输出一个 \`\`\`mes-sql 代码块（内含完整 SQL）。**代码块内只放纯 SQL**（可用 -- 写注释），来源与任何说明文字一律写在代码块外面——写进块内的说明行会导致护栏以"仅允许 SELECT / WITH"整条拒绝。输出该代码块后**必须立即停止**，不得再输出任何表格、数值、结论或示例结果——真实结果只能来自系统回传，提前写出的任何数据都会被系统隐藏并视为编造。除此之外**不要编造任何具体数值**。无需查库即可回答时，不要输出 mes-sql 代码块。`)
   return lines.join('\n')
 }
 
