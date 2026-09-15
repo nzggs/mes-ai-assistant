@@ -13,6 +13,8 @@ const docTypeConfig: Record<SourceCitation['docType'], { label: string; icon: st
   mes: { label: 'MES', icon: '🗄️', color: '#0891b2', bg: '#ecfeff' },
   xml: { label: 'XML', icon: '🗂️', color: '#7c3aed', bg: '#f5f3ff' },
   txt: { label: 'TXT', icon: '📝', color: '#0d9488', bg: '#f0fdfa' },
+  md: { label: 'MD', icon: '📘', color: '#4f46e5', bg: '#eef2ff' },
+  csv: { label: 'CSV', icon: '📋', color: '#b45309', bg: '#fffbeb' },
 }
 
 export function SourceListView({ sources }: SourceListViewProps) {

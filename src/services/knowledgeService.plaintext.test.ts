@@ -1,8 +1,9 @@
-// 纯文本文件（.txt）解析：编码自适应解码 + 分页切分。
-// 现场导出的 txt 常见 UTF-8 / UTF-8 BOM / UTF-16 / GBK 四种编码，
+// 纯文本家族（.txt / .md / .csv）解析：编码自适应解码 + 分页切分。
+// 现场导出的文本常见 UTF-8 / UTF-8 BOM / UTF-16 / GBK 四种编码，
 // 其中 GBK 若被按 UTF-8 硬解会整篇乱码并污染检索与总结，故此处逐编码锁定行为。
+// .md / .csv 与 .txt 共用同一条链路，因此解码用例对三者同样成立，另补 md/csv 的分页特性。
 import { describe, it, expect } from 'vitest'
-import { decodePlainText, splitPlainTextPages } from './knowledgeService'
+import { decodePlainText, splitPlainTextPages, isPlainTextType, PLAIN_TEXT_TYPES } from './knowledgeService'
 
 /** UTF-8 字节 */
 function utf8(s: string): Uint8Array {
@@ -11,6 +12,22 @@ function utf8(s: string): Uint8Array {
 
 /** GBK 字节（手工构造，TextEncoder 只支持 UTF-8；'中文' = D6D0 CEC4） */
 const GBK_ZHONGWEN = new Uint8Array([0xd6, 0xd0, 0xce, 0xc4])
+
+describe('isPlainTextType', () => {
+  it('txt / md / csv 属于纯文本家族', () => {
+    expect(PLAIN_TEXT_TYPES).toEqual(['txt', 'md', 'csv'])
+    for (const t of PLAIN_TEXT_TYPES) expect(isPlainTextType(t)).toBe(true)
+  })
+
+  it('二进制与结构化格式不属于纯文本家族', () => {
+    for (const t of ['word', 'ppt', 'excel', 'pdf', 'xml']) expect(isPlainTextType(t)).toBe(false)
+  })
+
+  it('空值不会误判', () => {
+    expect(isPlainTextType(undefined)).toBe(false)
+    expect(isPlainTextType('')).toBe(false)
+  })
+})
 
 describe('decodePlainText', () => {
   it('UTF-8（无 BOM）中文正常解码', () => {
@@ -37,6 +54,11 @@ describe('decodePlainText', () => {
   it('GBK 与 UTF-8 混排时的中文行同样可读', () => {
     const bytes = new Uint8Array([...GBK_ZHONGWEN, ...utf8('：3.2g')])
     expect(decodePlainText(bytes)).toContain('中文')
+  })
+
+  it('GBK 编码的 CSV 表头行可正常解码（csv 走同一链路的原因）', () => {
+    const bytes = new Uint8Array([...GBK_ZHONGWEN, ...utf8(',3.2g,12h')])
+    expect(decodePlainText(bytes)).toBe('中文,3.2g,12h')
   })
 
   it('空字节返回空串', () => {
@@ -93,5 +115,24 @@ describe('splitPlainTextPages', () => {
     expect(pages).toHaveLength(2)
     expect(pages[0].paragraphs[0]).toBe(block)
     expect(pages[1].paragraphs[0]).toBe(block)
+  })
+
+  it('Markdown 原文逐字保留（不解析、不剥离标记）', () => {
+    const md = ['# 注液工艺', '', '- 注液量 3.2g', '- 静置 12h', '', '| 参数 | 值 |', '| --- | --- |'].join('\n')
+    const pages = splitPlainTextPages('工艺说明.md', md)
+    expect(pages).toHaveLength(1)
+    expect(pages[0].title).toBe('工艺说明.md - 第1段')
+    expect(pages[0].paragraphs[0]).toBe(md)
+  })
+
+  it('CSV 按行分页：不把一行（一条记录）从中间劈开', () => {
+    const rows = ['泵号,注液量,静置时长', ...Array.from({ length: 80 }, (_, i) => `P${i + 1},3.${i % 10}g,12h`)]
+    const pages = splitPlainTextPages('导出.csv', rows.join('\n'), 120)
+    expect(pages.length).toBeGreaterThan(1)
+    const allLines = pages.flatMap(p => p.paragraphs[0].split('\n'))
+    // 行数与顺序完整保留，且每行都是完整的整行（没有半行残片）
+    expect(allLines).toEqual(rows)
+    expect(allLines.every(l => rows.includes(l))).toBe(true)
+    expect(pages.map(p => p.title)).toEqual(pages.map((_, i) => `导出.csv - 第${i + 1}段`))
   })
 })

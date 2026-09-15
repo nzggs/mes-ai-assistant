@@ -1,6 +1,6 @@
 import { useState, useMemo, useCallback, useRef, useEffect } from 'react'
 import { PdfViewer } from './PdfViewer'
-import { processUploadedDoc, reextractDocMetadata, summarizeDocumentScope, FULL_DOC_SUMMARY_KEY } from '../services/knowledgeService'
+import { processUploadedDoc, reextractDocMetadata, summarizeDocumentScope, FULL_DOC_SUMMARY_KEY, isPlainTextType } from '../services/knowledgeService'
 import { getApiKey, getProviderId, resolveModelId, getGroupId } from '../services/llmApi'
 import { saveTableSummary, appendDocLog, getDocLogs, saveUploadedDoc, saveMeta, removeDoc, syncDocNow, fetchAllDocPages } from '../services/docStore'
 import { canReviewDoc, type User } from '../services/userService'
@@ -17,6 +17,8 @@ const docTypeConfig = {
   pdf: { label: 'PDF', icon: '📕', color: '#dc2626', bg: '#fef2f2' },
   xml: { label: 'XML', icon: '🗂️', color: '#7c3aed', bg: '#f5f3ff' },
   txt: { label: 'TXT', icon: '📝', color: '#0d9488', bg: '#f0fdfa' },
+  md: { label: 'Markdown', icon: '📘', color: '#4f46e5', bg: '#eef2ff' },
+  csv: { label: 'CSV', icon: '📋', color: '#b45309', bg: '#fffbeb' },
 }
 
 const statusConfig = {
@@ -33,15 +35,15 @@ const XML_NO_SUMMARY_HINT =
   'XML 数据导出为逐条结构化记录，检索已由服务端索引直接命中，无需进行 AI 总结。如需查找某个对象，直接在问答中输入对象编号或功能描述即可（例如「PM1CEMD029」或「转序时间设置」）。'
 
 // 根据文件扩展名判断类型
-function getFileType(filename: string): 'word' | 'ppt' | 'excel' | 'pdf' | 'xml' | 'txt' | null {
+function getFileType(filename: string): 'word' | 'ppt' | 'excel' | 'pdf' | 'xml' | 'txt' | 'md' | 'csv' | null {
   const ext = filename.toLowerCase().split('.').pop()
   if (ext === 'doc' || ext === 'docx') return 'word'
   if (ext === 'ppt' || ext === 'pptx') return 'ppt'
   if (ext === 'xls' || ext === 'xlsx') return 'excel'
   if (ext === 'pdf') return 'pdf'
   if (ext === 'xml') return 'xml'
-  // 纯文本文件（编码 UTF-8/GBK 自适应，见 knowledgeService.decodePlainText）
-  if (ext === 'txt') return 'txt'
+  // 纯文本家族（.txt/.md/.csv）：编码 UTF-8/GBK 自适应，见 knowledgeService.PLAIN_TEXT_TYPES
+  if (isPlainTextType(ext)) return ext as 'txt' | 'md' | 'csv'
   return null
 }
 
@@ -435,7 +437,7 @@ export function KnowledgeBase({ documents, currentUser, onDocumentsChange, onReq
       const fileUrl = fileType !== 'pdf' ? objectUrl : undefined
 
       // 获取详细扩展名
-      const ext = file.name.toLowerCase().split('.').pop() as 'docx' | 'doc' | 'pptx' | 'ppt' | 'xlsx' | 'xls' | 'pdf' | 'xml' | 'txt'
+      const ext = file.name.toLowerCase().split('.').pop() as 'docx' | 'doc' | 'pptx' | 'ppt' | 'xlsx' | 'xls' | 'pdf' | 'xml' | 'txt' | 'md' | 'csv'
 
       // 创建文档初始内容（解析前占位）
       const emptyPages: DocPage[] = fileType !== 'pdf' ? [{
@@ -739,7 +741,7 @@ export function KnowledgeBase({ documents, currentUser, onDocumentsChange, onReq
               ref={fileInputRef}
               type="file"
               multiple
-              accept=".doc,.docx,.ppt,.pptx,.xls,.xlsx,.pdf,.xml,.txt"
+              accept=".doc,.docx,.ppt,.pptx,.xls,.xlsx,.pdf,.xml,.txt,.md,.csv"
               onChange={handleFileInputChange}
               className="hidden"
             />
@@ -792,6 +794,8 @@ export function KnowledgeBase({ documents, currentUser, onDocumentsChange, onReq
                   <span className="text-xs px-2 py-0.5 rounded bg-red-50 text-red-600 font-medium">📕 PDF (.pdf)</span>
                   <span className="text-xs px-2 py-0.5 rounded bg-cyan-50 text-cyan-600 font-medium">🗄️ XML (.xml)</span>
                   <span className="text-xs px-2 py-0.5 rounded bg-teal-50 text-teal-600 font-medium">📝 文本 (.txt)</span>
+                  <span className="text-xs px-2 py-0.5 rounded bg-indigo-50 text-indigo-600 font-medium">📘 Markdown (.md)</span>
+                  <span className="text-xs px-2 py-0.5 rounded bg-amber-50 text-amber-600 font-medium">📋 表格 (.csv)</span>
                 </div>
                 <div className="flex items-center gap-2">
                   <button
@@ -1695,9 +1699,9 @@ function OriginalDocModal({ doc, onClose }: { doc: KnowledgeDoc; onClose: () => 
           return
         }
 
-        if (doc.type === 'txt') {
-          // 纯文本文件：等宽字体展示已解码正文（编码已在入库时按 BOM/UTF-8/GBK 归一，
-          // 因此这里直接渲染解析结果即可，不会出现乱码）。长 txt 已按行分页，逐段展示。
+        if (isPlainTextType(doc.type)) {
+          // 纯文本家族（txt/md/csv）：等宽字体展示已解码正文（编码已在入库时按 BOM/UTF-8/GBK 归一，
+          // 因此这里直接渲染解析结果即可，不会出现乱码）。长文本已按行分页，逐段展示。
           const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
           const pages = Array.isArray(doc.content) ? doc.content : []
           if (pages.length === 0) {
@@ -1845,6 +1849,8 @@ function OriginalDocModal({ doc, onClose }: { doc: KnowledgeDoc; onClose: () => 
       pdf: { mime: 'application/pdf', label: 'PDF 文档' },
       xml: { mime: 'application/xml', label: 'XML 数据文件' },
       txt: { mime: 'text/plain', label: '文本文件' },
+      md: { mime: 'text/markdown', label: 'Markdown 文档' },
+      csv: { mime: 'text/csv', label: 'CSV 表格数据' },
     }
     const typeInfo = mimeMap[ext] || { mime: 'application/octet-stream', label: '原始文档' }
 

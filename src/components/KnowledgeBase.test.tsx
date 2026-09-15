@@ -159,4 +159,29 @@ describe('KnowledgeBase', () => {
     })
     expect(document.body.textContent).toContain('注液工艺说明.txt - 第2段')
   })
+
+  // .csv 表格数据：与 txt/md 同为纯文本家族。此处锁定「能识别类型 + 原文逐行可读」，
+  // 防止只加了上传白名单、忘记接原文预览分支的情况。
+  it('.csv 表格数据：列表显示 CSV 标签，点「阅读原文」逐段渲染行数据', async () => {
+    const csvDoc: KnowledgeDoc = {
+      id: 'c1', name: '注液参数导出.csv', type: 'csv', fileType: 'csv', status: 'approved',
+      summary: '注液工序参数导出表', keywords: ['注液'], content: [
+        { pageNum: 1, title: '注液参数导出.csv - 第1段', paragraphs: ['泵号,注液量,静置时长\nP1,3.2g,12h'] },
+        { pageNum: 2, title: '注液参数导出.csv - 第2段', paragraphs: ['P2,3.1g,12h'] },
+      ],
+      chunks: 2, pages: 2, size: '0.6 KB', fileUrl: 'blob:fake-original.csv',
+      tableSummaries: {}, summaryChunks: [],
+      uploadDate: '2026-09-15', approvedDate: '2026-09-15', uploader: 'admin',
+    } as any
+    renderKB([csvDoc], { username: 'admin', displayName: '管理员', department: 'IT部', role: 'admin' })
+
+    expect(screen.getByText('CSV')).toBeInTheDocument()
+    expect(screen.getByText('注液参数导出.csv')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByText('阅读原文'))
+    await waitFor(() => {
+      expect(document.body.textContent).toContain('泵号,注液量,静置时长')
+    })
+    expect(document.body.textContent).toContain('注液参数导出.csv - 第2段')
+  })
 })

@@ -743,7 +743,24 @@ async function extractOfficeText(doc: KnowledgeDoc): Promise<ExtractResult> {
   }
 }
 
-// ===== 纯文本文件（.txt）解析 =====
+// ===== 纯文本文件（.txt / .md / .csv）解析 =====
+
+/**
+ * 「纯文本家族」：这些格式本质都是文本，共用同一条「BOM/UTF-8/GBK 解码 → 按行分页」链路。
+ * - .txt  工艺说明、日志、老系统导出
+ * - .md   Markdown 文档（按纯文本入库：保留原始标记，检索/总结按原文语义处理）
+ * - .csv  表格数据导出（按行分页，一页含多行记录）
+ *
+ * .csv 特意不走 SheetJS：MES/老系统导出的 CSV 多为 GBK，走文本链路才能用上解码回退，
+ * 否则中文表头与字段会整篇乱码，进而污染检索与总结。
+ * 新增文本类格式只需在此登记（判断函数 isPlainTextType 已同时供服务与 UI 使用）。
+ */
+export const PLAIN_TEXT_TYPES = ['txt', 'md', 'csv'] as const
+
+/** 判断文档类型是否属于「纯文本家族」 */
+export function isPlainTextType(t: string | undefined): boolean {
+  return !!t && (PLAIN_TEXT_TYPES as readonly string[]).includes(t)
+}
 
 /** 纯文本单页字符上限：超出则在行边界切分为多页，避免一页渲染几万行把浏览器卡死 */
 const TXT_PAGE_CHARS = 4000
@@ -818,10 +835,11 @@ export function splitPlainTextPages(fileName: string, text: string, pageChars = 
 }
 
 /**
- * 解析 .txt 纯文本文件：按 BOM/UTF-8/GBK 解码后分页。
- * 纯文本无需额外解析依赖，解码即可入库；分页仅为阅读与切片粒度服务。
+ * 解析纯文本家族的文档（.txt / .md / .csv）：按 BOM/UTF-8/GBK 解码后分页。
+ * 这些格式无需额外解析依赖，解码即可入库；分页仅为阅读与切片粒度服务。
+ * 页标题由 splitPlainTextPages 拼成「文件名 - 第N段」，三类格式共用同一写法。
  */
-async function extractTxtText(doc: KnowledgeDoc): Promise<ExtractResult> {
+async function extractPlainTextFile(doc: KnowledgeDoc): Promise<ExtractResult> {
   const url = doc.fileUrl || doc.pdfUrl
   if (!url) throw new Error('文件 URL 不存在')
   const res = await fetch(url)
@@ -1737,11 +1755,11 @@ export function isQuotaLikeError(msg: string | undefined): boolean {
 
 /**
  * 解析失败时给用户的下一步建议（按文件类型区分）。
- * 纯文本（.txt）不适用"另存为 .docx/.xlsx/.pptx"这句提示，需单独给出编码/空文件方向的引导。
+ * 纯文本家族（.txt/.md/.csv）不适用"另存为 .docx/.xlsx/.pptx"这句提示，需单独给出编码/空文件方向的引导。
  */
 function parseFailHint(doc: KnowledgeDoc): string {
   if (doc.type === 'pdf') return '请检查文件是否损坏。'
-  if (doc.type === 'txt') return '请确认文件为非空的纯文本（UTF-8 或 GBK 编码），然后重新上传。'
+  if (isPlainTextType(doc.type)) return '请确认文件为非空的纯文本（UTF-8 或 GBK 编码），然后重新上传。'
   return '旧版二进制格式(.doc/.xls/.ppt)支持有限，建议另存为 .docx/.xlsx/.pptx 格式后重新上传。'
 }
 
@@ -1766,9 +1784,9 @@ export async function processUploadedDoc(
       xmlMeta = await extractXmlText(doc)
       textContent = xmlMeta.text
       extractedPages = xmlMeta.pages
-    } else if (doc.type === 'txt' && (doc.fileUrl || doc.pdfUrl)) {
-      // 纯文本文件（.txt）：按 BOM/UTF-8/GBK 解码后分页，再走与 Office 相同的 AI 归纳
-      const result = await extractTxtText(doc)
+    } else if (isPlainTextType(doc.type) && (doc.fileUrl || doc.pdfUrl)) {
+      // 纯文本家族（.txt/.md/.csv）：按 BOM/UTF-8/GBK 解码后分页，再走与 Office 相同的 AI 归纳
+      const result = await extractPlainTextFile(doc)
       textContent = result.text
       extractedPages = result.pages
     } else if ((doc.type === 'word' || doc.type === 'ppt' || doc.type === 'excel') && (doc.fileUrl || doc.pdfUrl)) {
@@ -1919,8 +1937,8 @@ export async function reextractDocMetadata(
         if (doc.type === 'pdf' && doc.pdfUrl) {
           fresh = await extractPdfText(doc.pdfUrl)
           pages = buildPagesFromText(fresh)
-        } else if (doc.type === 'txt' && (doc.fileUrl || doc.pdfUrl)) {
-          const result = await extractTxtText(doc)
+        } else if (isPlainTextType(doc.type) && (doc.fileUrl || doc.pdfUrl)) {
+          const result = await extractPlainTextFile(doc)
           fresh = result.text
           pages = result.pages
         } else if ((doc.type === 'word' || doc.type === 'ppt' || doc.type === 'excel') && (doc.fileUrl || doc.pdfUrl)) {
