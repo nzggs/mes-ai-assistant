@@ -83,6 +83,20 @@ function trendArrow(trend: string) {
   return '→'
 }
 
+/** 相对时间（用于「最近一次错误」这类历史事件，避免只给一个绝对时间不好判断新旧） */
+function ago(ts: number): string {
+  if (!Number.isFinite(ts) || ts <= 0) return ''
+  const diff = Date.now() - ts
+  if (diff < 0) return '刚刚'
+  const sec = Math.round(diff / 1000)
+  if (sec < 60) return `${sec} 秒前`
+  const min = Math.round(sec / 60)
+  if (min < 60) return `${min} 分钟前`
+  const hour = Math.round(min / 60)
+  if (hour < 24) return `${hour} 小时前`
+  return `${Math.round(hour / 24)} 天前`
+}
+
 function confidenceColor(c: number): string {
   if (c >= 85) return '#16a34a'
   if (c >= 70) return '#f59e0b'
@@ -179,8 +193,11 @@ export function ApcRto({ initialProjectId }: { initialProjectId?: string | null 
       setError(err?.message || String(err))
     } finally {
       setLoading(false)
+      // 取数之后连接状态一定变了（成功即已建连；失败则正是需要显示红灯的时候），
+      // 所以这里无条件刷新一次状态——否则「已经取到数了，灯还是黄的」。
+      loadStatus()
     }
-  }, [windowMinutes, activeProjectId])
+  }, [windowMinutes, activeProjectId, loadStatus])
 
   // 配置保存后：重新拉状态（数据源就绪与否可能已变化）并立即刷新数据
   const handleConfigSaved = useCallback(() => {
@@ -450,7 +467,9 @@ export function ApcRto({ initialProjectId }: { initialProjectId?: string | null 
                     <span className={`w-2 h-2 rounded-full ${s.connected ? 'bg-mes-success' : (s.configured ? 'bg-amber-400' : 'bg-gray-300')}`} />
                     <span className="text-mes-textSecondary">
                       {s.configured
-                        ? (s.connected ? `${s.name || s.id} 已连接 ${s.host}:${s.port}` : `${s.name || s.id} 待连接（首次取数时建立）`)
+                        ? (s.connected
+                            ? `${s.name || s.id} 已连接 ${s.host}:${s.port}`
+                            : `${s.name || s.id} 未连接${s.lastError ? '（探测失败）' : ''}`)
                         : `${s.name || s.id} 未配置`}
                     </span>
                   </span>
@@ -488,11 +507,16 @@ export function ApcRto({ initialProjectId }: { initialProjectId?: string | null 
               {overview.source?.note}
             </div>
           )}
-          {status?.hana?.slots?.some(s => s.lastError) && overview?.mode === 'hana' && (
+          {overview?.mode === 'hana' && status?.hana?.slots?.some(s => s.configured && !s.connected && s.lastError) && (
             <div className="mt-3 pt-3 border-t border-mes-border text-[11px] text-red-600">
-              {status.hana.slots.filter(s => s.lastError).map(s => (
-                <div key={s.id}>最近一次数据源错误（{s.name || s.id}）：{s.lastError}</div>
-              ))}
+              {status.hana.slots
+                .filter(s => s.configured && !s.connected && s.lastError)
+                .map(s => (
+                  <div key={s.id}>
+                    最近一次数据源错误（{s.name || s.id}）：{s.lastError}
+                    {s.lastErrorAt ? `（${ago(s.lastErrorAt)}）` : ''}
+                  </div>
+                ))}
             </div>
           )}
         </div>

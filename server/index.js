@@ -17,7 +17,7 @@ import {
 import { extractPdfTextFromFile } from './pdfExtract.js'
 import { startSummary, getTask, cancelTask, listTasks, recoverSummaryTasks, startTaskCleanup } from './summaryTask.js'
 import { configureSearchIndex, buildIndex, search as searchInIndex, listObjects as listObjectsInIndex, getStatus as getIndexStatus, upsertDocument, removeDocument, hasDocument, pagesOfDoc } from './searchIndex.js'
-import { getApcStatus, getOverview, getOptimization, getHistory, isApcEnabled, clearApcCache, previewQuery, getMesGuide, queryMesSql } from './apcService.js'
+import { getApcStatus, getOverview, getOptimization, getHistory, isApcEnabled, clearApcCache, previewQuery, getMesGuide, queryMesSql, probeConfiguredSlots, clearProbeCache } from './apcService.js'
 import { pingHana, closeHana, getHanaStatus, testHanaConnection } from './hanaClient.js'
 import {
   getConfigForClient, saveDatabase, saveQueries, saveParams, saveMeta, saveLimits,
@@ -1081,8 +1081,12 @@ function parseWindowMinutes(v) {
 }
 
 /** 功能与数据源状态（不含任何凭据） */
-app.get('/api/apc/status', apcEnabledGuard, (_req, res) => {
+app.get('/api/apc/status', apcEnabledGuard, async (req, res) => {
   try {
+    // 先探测「已配置但未连接」的槽位，让 connected 反映真实可达性——否则没被任何项目
+    // 使用的库会永远显示「待连接」。探测内部带 TTL 缓存（APC_PROBE_TTL_MS，默认 30s，
+    // ?refresh=1 强制刷新），因此这里不额外限流也不会把请求压力透传到数据库。
+    await probeConfiguredSlots({ force: boolParam(req.query.refresh) }).catch(() => undefined)
     res.json(getApcStatus())
   } catch (err) {
     return internalError(res, err)
@@ -1264,6 +1268,8 @@ app.post('/api/apc/disconnect', requireAdmin, async (_req, res) => {
 /** 配置变更后让缓存与连接跟配置对齐 */
 async function applyConfigChange() {
   clearApcCache()
+  // 配置变了，之前的探测结论作废（否则 TTL 内仍按旧配置显示灯色）
+  clearProbeCache()
   await closeHana()
 }
 
@@ -1331,7 +1337,11 @@ app.post('/api/apc/config/test-db', requireAdmin, apcProbeRateLimit, async (req,
   const draft = (req.body && req.body.database) || {}
   const id = req.body && req.body.id
   try {
-    res.json(await testHanaConnection(draft, id))
+    const result = await testHanaConnection(draft, id)
+    // 测通后清掉探测缓存：下一次状态查询会立刻重新探测，页面随之转绿，
+    // 不必等 TTL 到期（否则用户会觉得「刚测通了怎么还是黄灯」）。
+    if (result && result.ok) clearProbeCache(id === 'db2' ? 'db2' : id === 'db1' ? 'db1' : undefined)
+    res.json(result)
   } catch (err) {
     return internalError(res, err)
   }

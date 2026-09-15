@@ -357,6 +357,8 @@ export interface ApcHanaSlotStatus {
   maxRows: number
   statementTimeoutMs: number
   lastError: string
+  /** 最近一次错误的发生时间（毫秒）；无错误时为 null */
+  lastErrorAt?: number | null
   lastConnectAt: number | null
   lastQueryAt: number | null
   lastQueryMs: number | null

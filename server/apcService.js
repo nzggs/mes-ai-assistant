@@ -19,7 +19,7 @@
  * 「整数」与「目录内白名单参数编码」，不接受任何客户端传入的裸 SQL。
  */
 import fs from 'fs'
-import { isDataSourceConfigured, queryReadOnly, getHanaStatus, pickColumn } from './hanaClient.js'
+import { isDataSourceConfigured, queryReadOnly, getHanaStatus, pickColumn, pingHana } from './hanaClient.js'
 import * as apcConfig from './apcConfig.js'
 import { CODE_RE, normalizeQueries, normalizeParams, queryTemplateWarnings } from './apcCatalog.js'
 import { quoteIdent, renderSqlTemplate, assertIdent, assertReadOnlySql, applyRowLimit } from './sqlGuard.js'
@@ -880,6 +880,43 @@ function describeSource(mode, meta) {
     ready: false,
     reason,
   }
+}
+
+// ===== 连接可达性探测 =====
+//
+// getHanaStatus() 只是内存快照：connected 只在「本进程真正建立过连接」之后才为真。
+// 于是没被任何项目使用的库（例如只配了连接却没有任何参数的 db2）会永远显示「待连接」，
+// 与实际可达性不符。状态接口在返回前对「已配置但未连接」的槽位探一次，
+// 让灯色反映真实可达性；带 TTL 缓存，避免每次轮询都去打库。
+const probeCache = new Map()
+
+/**
+ * 探测已配置但未连接的槽位（并发、失败不抛出）。
+ * @param {{force?:boolean}} [opts] force=true 时跳过 TTL 缓存
+ */
+export async function probeConfiguredSlots({ force = false } = {}) {
+  const ttl = Math.max(0, num(process.env.APC_PROBE_TTL_MS, 30000))
+  const pending = getHanaStatus().slots.filter((s) => s.configured && !s.connected)
+  await Promise.all(pending.map(async (s) => {
+    const hit = probeCache.get(s.id)
+    if (!force && ttl > 0 && hit && Date.now() - hit.at < ttl) {
+      await hit.promise.catch(() => undefined)
+      return
+    }
+    const promise = pingHana(s.id)
+    probeCache.set(s.id, { at: Date.now(), promise })
+    // 探测失败只落在槽位状态里（页面据此显示），不能让整个状态接口失败
+    await promise.catch(() => undefined)
+  }))
+}
+
+/**
+ * 清掉探测缓存（连接刚被测通 / 配置刚变更时调用，让下一次状态查询立刻重新探测，
+ * 而不是等 TTL 到期）。
+ */
+export function clearProbeCache(slotId) {
+  if (slotId) probeCache.delete(slotId)
+  else probeCache.clear()
 }
 
 export function getApcStatus() {

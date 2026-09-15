@@ -93,6 +93,7 @@ function newSlotState() {
     connected: false,
     connecting: false,
     lastError: '',
+    lastErrorAt: 0,
     lastConnectAt: 0,
     lastQueryAt: 0,
     lastQueryMs: 0,
@@ -113,15 +114,26 @@ function slotEntry(id) {
   return entry
 }
 
-/** 销毁某个槽位的连接（超时/异常时调用，确保服务端会话被释放） */
-function destroyClient(entry, reason) {
+/**
+ * 销毁某个槽位的连接（超时/异常/主动关闭时调用，确保服务端会话被释放）。
+ *
+ * 注意「主动断开」与「连接故障」必须区分开：配置变更或进程收尾属于正常操作，
+ * 若把销毁时驱动回调上来的 error（历史上是 'reset'）记成 lastError，
+ * 页面就会长期挂一条早已恢复的红字。deliberate=true 时不写 lastError。
+ */
+function destroyClient(entry, reason, opts = {}) {
   const c = entry.client
   entry.client = null
   entry.connected = false
-  if (reason) entry.lastError = String(reason)
+  if (!opts.deliberate && reason) {
+    entry.lastError = String(reason)
+    entry.lastErrorAt = Date.now()
+  }
   if (!c) return
   try {
-    if (typeof c.destroy === 'function') c.destroy(new Error(reason || 'reset'))
+    // 传入中性文案而非 'reset'：驱动销毁 socket 时会把该错误回调上来，
+    // 原文案会被误读成「连接被重置」。
+    if (typeof c.destroy === 'function') c.destroy(new Error(opts.deliberate ? 'closed' : (reason || 'closed')))
     else if (typeof c.close === 'function') c.close()
   } catch { /* 忽略关闭异常 */ }
 }
@@ -165,8 +177,12 @@ async function ensureConnected(id) {
 
   const c = hdb.createClient(opts)
   c.on('error', (err) => {
+    // 只有「当前生效的就是这个连接」时才记录：主动断开或重连后，旧连接迟到的 error
+    // 不应覆盖新连接的状态，否则页面会显示一条早已恢复的旧故障。
+    if (entry.client !== c) return
     entry.connected = false
     entry.lastError = String((err && err.message) || err)
+    entry.lastErrorAt = Date.now()
   })
   entry.client = c
   entry.connecting = true
@@ -193,6 +209,7 @@ async function ensureConnected(id) {
       entry.connected = true
       entry.lastConnectAt = Date.now()
       entry.lastError = ''
+      entry.lastErrorAt = 0
       resolve()
     })
   })
@@ -255,6 +272,9 @@ export async function queryReadOnly(sql, opts = {}) {
     entry.lastQueryAt = Date.now()
     entry.lastQueryMs = elapsed
     entry.queryCount++
+    // 查询成功即证明连接可用：清掉历史错误，避免页面长期挂着一条早已恢复的旧故障。
+    entry.lastError = ''
+    entry.lastErrorAt = 0
 
     // 客户端二次硬截断：即使驱动返回超出上限，也不会把超量数据带出本模块
     const capped = Number.isFinite(maxRows) && maxRows > 0 ? rows.slice(0, maxRows) : rows
@@ -293,6 +313,7 @@ export function getHanaStatus() {
         maxRows: cfg.maxRows,
         statementTimeoutMs: cfg.statementTimeoutMs,
         lastError: entry.lastError,
+        lastErrorAt: entry.lastErrorAt || null,
         lastConnectAt: entry.lastConnectAt || null,
         lastQueryAt: entry.lastQueryAt || null,
         lastQueryMs: entry.lastQueryMs || null,
@@ -303,18 +324,29 @@ export function getHanaStatus() {
   }
 }
 
+/** 同一槽位进行中的探测（并发去重：页面轮询与手动检测可能同时触发，避免重复建连） */
+const probePending = new Map()
+
 /** 连通性探测：最轻量的一条只读语句（slotId 指定探测哪个数据库系统） */
-export async function pingHana(slotId) {
+export function pingHana(slotId) {
   const id = DB_SLOTS.includes(slotId) ? slotId : 'db1'
+  const inflight = probePending.get(id)
+  if (inflight) return inflight
   const cfg = getHanaConfig(id)
-  await queryReadOnly('SELECT 1 AS "OK" FROM DUMMY', {
+  const tracked = queryReadOnly('SELECT 1 AS "OK" FROM DUMMY', {
     slotId: id,
     maxRows: 1,
     timeoutMs: Math.min(cfg.statementTimeoutMs, 8000),
     // 探测语句不注入 LIMIT（部分老版本 HANA 不支持 LIMIT），仅靠客户端硬截断
     injectLimit: false,
   })
-  return true
+    .then(() => true)
+    .finally(() => { probePending.delete(id) })
+  // 先挂一个兜底 catch，避免并发探测期间这个 promise 短暂无人接管时被判为 unhandled rejection；
+  // 真正的调用方 await 的仍是同一个 promise，错误照样能拿到。
+  tracked.catch(() => {})
+  probePending.set(id, tracked)
+  return tracked
 }
 
 /** 主动断开连接（进程退出 / 配置变更后重连）；slotId 缺省时断开全部槽位 */
@@ -323,7 +355,8 @@ export function closeHana(slotId) {
   for (const entry of targets) {
     entry.connectPromise = null
     entry.connecting = false
-    destroyClient(entry, '')
+    // deliberate：这是正常收尾，不能记成连接错误
+    destroyClient(entry, '', { deliberate: true })
   }
   return Promise.resolve()
 }

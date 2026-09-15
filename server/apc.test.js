@@ -5,12 +5,13 @@ import os from 'os'
 import path from 'path'
 import {
   assertReadOnlySql, applyRowLimit, stripSqlComments, maskSql,
-  pickColumn, queryReadOnly,
+  pickColumn, queryReadOnly, getHanaStatus, pingHana,
 } from './hanaClient.js'
 import {
   basicStats, linearSlope, roundTo, optimizeParam,
   loadCatalog, getSourceMode, getSourceReadiness, getOverview, getOptimization, getApcStatus,
   clearApcCache, listParams, getMesGuide, queryMesSql, buildTemplateVars,
+  probeConfiguredSlots, clearProbeCache,
 } from './apcService.js'
 import { saveParams, createProject, deleteProject, listProjects } from './apcConfig.js'
 import { renderSqlTemplate } from './sqlGuard.js'
@@ -494,5 +495,43 @@ describe('apcService · 宽表取数列清单', () => {
       params: [{ code: 'K1' }],
     }
     expect(() => buildTemplateVars(cat, { minutes: 60, limit: 100, codes: ['K1'] })).toThrow(/数据列名/)
+  })
+})
+
+// ===== 连接状态与可达性探测 =====
+// 背景：connected 只在「本进程真正建立过连接」后才为真，没被任何项目使用的库会永远
+// 显示「待连接」。状态接口因此在返回前对「已配置但未连接」的槽位做一次探测。
+describe('hanaClient · 连接状态与探测', () => {
+  it('状态快照包含 lastErrorAt（页面据此显示「多久之前」）', () => {
+    const st = getHanaStatus()
+    expect(Array.isArray(st.slots)).toBe(true)
+    expect(st.slots).toHaveLength(2)
+    for (const s of st.slots) {
+      expect(s).toHaveProperty('lastErrorAt')
+      expect(typeof s.lastError).toBe('string')
+    }
+  })
+
+  it('未配置连接时探测会失败（由调用方决定如何展示），不会静默成功', async () => {
+    await expect(pingHana('db2')).rejects.toThrow()
+  })
+
+  it('同一槽位的并发探测复用同一个请求（避免重复建连）', async () => {
+    const a = pingHana('db1')
+    const b = pingHana('db1')
+    expect(a).toBe(b)
+    await expect(a).rejects.toThrow()
+  })
+
+  it('没有已配置槽位时 probeConfiguredSlots 直接返回；clearProbeCache 可安全调用', async () => {
+    await expect(probeConfiguredSlots()).resolves.toBeUndefined()
+    expect(() => clearProbeCache()).not.toThrow()
+    expect(() => clearProbeCache('db1')).not.toThrow()
+  })
+
+  it('状态聚合接口仍是同步可调用（探测放在路由层，不污染 getApcStatus 签名）', () => {
+    const st = getApcStatus()
+    expect(st).toHaveProperty('hana')
+    expect(Array.isArray(st.hana.slots)).toBe(true)
   })
 })
