@@ -541,6 +541,55 @@ describe('ApcRto 页面', () => {
     expect(await screen.findByText('读取过程数据失败')).toBeInTheDocument()
     expect(screen.getByText(/HANA 连接失败/)).toBeInTheDocument()
   })
+
+  // 真实场景：HANA 连得上，但窗口内一行数据都没有。
+  // 服务端会回 status=unknown、latest/mean=null、series=[]、moves=[]，
+  // 页面必须照常渲染（不许整页崩），且绝不能把 null 显示成 NaN。
+  it('窗口内没有数据行时：页面不崩、不出现 NaN，并如实说明为何不做优化判定', async () => {
+    const EMPTY_OUTPUT: ApcCvResult = {
+      ...OUTPUT,
+      latest: null, mean: null, std: null, min_: null, max_: null,
+      sampleCount: 0, slope: 0, trend: 'stable',
+      specResolved: {
+        ok: false,
+        errors: ['setpoint 需要读取列 SPEC_CENTER，但当前没有可用的数据行'],
+        expressions: { setpoint: 'SPEC_CENTER', lsl: 'LOWER_LIMIT', usl: 'UPPER_LIMIT' },
+        columns: ['SPEC_CENTER', 'LOWER_LIMIT', 'UPPER_LIMIT'],
+      },
+      pointDeviation: { n: 0, outOfSpec: 0, outLow: 0, outHigh: 0, worst: null },
+      series: [],
+      target: null, lsl: null, usl: null, cpk: null,
+      status: 'unknown',
+      moves: [],
+      recommendation: {
+        cv: { current: null, target: null, delta: null },
+        moves: [],
+        predictedCV: null, residual: null, residualPct: null,
+        confidence: 0, urgency: 'none', hold: true, rounds: 0, clampedBy: null,
+        reason: '输出结果的规格未能确定，本次不做优化判定：setpoint 需要读取列 SPEC_CENTER，但当前没有可用的数据行。',
+        risk: '',
+      },
+    }
+    mocks.fetchApcOverview.mockResolvedValue({ ...OVERVIEW, rowCount: 0, output: EMPTY_OUTPUT })
+    mocks.fetchApcOptimization.mockResolvedValue({
+      ...OPTIMIZATION, output: EMPTY_OUTPUT, recommendation: EMPTY_OUTPUT.recommendation, moves: [],
+    })
+
+    render(<ApcRto />)
+    // 标题与输出结果卡照常在 → 没有整页空白
+    expect(await screen.findByText('APC 和 RTO')).toBeInTheDocument()
+    expect(screen.getAllByText('正极涂布面密度').length).toBeGreaterThan(0)
+    // 状态如实标注为「未知」，不硬凑成「正常」
+    expect(screen.getAllByText('未知').length).toBeGreaterThan(0)
+    // 空值统一显示破折号，不允许出现 NaN / undefined
+    expect(screen.getAllByText('—').length).toBeGreaterThan(0)
+    expect(screen.queryByText(/NaN/)).not.toBeInTheDocument()
+
+    // 优化建议页：明确「建议保持」，并把「规格未确定」讲清楚
+    fireEvent.click(screen.getByText('优化建议'))
+    expect(await screen.findByText('建议保持')).toBeInTheDocument()
+    expect(screen.getByText(/规格未能确定/)).toBeInTheDocument()
+  })
 })
 
 describe('ApcRto · 选中项目的记忆与校验', () => {
