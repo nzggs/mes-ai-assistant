@@ -8,6 +8,8 @@ import type {
   ApcConfigPatch,
   ApcConfigResponse,
   ApcDatabaseDraft,
+  ApcItemPreview,
+  ApcMonitorItem,
   ApcOverview,
   ApcOptimization,
   ApcHistoryResponse,
@@ -51,6 +53,8 @@ export interface ApcFetchOptions {
   minutes?: number
   /** 监测项目 id（缺省默认项目） */
   project?: string
+  /** 监测项 id（缺省该项目下的第一个监测项） */
+  item?: string
   /** 强制绕过服务端缓存 */
   refresh?: boolean
   timeoutMs?: number
@@ -62,16 +66,20 @@ function windowQuery(opts: ApcFetchOptions): string {
     parts.push(`minutes=${Math.round(opts.minutes)}`)
   }
   if (opts.project) parts.push(`project=${encodeURIComponent(opts.project)}`)
+  if (opts.item) parts.push(`item=${encodeURIComponent(opts.item)}`)
   if (opts.refresh) parts.push('refresh=1')
   return parts.length ? `?${parts.join('&')}` : ''
 }
 
 /** 功能与数据源状态 */
 export async function fetchApcStatus(opts: ApcFetchOptions = {}): Promise<ApcStatusResponse> {
-  return fetchJson<ApcStatusResponse>(`${BACKEND_BASE}/api/apc/status`, opts.timeoutMs ?? 6000)
+  return fetchJson<ApcStatusResponse>(
+    `${BACKEND_BASE}/api/apc/status${opts.refresh ? '?refresh=1' : ''}`,
+    opts.timeoutMs ?? 6000
+  )
 }
 
-/** 过程参数概览：实时值 + 统计量 + 趋势 */
+/** 监测项概览：输出结果 CV 的实时值 / 统计 / 趋势 + N 个参与参数的建议调整量 */
 export async function fetchApcOverview(opts: ApcFetchOptions = {}): Promise<ApcOverview> {
   return fetchJson<ApcOverview>(
     `${BACKEND_BASE}/api/apc/overview${windowQuery(opts)}`,
@@ -79,20 +87,18 @@ export async function fetchApcOverview(opts: ApcFetchOptions = {}): Promise<ApcO
   )
 }
 
-/** 优化建议：过程参数设定值建议值 */
-export async function fetchApcOptimization(
-  opts: ApcFetchOptions & { codes?: string[] } = {}
-): Promise<ApcOptimization> {
-  const extra = opts.codes && opts.codes.length > 0
-    ? `${windowQuery(opts) ? '&' : '?'}codes=${encodeURIComponent(opts.codes.join(','))}`
-    : ''
+/** 优化建议：多对 1 加权分配后的各参与参数调整量（复用概览数据与缓存） */
+export async function fetchApcOptimization(opts: ApcFetchOptions = {}): Promise<ApcOptimization> {
   return fetchJson<ApcOptimization>(
-    `${BACKEND_BASE}/api/apc/optimize${windowQuery(opts)}${extra}`,
+    `${BACKEND_BASE}/api/apc/optimize${windowQuery(opts)}`,
     opts.timeoutMs
   )
 }
 
-/** 单个参数的历史数据列值曲线 */
+/**
+ * 单条曲线：code 可以是输出结果 CV，也可以是任一参与参数。
+ * 必须带 item（服务端会按监测项解析它属于 CV 还是某个 MV）。
+ */
 export async function fetchApcHistory(
   code: string,
   opts: ApcFetchOptions = {}
@@ -245,6 +251,97 @@ export async function deleteApcProject(id: string): Promise<{ ok: boolean; proje
     `/api/apc/projects/${encodeURIComponent(id)}`,
     { method: 'DELETE', headers: adminHeaders() },
     20_000
+  )
+}
+
+// ===== 监测项 CRUD（多对 1 调优的基本单位）=====
+//
+// 老项目（只有 queries + params）在读取时会被服务端**内存合成**成一批「自调优」监测项，
+// 因此列表接口可能返回 synthesizedFromLegacy=true；写入过一次之后才真正落盘。
+
+/** 列出项目的监测项（含完整定义） */
+export async function fetchApcItems(
+  projectId: string,
+  timeoutMs = 10_000
+): Promise<{ items: ApcMonitorItem[]; synthesizedFromLegacy?: boolean }> {
+  return fetchJson<{ items: ApcMonitorItem[]; synthesizedFromLegacy?: boolean }>(
+    `${BACKEND_BASE}/api/apc/projects/${encodeURIComponent(projectId)}/items`,
+    timeoutMs
+  )
+}
+
+/** 新建监测项（仅管理员；id 缺省时由服务端生成） */
+export async function createApcItem(
+  projectId: string,
+  item: Partial<ApcMonitorItem>
+): Promise<{ ok: boolean; item: ApcMonitorItem; items: ApcMonitorItem[] }> {
+  return adminRequest<{ ok: boolean; item: ApcMonitorItem; items: ApcMonitorItem[] }>(
+    `/api/apc/projects/${encodeURIComponent(projectId)}/items`,
+    { method: 'POST', headers: adminHeaders(), body: JSON.stringify(item) },
+    20_000
+  )
+}
+
+/** 更新监测项（仅管理员；全量提交——传入的即该项最终形态） */
+export async function updateApcItem(
+  projectId: string,
+  itemId: string,
+  item: Partial<ApcMonitorItem>
+): Promise<{ ok: boolean; item: ApcMonitorItem; items: ApcMonitorItem[] }> {
+  return adminRequest<{ ok: boolean; item: ApcMonitorItem; items: ApcMonitorItem[] }>(
+    `/api/apc/projects/${encodeURIComponent(projectId)}/items/${encodeURIComponent(itemId)}`,
+    { method: 'PUT', headers: adminHeaders(), body: JSON.stringify(item) },
+    20_000
+  )
+}
+
+/** 删除监测项（仅管理员） */
+export async function deleteApcItem(
+  projectId: string,
+  itemId: string
+): Promise<{ ok: boolean; items: ApcMonitorItem[] }> {
+  return adminRequest<{ ok: boolean; items: ApcMonitorItem[] }>(
+    `/api/apc/projects/${encodeURIComponent(projectId)}/items/${encodeURIComponent(itemId)}`,
+    { method: 'DELETE', headers: adminHeaders() },
+    20_000
+  )
+}
+
+/**
+ * 按监测项试运行取数 SQL（仅管理员）。
+ * 用页面上的草稿（未保存）执行一次真实只读查询，返回列名、前 N 行与逐列核对结果。
+ * 数据源槽位跟随项目，不接受客户端指定。
+ */
+export async function previewApcItemQuery(payload: {
+  projectId: string
+  item: Partial<ApcMonitorItem>
+  minutes?: number
+  maxRows?: number
+}): Promise<ApcItemPreview> {
+  return adminRequest<ApcItemPreview>(
+    `/api/apc/projects/${encodeURIComponent(payload.projectId)}/items/preview-query`,
+    {
+      method: 'POST',
+      headers: adminHeaders(),
+      body: JSON.stringify({ item: payload.item, minutes: payload.minutes, maxRows: payload.maxRows }),
+    },
+    40_000
+  )
+}
+
+/**
+ * 影响系数 k 的自动标定（第二期）。
+ * 服务端当前明确回 501 ENOTIMPL —— 前端据此显示「未开放」，
+ * 绝不会因为拿到静默空响应而误以为「标定成功但没有变化」。
+ */
+export async function calibrateApcItem(
+  projectId: string,
+  itemId: string
+): Promise<{ ok: boolean; code?: string; error?: string }> {
+  return adminRequest<{ ok: boolean; code?: string; error?: string }>(
+    `/api/apc/projects/${encodeURIComponent(projectId)}/items/${encodeURIComponent(itemId)}/calibrate`,
+    { method: 'POST', headers: adminHeaders() },
+    40_000
   )
 }
 

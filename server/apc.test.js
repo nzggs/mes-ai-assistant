@@ -319,16 +319,17 @@ describe('apcService · 数据源与聚合', () => {
     const ov = await getOverview({ minutes: 60 })
     expect(ov.mode).toBe('unconfigured')
     expect(ov.ready).toBe(false)
-    expect(ov.params).toEqual([])
+    // 新结构：概览对应「一个监测项」，未就绪时 output 为 null，不返回任何伪造数据
+    expect(ov.output).toBeNull()
     expect(ov.rowCount).toBe(0)
     expect(ov.source.label).toBe('未配置数据源')
     expect(ov.source.ready).toBe(false)
-    expect(ov.source.note).toMatch(/SQL 模板|数据库管理|新建项目/)
+    expect(ov.source.note).toMatch(/SQL 模板|数据库管理|新建项目|监测项/)
 
     const op = await getOptimization({ minutes: 60 })
     expect(op.mode).toBe('unconfigured')
-    expect(op.items).toEqual([])
-    expect(op.summary.total).toBe(0)
+    expect(op.recommendation).toBeNull()
+    expect(op.moves).toEqual([])
   })
 
   it('没有任何监测项目时：原因为 no-project，状态接口不报错也不预置项目', () => {

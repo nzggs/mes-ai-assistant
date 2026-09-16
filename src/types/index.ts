@@ -266,67 +266,186 @@ export interface ApcPointDeviation {
   } | null
 }
 
-/** 单个过程参数的优化建议 */
-export interface ApcRecommendation {
-  /** 当前设定值；规格无法确定时为 null */
-  current: number | null
-  /** 优化后的建议设定值；规格无法确定时为 null */
-  suggested: number | null
-  /** 建议调整量（建议值 - 当前值） */
-  delta: number
-  /** 调整幅度（%） */
-  deltaPct: number | null
-  /** 置信度 0-100 */
-  confidence: number
-  urgency: ApcUrgency
-  /** 是否建议保持（死区内或修正量小于最小调节步长） */
-  hold: boolean
-  /** 约束来源：min=可调下限 max=可调上限 step=单次调整限幅 */
-  clampedBy: 'min' | 'max' | 'step' | null
-  /** 预计调整后的均值 */
-  predictedMean?: number
-  /** 预计调整后的过程能力指数 */
-  predictedCpk?: number | null
-  /** 中文推荐理由（含量化依据） */
-  reason: string
-  /** 风险提示 */
-  risk?: string
+/**
+ * 影响系数 k = ∂CV/∂MVᵢ（输出结果随该参数变化的灵敏度）。
+ * 缺省 value = 0 ＝「尚未标定」：运行期该参数被排除出求解集并明确提示，但**不阻断保存**
+ * （现场通常要先跑起来拿到数据，才谈得上标定）。
+ * 手工填写与自动标定共用同一字段，`mode` 只记录来源，`calibrated` 留档供回溯。
+ */
+export interface ApcGain {
+  mode: 'manual' | 'calibrated'
+  value: number
+  calibrated?: { value: number; r2: number; n: number; at: string; method: string }
 }
 
-/** 过程参数（含统计量与优化建议） */
-export interface ApcParamItem {
+/** 规格类字段：数字，或**取数结果列名表达式**（如 `USL_COL - 1`，逐行求值） */
+export type ApcSpecValue = number | string
+
+/** 输出结果 CV 的规格 */
+export interface ApcOutputSpec {
+  lsl: ApcSpecValue
+  usl: ApcSpecValue
+  /** RTO 理想操作点；缺省时运行期取 (lsl+usl)/2 */
+  target: ApcSpecValue | null
+}
+
+/** 输出结果 CV —— 多对 1 调优里唯一的被控量 */
+export interface ApcItemOutput {
+  code: string
+  name: string
+  unit: string
+  decimals: number
+  /** 取数 SQL 结果中承载 CV 实测值的列名（宽表下取值的唯一依据） */
+  column: string
+  /** 优化目标：quality / energy / yield / stability */
+  objective: string
+  spec: ApcOutputSpec
+}
+
+/** 参与参数 MV —— 与 CV 同一行的各自一列；量程与单位由界面手动配置 */
+export interface ApcItemParam {
   code: string
   name: string
   process: string
   unit: string
   decimals: number
-  /** 优化目标：quality / energy / yield / stability */
+  /** 取数 SQL 结果中承载该参数值的列名 */
+  column: string
+  min: ApcSpecValue
+  max: ApcSpecValue
+  /** 当前设定值；留空（null）时运行期退回该参数窗口内的实测均值作为工作点 */
+  setpoint: number | null
+  /** 单次调整幅度上限（%） */
+  maxStepPct: number
+  /** 调整阻力 w：越大越不愿意动（易损件 / 影响其它指标 / 能耗敏感），量纲由求解器归一 */
+  weight: number
+  /** 停用后不参与调优 */
+  enabled: boolean
+  k: ApcGain
+}
+
+/**
+ * 调优策略。
+ * `deadbandPct` **不可删**：偏差落在死区内且过程能力正常时，调整收益低于扰动成本，
+ * 「不动」本身就是最优决策——这是 RTO 与「自动追目标」的分界线。
+ */
+export interface ApcItemTuning {
+  deadbandPct: number
+  /** 约束重新分摊的最大轮数 */
+  maxRounds: number
+  /** 残余偏差容忍度（占原偏差百分比），超过则在风险提示里说明 */
+  residualTolerancePct: number
+}
+
+/**
+ * 监测项 —— 多对 1 调优的基本单位。
+ * 一条取数 SQL 把 CV 与全部 MV 从**同一行的不同列**取回，因此取数模式只有宽表。
+ */
+export interface ApcMonitorItem {
+  id: string
+  name: string
+  description: string
+  query: ApcQueryConfig
+  output: ApcItemOutput
+  params: ApcItemParam[]
+  tuning: ApcItemTuning
+  /** 由老配置（queries + params）在内存合成、尚未落盘 */
+  migrated?: boolean
+}
+
+/** 单个参与参数的求解结果行（无论是否参与本次求解都会返回） */
+export interface ApcMove {
+  code: string
+  name: string
+  unit: string
+  decimals: number
+  /** 工作点：配置了「当前设定值」时用它，否则用窗口实测均值 */
+  current: number | null
+  suggested: number | null
+  delta: number
+  deltaPct: number | null
+  min: ApcSpecValue
+  max: ApcSpecValue
+  span: number
+  weight: number
+  k: number
+  kMode: 'manual' | 'calibrated'
+  /** 杠杆份额 kᵢ²·sᵢ²/wᵢ，决定谁承担更多调整量 */
+  leverage: number
+  /** 该参数实际承担的偏差比例（0~1） */
+  share: number
+  /** 约束来源：min=可调下限 max=可调上限 step=单次调整限幅 */
+  clampedBy: 'min' | 'max' | 'step' | null
+  /** 是否参与本次求解 */
+  participating: boolean
+  /** 未参与时的原因（停用 / 无数据 / k 未标定） */
+  excludedReason: string
+}
+
+/** 多对 1 加权求解后的整体建议 */
+export interface ApcItemRecommendation {
+  cv: {
+    /** CV 窗口实测均值 */
+    current: number | null
+    /** RTO 理想操作点（或规格中值） */
+    target: number | null
+    /** target − current */
+    delta: number | null
+  }
+  /** 实际需要动的参数（delta ≠ 0） */
+  moves: ApcMove[]
+  /** 预计调整后的 CV 均值 */
+  predictedCV: number | null
+  /** 受约束后仍未消除的偏差 */
+  residual: number | null
+  residualPct: number | null
+  /** 置信度 0-100 */
+  confidence: number
+  urgency: ApcUrgency
+  /** 是否建议保持（死区内 / 无可用参数 / 修正量小于最小调节步长） */
+  hold: boolean
+  /** 迭代分摊轮数 */
+  rounds: number
+  /** 生效过的约束集合（逗号分隔） */
+  clampedBy: string | null
+  /** 中文推荐理由（含量化依据） */
+  reason: string
+  /** 风险提示 */
+  risk: string
+}
+
+/**
+ * 输出结果 CV 的完整运行结果（服务端 optimizeItem 的返回）。
+ * 规格无法确定时不做任何判定：target/lsl/usl/cpk 为 null、status 为 unknown、hold 为 true。
+ */
+export interface ApcCvResult {
+  code: string
+  name: string
+  unit: string
+  decimals: number
   objective: string
   objectiveLabel: string
-  /** 以下 6 项均为「按最新一行解析后」的数值；规格写成了列名表达式且取不到值时为空 */
-  setpoint: number | null
-  optimalTarget: number | null
-  min: number | null
-  max: number | null
-  lsl: number | null
-  usl: number | null
-  maxStepPct: number
   latest: number | null
   mean: number | null
   std: number | null
   min_: number | null
   max_: number | null
   sampleCount: number
-  cpk: number | null
   slope: number
   trend: ApcTrend
+  /** 按最新一行解析后的 RTO 理想操作点 */
+  target: number | null
+  lsl: number | null
+  usl: number | null
+  cpk: number | null
   status: ApcParamStatus
-  series: ApcSeriesPoint[]
-  recommendation: ApcRecommendation
-  /** 规格表达式的解析结果（含表达式原文与引用列） */
   specResolved?: ApcSpecResolved
-  /** 点级超规格摘要 */
   pointDeviation?: ApcPointDeviation
+  series: ApcSeriesPoint[]
+  tuning: ApcItemTuning
+  /** 全部参与参数的求解行（含未参与的） */
+  moves: ApcMove[]
+  recommendation: ApcItemRecommendation
 }
 
 /** 数据源说明 */
@@ -341,15 +460,30 @@ export interface ApcSourceInfo {
   warnings?: string[]
 }
 
-/** 参数概览响应（GET /api/apc/overview） */
+/** 数据源未就绪的原因 */
+export type ApcReadinessReason = 'no-project' | 'no-item' | 'no-template' | 'no-connection'
+
+/** 监测项就绪情况 */
+export interface ApcReadiness {
+  ready: boolean
+  reason: ApcReadinessReason | ''
+  itemId?: string
+}
+
+/** 监测项概览响应（GET /api/apc/overview）：1 个输出结果 CV + N 个参与参数的建议 */
 export interface ApcOverview {
   project?: string
   projectName?: string
+  /** 本次实际使用的监测项 */
+  item?: { id: string; name: string; description?: string } | null
+  /** 供前端渲染监测项选择器 */
+  items?: Array<{ id: string; name: string }>
   station: string
   mode: ApcSourceMode
-  /** 数据源是否就绪；未就绪时 params 为空、页面显示空态引导 */
+  /** 数据源是否就绪；未就绪时 output 为 null、页面显示空态引导 */
   ready: boolean
-  reason?: string
+  reason?: ApcReadinessReason | ''
+  readiness?: ApcReadiness
   generatedAt: string
   elapsedMs: number
   windowMinutes: number
@@ -357,29 +491,29 @@ export interface ApcOverview {
   rowCount: number
   truncated: boolean
   source: ApcSourceInfo
-  params: ApcParamItem[]
+  warnings?: string[]
+  /** 输出结果 CV 的实时值、统计、趋势与多对 1 建议 */
+  output: ApcCvResult | null
 }
 
-/** 优化建议响应（GET /api/apc/optimize） */
+/** 优化建议响应（GET /api/apc/optimize）：复用概览数据，把建议提到顶层 */
 export interface ApcOptimization {
   project?: string
   projectName?: string
+  item?: { id: string; name: string; description?: string } | null
+  items?: Array<{ id: string; name: string }>
   station: string
   mode: ApcSourceMode
   ready: boolean
-  reason?: string
+  reason?: ApcReadinessReason | ''
   generatedAt: string
   windowMinutes: number
   source: ApcSourceInfo
-  summary: {
-    total: number
-    actionable: number
-    high: number
-    medium: number
-    danger: number
-    avgConfidence: number
-  }
-  items: ApcParamItem[]
+  warnings?: string[]
+  output: ApcCvResult | null
+  recommendation: ApcItemRecommendation | null
+  /** 与 recommendation.moves 相同（便利字段） */
+  moves: ApcMove[]
 }
 
 /** 单个数据库槽位的只读数据源运行状态 */
@@ -421,7 +555,7 @@ export interface ApcStatusResponse {
   reason?: string
   station: string
   paramCount: number
-  /** 当前取数模式：long=窄表 / wide=宽表 / null=未配置 */
+  /** 当前取数模式：宽表（唯一模式）/ null=未配置 */
   queryMode: ApcQueryMode | null
   catalogFile: string
   /** env-file=由 APC_CATALOG_FILE 锁定；saved=种子文件 + 页面保存覆盖 */
@@ -429,7 +563,7 @@ export interface ApcStatusResponse {
   catalogFileLocked: boolean
   catalogError: string
   /** 监测项目摘要列表 */
-  projects: Array<{ id: string; name: string; description: string; dbSlot: string; paramCount: number; hasQueries: boolean }>
+  projects: ApcProjectSummary[]
   /** 运行期配置文件（落在数据卷，不随镜像重建丢失，且不入 git） */
   configFile: string
   configFileExists: boolean
@@ -437,25 +571,30 @@ export interface ApcStatusResponse {
   hana: ApcHanaStatus
 }
 
-/** 单参数历史响应（GET /api/apc/history） */
+/** 单条曲线历史响应（GET /api/apc/history；code 可为输出结果 CV 或任一参与参数） */
 export interface ApcHistoryResponse {
+  ready: boolean
+  mode: ApcSourceMode
+  reason?: ApcReadinessReason | ''
+  item?: { id: string; name: string } | null
+  windowMinutes: number
+  source?: ApcSourceInfo
+  warnings?: string[]
+  /** true=这条曲线是输出结果 CV（有规格带与 Cpk）；false=参与参数 */
+  isOutput?: boolean
   param: {
     code: string
     name: string
-    process: string
     unit: string
     decimals: number
-    /** 按最新一行解析后的数值；规格取不到时为空 */
-    setpoint: number | null
-    optimalTarget: number | null
+    /** 仅输出结果 CV 有值：RTO 理想操作点 */
+    target: number | null
     lsl: number | null
     usl: number | null
+    /** 仅参与参数有值：可调范围 */
     min: number | null
     max: number | null
-  }
-  mode: ApcSourceMode
-  windowMinutes: number
-  source: ApcSourceInfo
+  } | null
   specResolved?: ApcSpecResolved
   pointDeviation?: ApcPointDeviation
   stats: {
@@ -467,24 +606,25 @@ export interface ApcHistoryResponse {
     cpk: number | null
     trend: ApcTrend
     status: ApcParamStatus
-  }
+  } | null
   points: ApcSeriesPoint[]
 }
 
 // ===== APC / RTO 数据源配置（页面上可手工配置）=====
 
 /**
- * 取数模式：
- *  - long（窄表）：一行一个参数值，需要「参数编码列 / 时间戳列 / 数值列」
- *  - wide（宽表）：一行一个时间戳，每个参数各占一列（列名在参数配置里逐个指定）
+ * 取数模式：**只有宽表**。
+ * 一个监测项的 CV 与全部 MV 必须来自查询结果**同一行的不同列**，
+ * 窄表（long：一行一个参数值、靠编码分组）无法满足，已物理移除。
  */
-export type ApcQueryMode = 'long' | 'wide'
+export type ApcQueryMode = 'wide'
 
-/** 取数 SQL 配置 */
+/** 取数 SQL 配置（每个监测项各有一条） */
 export interface ApcQueryConfig {
   mode: ApcQueryMode
-  /** SQL 模板，可用占位符：{{minutes}} {{limit}} {{codeFilter}} {{columns}} {{schema}} */
+  /** SQL 模板，可用占位符：{{minutes}} {{limit}} {{columns}} {{schema}} */
   history: string
+  /** 字段映射。宽表下只需时间戳列；code/value 为窄表时代遗留，恒不再使用 */
   columns: { code?: string; ts?: string; value?: string }
 }
 
@@ -603,15 +743,18 @@ export interface ApcConfigPatch {
   meta?: Partial<ApcCatalogMeta>
 }
 
-/** 监测项目摘要（列表/卡片用，不含 queries/params 全文） */
+/** 监测项目摘要（列表/卡片用，不含监测项全文） */
 export interface ApcProjectSummary {
   id: string
   name: string
   description: string
   /** 项目绑定的数据库槽位（db1 / db2） */
   dbSlot: string
-  paramCount: number
-  /** 是否已配置取数 SQL 模板 */
+  /** 项目下的监测项数量 */
+  itemCount: number
+  /** @deprecated 老结构（queries+params）里的参数个数；新结构请用 itemCount */
+  paramCount?: number
+  /** 是否至少有一个监测项配好了取数 SQL 模板 */
   hasQueries: boolean
   createdAt: string | null
   updatedAt: string | null
@@ -619,8 +762,15 @@ export interface ApcProjectSummary {
 
 /** 监测项目完整定义（项目编辑器用） */
 export interface ApcProjectFull extends ApcProjectSummary {
+  /** 老结构遗留；迁移到 items 后为 null */
   queries: ApcQueryConfig | null
+  /** 老结构遗留；迁移到 items 后为空数组 */
   params: ApcParamConfig[]
+  /** 监测项（多对 1 调优的基本单位） */
+  items: ApcMonitorItem[]
+  /** true=该项目仍是老结构，items 是服务端在内存里合成出来的（保存一次后落盘） */
+  synthesizedFromLegacy?: boolean
+  legacyMigrated?: boolean
 }
 
 /** 项目创建/更新草稿（只提交传入的字段） */
@@ -628,8 +778,12 @@ export interface ApcProjectDraft {
   name?: string
   description?: string
   dbSlot?: string
+  /** @deprecated 老结构；请改用 items */
   queries?: ApcQueryConfig | null
+  /** @deprecated 老结构；请改用 items */
   params?: ApcParamConfig[]
+  /** 监测项列表（一旦提交，服务端即视为迁移完成并清空老结构） */
+  items?: ApcMonitorItem[]
 }
 
 /** MES 直查指引（GET /api/mes/guide，不含任何凭据；与项目 SQL 模板无关，SQL 从知识库检索） */
@@ -681,6 +835,32 @@ export interface ApcQueryPreview {
     code: string
     expressions: Record<string, string>
     columns: Array<{ name: string; present: boolean }>
+  }>
+  rows: Record<string, unknown>[]
+  rowCount: number
+  truncated: boolean
+  elapsedMs: number
+  warnings: string[]
+}
+
+/**
+ * 按监测项试运行取数 SQL 的结果（POST /api/apc/projects/:id/items/preview-query）。
+ * 比老接口多一个 `columnCheck`：逐列核对「页面要用的每一列是否真的被 SELECT 出来」——
+ * 列写在 ORDER BY 里并不等于出现在结果里，这类问题只看 SQL 文本看不出来。
+ */
+export interface ApcItemPreview {
+  ok: boolean
+  mode: ApcQueryMode
+  /** 渲染占位符之后、实际执行的 SQL */
+  sql: string
+  vars: Record<string, string>
+  columns: string[]
+  /** 输出结果与全部参与参数的列名核对（present=null 表示查询没返回行，无法判断） */
+  columnCheck: Array<{
+    role: 'output' | 'param'
+    code: string
+    column: string
+    present: boolean | null
   }>
   rows: Record<string, unknown>[]
   rowCount: number

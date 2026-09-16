@@ -3,7 +3,7 @@
 // 展示内容：规格上下限带（LSL/USL）、当前设定值、RTO 理想操作点、实测数据列值曲线。
 // 用于「APC 和 RTO」页面，让「数据在变、设定值该往哪调」一目了然。
 
-import { useMemo, useState } from 'react'
+import { useId, useMemo, useState } from 'react'
 import type { ApcParamStatus, ApcSeriesPoint } from '../types'
 
 interface ApcTrendChartProps {
@@ -24,6 +24,10 @@ interface ApcTrendChartProps {
    * time=强制按时间；index=强制按序号等距铺开。
    */
   axisMode?: 'auto' | 'time' | 'index'
+  /** 三条参考线的文案（输出结果用默认值；参与参数曲线改成「当前工作点 / 建议值」更贴切） */
+  setpointLabel?: string
+  targetLabel?: string
+  suggestedLabel?: string
 }
 
 const W = 720
@@ -58,8 +62,14 @@ export function ApcTrendChart({
   height = 200,
   suggested,
   axisMode = 'auto',
+  setpointLabel = '设定值',
+  targetLabel = 'RTO 理想点',
+  suggestedLabel = '建议',
 }: ApcTrendChartProps) {
   const [hover, setHover] = useState<number | null>(null)
+  // 渐变 id 必须每个实例唯一：同页出现多张趋势图时，写死的 id 会让后一张的定义
+  // 覆盖前一张，所有曲线共用同一种填充色（图一多就串色），useId 天然隔离。
+  const gradId = `apcAreaFill-${useId().replace(/[^a-zA-Z0-9_-]/g, '')}`
   const H = height
   const innerW = W - PAD.l - PAD.r
   const innerH = H - PAD.t - PAD.b
@@ -207,7 +217,7 @@ export function ApcTrendChart({
         aria-label="过程参数历史趋势"
       >
         <defs>
-          <linearGradient id="apcAreaFill" x1="0" y1="0" x2="0" y2="1">
+          <linearGradient id={gradId} x1="0" y1="0" x2="0" y2="1">
             <stop offset="0%" stopColor={lineColor} stopOpacity="0.22" />
             <stop offset="100%" stopColor={lineColor} stopOpacity="0.01" />
           </linearGradient>
@@ -275,7 +285,7 @@ export function ApcTrendChart({
         {flatSetpoint != null && (
           <>
             <line x1={PAD.l} y1={yOf(flatSetpoint)} x2={PAD.l + innerW} y2={yOf(flatSetpoint)} stroke="#94a3b8" strokeWidth="1.2" strokeDasharray="6 4" />
-            <text x={PAD.l + 4} y={yOf(flatSetpoint) - 4} fontSize="9" fill="#64748b">设定值 {fmt(flatSetpoint, decimals)}</text>
+            <text x={PAD.l + 4} y={yOf(flatSetpoint) - 4} fontSize="9" fill="#64748b">{setpointLabel} {fmt(flatSetpoint, decimals)}</text>
           </>
         )}
 
@@ -283,7 +293,7 @@ export function ApcTrendChart({
         {flatTarget != null && (
           <>
             <line x1={PAD.l} y1={yOf(flatTarget)} x2={PAD.l + innerW} y2={yOf(flatTarget)} stroke="#8b5cf6" strokeWidth="1.2" strokeDasharray="2 3" />
-            <text x={PAD.l + 4} y={yOf(flatTarget) + 11} fontSize="9" fill="#8b5cf6">RTO 理想点 {fmt(flatTarget, decimals)}</text>
+            <text x={PAD.l + 4} y={yOf(flatTarget) + 11} fontSize="9" fill="#8b5cf6">{targetLabel} {fmt(flatTarget, decimals)}</text>
           </>
         )}
 
@@ -291,14 +301,14 @@ export function ApcTrendChart({
         {typeof suggested === 'number' && flatSetpoint != null && Math.abs(suggested - flatSetpoint) > 1e-9 && (
           <>
             <line x1={PAD.l} y1={yOf(suggested)} x2={PAD.l + innerW} y2={yOf(suggested)} stroke="#4d6bfe" strokeWidth="1.2" strokeDasharray="1 3" />
-            <text x={PAD.l + innerW - 2} y={yOf(suggested) - 4} textAnchor="end" fontSize="9" fill="#4d6bfe">建议 {fmt(suggested, decimals)}</text>
+            <text x={PAD.l + innerW - 2} y={yOf(suggested) - 4} textAnchor="end" fontSize="9" fill="#4d6bfe">{suggestedLabel} {fmt(suggested, decimals)}</text>
           </>
         )}
 
         {/* 曲线 */}
         {points.length > 1 && (
           <>
-            <path d={areaPath} fill="url(#apcAreaFill)" />
+            <path d={areaPath} fill={`url(#${gradId})`} />
             <path d={linePath} fill="none" stroke={lineColor} strokeWidth="1.8" strokeLinejoin="round" strokeLinecap="round" />
           </>
         )}

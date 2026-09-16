@@ -17,12 +17,13 @@ import {
 import { extractPdfTextFromFile } from './pdfExtract.js'
 import { startSummary, getTask, cancelTask, listTasks, recoverSummaryTasks, startTaskCleanup } from './summaryTask.js'
 import { configureSearchIndex, buildIndex, search as searchInIndex, listObjects as listObjectsInIndex, getStatus as getIndexStatus, upsertDocument, removeDocument, hasDocument, pagesOfDoc } from './searchIndex.js'
-import { getApcStatus, getOverview, getOptimization, getHistory, isApcEnabled, clearApcCache, previewQuery, getMesGuide, queryMesSql, probeConfiguredSlots, clearProbeCache } from './apcService.js'
+import { getApcStatus, getOverview, getOptimization, getHistory, isApcEnabled, clearApcCache, previewQuery, previewItemQuery, getMesGuide, queryMesSql, probeConfiguredSlots, clearProbeCache } from './apcService.js'
 import { pingHana, closeHana, getHanaStatus, testHanaConnection } from './hanaClient.js'
 import {
   getConfigForClient, saveDatabase, saveQueries, saveParams, saveMeta, saveLimits,
   resetSection, RESET_SECTIONS, DB_SLOTS,
   listProjects, getProject, createProject, updateProject, deleteProject,
+  listItems, upsertItem, deleteItem,
 } from './apcConfig.js'
 import { registerDocIndexRoutes } from './docIndexRoute.js'
 import { listMemories, addMemory, updateMemory, deleteMemory, deleteAllMemories, MEMORY_LIMITS } from './memoryStore.js'
@@ -1093,36 +1094,46 @@ app.get('/api/apc/status', apcEnabledGuard, async (req, res) => {
   }
 })
 
-/** 参数概览：实时值 + 统计量 + 趋势（?project=<id> 指定监测项目，缺省取第一个项目） */
+/** 监测项概览：1 个输出结果 CV 的实时值/统计/趋势，加 N 个参与参数的建议调整量 */
 app.get('/api/apc/overview', apcEnabledGuard, apcRateLimit, async (req, res) => {
   try {
     if (boolParam(req.query.refresh)) clearApcCache()
-    res.json(await getOverview({ minutes: parseWindowMinutes(req.query.minutes), project: req.query.project }))
+    res.json(await getOverview({
+      minutes: parseWindowMinutes(req.query.minutes),
+      project: req.query.project,
+      item: req.query.item,
+    }))
   } catch (err) {
     return fail(res, err)
   }
 })
 
-/** 单个参数的历史数据列值 */
+/** 单条曲线：code 可以是输出结果 CV，也可以是任一参与参数 */
 app.get('/api/apc/history', apcEnabledGuard, apcRateLimit, async (req, res) => {
   try {
     const code = String(req.query.code || '').trim()
     if (!code) return res.status(400).json({ error: 'code 为必填' })
     if (boolParam(req.query.refresh)) clearApcCache()
-    res.json(await getHistory({ code, minutes: parseWindowMinutes(req.query.minutes), project: req.query.project }))
+    res.json(await getHistory({
+      code,
+      minutes: parseWindowMinutes(req.query.minutes),
+      project: req.query.project,
+      item: req.query.item,
+    }))
   } catch (err) {
     return fail(res, err)
   }
 })
 
-/** 优化建议：按紧急度给出过程参数设定值建议 */
+/** 优化建议：多对 1 加权分配后的各参与参数调整量 */
 app.get('/api/apc/optimize', apcEnabledGuard, apcRateLimit, async (req, res) => {
   try {
-    const codes = typeof req.query.codes === 'string'
-      ? req.query.codes.split(',').map(s => s.trim()).filter(Boolean).slice(0, 50)
-      : undefined
     if (Boolean(req.query.refresh)) clearApcCache()
-    res.json(await getOptimization({ minutes: parseWindowMinutes(req.query.minutes), codes, project: req.query.project }))
+    res.json(await getOptimization({
+      minutes: parseWindowMinutes(req.query.minutes),
+      project: req.query.project,
+      item: req.query.item,
+    }))
   } catch (err) {
     return fail(res, err)
   }
@@ -1183,6 +1194,101 @@ app.delete('/api/apc/projects/:id', requireAdmin, apcProbeRateLimit, (req, res) 
   } catch (err) {
     return fail(res, err)
   }
+})
+
+// ===== 监测项（多对 1 调优的基本单位）=====
+// 一个监测项 = 一条取数 SQL + 1 个输出结果 CV + N 个参与参数 MV。
+// 读接口沿用运行类限流；写入类一律 requireAdmin。
+// 注意：老项目（只有 queries + params）在读取时会被**内存合成**成一批「自调优」监测项，
+// 因此这里的 GET 可能返回 synthesizedFromLegacy=true；保存过一次之后才真正落盘。
+
+/** 列出项目的监测项 */
+app.get('/api/apc/projects/:id/items', apcEnabledGuard, apcRateLimit, (req, res) => {
+  try {
+    const project = getProject(req.params.id)
+    if (!project) return res.status(404).json({ error: `监测项目不存在：${req.params.id}` })
+    res.json({
+      items: Array.isArray(project.items) ? project.items : [],
+      synthesizedFromLegacy: Boolean(project.synthesizedFromLegacy),
+    })
+  } catch (err) {
+    return internalError(res, err)
+  }
+})
+
+/** 新建监测项（仅管理员） */
+app.post('/api/apc/projects/:id/items', requireAdmin, apcProbeRateLimit, (req, res) => {
+  try {
+    const item = upsertItem(req.params.id, req.body && typeof req.body === 'object' ? req.body : {}, null)
+    clearApcCache()
+    res.status(201).json({ ok: true, item, items: listItems(req.params.id) })
+  } catch (err) {
+    return fail(res, err)
+  }
+})
+
+/** 更新监测项（仅管理员；全量提交——传入的即该项最终形态） */
+app.put('/api/apc/projects/:id/items/:itemId', requireAdmin, apcProbeRateLimit, (req, res) => {
+  try {
+    const item = upsertItem(
+      req.params.id,
+      req.body && typeof req.body === 'object' ? req.body : {},
+      req.params.itemId
+    )
+    clearApcCache()
+    res.json({ ok: true, item, items: listItems(req.params.id) })
+  } catch (err) {
+    return fail(res, err)
+  }
+})
+
+/** 删除监测项（仅管理员） */
+app.delete('/api/apc/projects/:id/items/:itemId', requireAdmin, apcProbeRateLimit, (req, res) => {
+  try {
+    const items = deleteItem(req.params.id, req.params.itemId)
+    clearApcCache()
+    res.json({ ok: true, items })
+  } catch (err) {
+    return fail(res, err)
+  }
+})
+
+/**
+ * 按监测项试算取数 SQL（仅管理员）：
+ * 真实执行一次只读查询，返回列名、前 N 行，以及「页面要用的每一列是否真的取回来了」的逐项核对。
+ * 草稿同样过只读护栏与模板校验——试运行不能成为绕过安全边界的口子。
+ */
+app.post('/api/apc/projects/:id/items/preview-query', requireAdmin, apcProbeRateLimit, async (req, res) => {
+  try {
+    const body = req.body && typeof req.body === 'object' ? req.body : {}
+    const project = getProject(req.params.id)
+    if (!project) return res.status(404).json({ error: `监测项目不存在：${req.params.id}` })
+    res.json(await previewItemQuery({
+      project: req.params.id,
+      item: body.item,
+      minutes: body.minutes,
+      maxRows: body.maxRows,
+      // 数据源槽位跟随项目，不接受客户端指定
+      slot: project.dbSlot,
+    }))
+  } catch (err) {
+    return fail(res, err)
+  }
+})
+
+/**
+ * 影响系数 k 的自动标定（第二期）。
+ * 这里明确返回 501 而不是空结果：前端据此显示「未开放」，
+ * 绝不会因为拿到一个静默的空响应而误以为「标定成功但没有变化」。
+ */
+app.post('/api/apc/projects/:id/items/:itemId/calibrate', requireAdmin, apcProbeRateLimit, (_req, res) => {
+  res.status(501).json({
+    ok: false,
+    code: 'ENOTIMPL',
+    error:
+      '影响系数 k 的自动标定尚未开放（计划在第二期提供：用历史数据做多元回归 + 共线性诊断）。' +
+      '当前请在监测项里手工填写 k，可先用单变量试验估计：k ≈ ΔCV / ΔMV。',
+  })
 })
 
 // ===== 问答（聊天）中的 MES 数据直查 =====

@@ -169,46 +169,54 @@ describe('apcConfig · 密码只进不出', () => {
 
 describe('apcConfig · 取数 SQL 校验', () => {
   it('接受合法模板并立即生效', () => {
-    saveQueries({ mode: 'long', history: OK_SQL, columns: OK_COLUMNS })
+    saveQueries({ mode: 'wide', history: WIDE_SQL, columns: { ts: 'TS' } })
     const q = getEffectiveCatalog().queries
-    expect(q.mode).toBe('long')
+    expect(q.mode).toBe('wide')
     expect(q.history).toContain('{{minutes}}')
-    expect(q.columns.value).toBe('VALUE')
+    expect(q.columns.ts).toBe('TS')
   })
 
   it('拒绝非只读语句、多语句与 SELECT INTO', () => {
-    expect(() => saveQueries({ mode: 'long', history: 'DELETE FROM T', columns: OK_COLUMNS })).toThrow()
-    expect(() => saveQueries({ mode: 'long', history: 'UPDATE T SET A=1 WHERE {{minutes}}=1', columns: OK_COLUMNS })).toThrow()
-    expect(() => saveQueries({ mode: 'long', history: 'SELECT 1 FROM T; DROP TABLE T', columns: OK_COLUMNS })).toThrow(/单条/)
-    expect(() => saveQueries({ mode: 'long', history: 'SELECT * INTO T2 FROM T WHERE {{minutes}}=1', columns: OK_COLUMNS })).toThrow()
+    expect(() => saveQueries({ mode: 'wide', history: 'DELETE FROM T', columns: OK_COLUMNS })).toThrow()
+    expect(() => saveQueries({ mode: 'wide', history: 'UPDATE T SET A=1 WHERE {{minutes}}=1', columns: OK_COLUMNS })).toThrow()
+    expect(() => saveQueries({ mode: 'wide', history: 'SELECT 1 FROM T; DROP TABLE T', columns: OK_COLUMNS })).toThrow(/单条/)
+    expect(() => saveQueries({ mode: 'wide', history: 'SELECT * INTO T2 FROM T WHERE {{minutes}}=1', columns: OK_COLUMNS })).toThrow()
     // 注释夹带也不例外
-    expect(() => saveQueries({ mode: 'long', history: '/* DROP TABLE T */ SELECT {{minutes}} FROM T', columns: OK_COLUMNS })).not.toThrow()
+    expect(() => saveQueries({ mode: 'wide', history: '/* DROP TABLE T */ SELECT {{minutes}} FROM T', columns: OK_COLUMNS })).not.toThrow()
   })
 
   it('拒绝未知占位符与完全不用占位符的模板', () => {
-    expect(() => saveQueries({ mode: 'long', history: 'SELECT {{oops}} FROM T', columns: OK_COLUMNS })).toThrow(/占位符/)
-    expect(() => saveQueries({ mode: 'long', history: 'SELECT 1 FROM T', columns: OK_COLUMNS })).toThrow(/占位符/)
+    expect(() => saveQueries({ mode: 'wide', history: 'SELECT {{oops}} FROM T', columns: OK_COLUMNS })).toThrow(/占位符/)
+    expect(() => saveQueries({ mode: 'wide', history: 'SELECT 1 FROM T', columns: OK_COLUMNS })).toThrow(/占位符/)
   })
 
-  it('拒绝非法列名（防注入）与缺失的映射列', () => {
+  it('拒绝非法列名（防注入）与缺失的时间戳列', () => {
     expect(() => saveQueries({
-      mode: 'long', history: OK_SQL,
-      columns: { ...OK_COLUMNS, value: 'V" ; DROP TABLE T' },
+      mode: 'wide', history: WIDE_SQL,
+      columns: { ts: 'T" ; DROP TABLE T' },
     })).toThrow(/非法/)
-    expect(() => saveQueries({ mode: 'long', history: OK_SQL, columns: { code: 'C', ts: 'T' } })).toThrow(/数值列/)
-    expect(() => saveQueries({ mode: 'long', history: OK_SQL, columns: { ts: 'T', value: 'V' } })).toThrow(/参数编码列/)
+    expect(() => saveQueries({ mode: 'wide', history: WIDE_SQL, columns: {} })).toThrow(/时间戳列/)
   })
 
-  it('宽表模式必须给每个参数配数据列名，配齐后才允许保存', () => {
-    // 种子目录现为空（监测项由管理员自行增删），先建一个未配列名的参数，宽表校验才会触发
-    saveParams([{ code: 'P1', name: '参数1', lsl: 0, usl: 1, min: -1, max: 2, setpoint: 0.5 }])
-    expect(() => saveQueries({ mode: 'wide', history: WIDE_SQL, columns: { ts: 'TS' } })).toThrow(/数据列名/)
+  it('窄表（long）模式已物理移除：历史配置被明确拒绝，而不是静默按宽表解释', () => {
+    expect(() => saveQueries({ mode: 'long', history: OK_SQL, columns: OK_COLUMNS })).toThrow(/窄表|已移除/)
+  })
 
-    const withColumns = getEffectiveCatalog().params.map((p, i) => ({ ...p, column: `TAG_${i}` }))
-    saveParams(withColumns)
-    const q = saveQueries({ mode: 'wide', history: WIDE_SQL, columns: { ts: 'TS' } })
-    expect(q.mode).toBe('wide')
-    expect(getEffectiveCatalog().queries.mode).toBe('wide')
+  it('监测项必须给输出结果与每个参与参数配数据列名', () => {
+    const project = listProjects()[0]
+    const item = {
+      name: '电芯重量',
+      query: { mode: 'wide', history: WIDE_SQL, columns: { ts: 'TS' } },
+      output: { code: 'CELL_WEIGHT', column: 'CELL_WEIGHT', lsl: 12, usl: 13 },
+      params: [{ code: 'SLURRY_SOLID', column: 'SLURRY_SOLID', min: 60, max: 80, k: { value: 0.05 } }],
+    }
+    expect(() => updateProject(project.id, { items: [item] })).not.toThrow()
+    expect(() => updateProject(project.id, {
+      items: [{ ...item, output: { ...item.output, column: '' } }],
+    })).toThrow(/数据列名/)
+    expect(() => updateProject(project.id, {
+      items: [{ ...item, params: [{ code: 'X', min: 1, max: 2 }] }],
+    })).toThrow(/数据列名/)
   })
 })
 
@@ -351,7 +359,7 @@ describe('apcConfig · APC_CATALOG_FILE 锁定', () => {
     expect(view.catalogFileLocked).toBe(true)
     expect(view.seedFile).toBe(SEED_FILE)
 
-    expect(() => saveQueries({ mode: 'long', history: OK_SQL, columns: OK_COLUMNS })).toThrow(/APC_CATALOG_FILE/)
+    expect(() => saveQueries({ mode: 'wide', history: OK_SQL, columns: OK_COLUMNS })).toThrow(/APC_CATALOG_FILE/)
     expect(() => saveParams(getEffectiveCatalog().params)).toThrow(/APC_CATALOG_FILE/)
     expect(() => saveMeta({ station: 'x' })).toThrow(/APC_CATALOG_FILE/)
     expect(() => resetSection('params')).toThrow(/APC_CATALOG_FILE/)
@@ -366,28 +374,21 @@ describe('apcConfig · APC_CATALOG_FILE 锁定', () => {
 describe('apcService · 取数模板渲染', () => {
   const params = [{ code: 'A', column: 'TAG_A' }, { code: 'B', column: 'TAG_B' }]
 
-  it('窄表生成 codeFilter，宽表生成 columns', () => {
-    const longVars = buildTemplateVars(
-      { params, queries: { mode: 'long', columns: { code: 'PARAM_CODE' } } },
+  it('宽表由 {{columns}} 展开参数列；codeFilter 恒为空（窄表已移除）', () => {
+    const vars = buildTemplateVars(
+      { params, queries: { mode: 'wide', columns: { code: 'PARAM_CODE' } } },
       { minutes: 60, limit: 50, codes: ['A', 'B'], params }
     )
-    expect(longVars.codeFilter).toBe(` AND "PARAM_CODE" IN ('A', 'B')`)
-    expect(longVars.columns).toBe('')
-    expect(longVars.minutes).toBe('60')
-    expect(longVars.limit).toBe('50')
-
-    const wideVars = buildTemplateVars(
-      { params, queries: { mode: 'wide' } },
-      { minutes: 90, limit: 10, params }
-    )
-    expect(wideVars.columns).toBe('"TAG_A", "TAG_B"')
-    expect(wideVars.codeFilter).toBe('')
-    expect(wideVars.minutes).toBe('90')
+    // 窄表已物理移除：{{codeFilter}} 仍被接受但不再展开任何内容
+    expect(vars.codeFilter).toBe('')
+    expect(vars.columns).toBe('"TAG_A", "TAG_B"')
+    expect(vars.minutes).toBe('60')
+    expect(vars.limit).toBe('50')
   })
 
   it('schema 占位符取自目录元信息', () => {
     const vars = buildTemplateVars(
-      { schema: 'MES', params, queries: { mode: 'long', columns: {} } },
+      { schema: 'MES', params, queries: { mode: 'wide', columns: {} } },
       { minutes: 5, limit: 5, codes: [], params: [] }
     )
     expect(vars.schema).toBe('MES')
@@ -417,19 +418,19 @@ describe('apcService · SQL 试运行', () => {
 
     // 非只读语句
     await expect(previewQuery({
-      queries: { mode: 'long', history: 'DROP TABLE T', columns: OK_COLUMNS },
+      queries: { mode: 'wide', history: 'DROP TABLE T', columns: OK_COLUMNS },
     })).rejects.toThrow()
     // 多语句
     await expect(previewQuery({
-      queries: { mode: 'long', history: 'SELECT {{minutes}} FROM T; DELETE FROM T', columns: OK_COLUMNS },
+      queries: { mode: 'wide', history: 'SELECT {{minutes}} FROM T; DELETE FROM T', columns: OK_COLUMNS },
     })).rejects.toThrow(/单条/)
-    // 映射不全（缺数值列）
+    // 缺少时间戳列（宽表唯一必填的字段映射）
     await expect(previewQuery({
-      queries: { mode: 'long', history: OK_SQL, columns: { code: 'C', ts: 'T' } },
-    })).rejects.toThrow(/数值列/)
+      queries: { mode: 'wide', history: WIDE_SQL, columns: {} },
+    })).rejects.toThrow(/时间戳列/)
     // 未知占位符
     await expect(previewQuery({
-      queries: { mode: 'long', history: 'SELECT {{minutes}} FROM T WHERE {{x}}=1', columns: OK_COLUMNS },
+      queries: { mode: 'wide', history: 'SELECT {{minutes}} FROM T WHERE {{x}}=1', columns: OK_COLUMNS },
     })).rejects.toThrow(/占位符/)
   })
 })
@@ -475,7 +476,7 @@ describe('apcConfig · 监测项目（dbSlot + SQL 模板 + 参数自成一套�
     fs.writeFileSync(TMP_CONFIG, JSON.stringify({
       version: 1,
       catalog: {
-        queries: { mode: 'long', history: OK_SQL, columns: OK_COLUMNS },
+        queries: { mode: 'wide', history: OK_SQL, columns: OK_COLUMNS },
         params: [{ code: 'Z1', ...P_BASE }],
       },
     }))
@@ -499,7 +500,7 @@ describe('apcConfig · 监测项目（dbSlot + SQL 模板 + 参数自成一套�
   it('项目的 queries 按项目隔离：改一个项目不影响另一个', () => {
     const first = listProjects()[0]
     const p = createProject({ name: '独立项目', dbSlot: 'db1' })
-    saveQueries({ mode: 'long', history: OK_SQL, columns: OK_COLUMNS }, first.id)
+    saveQueries({ mode: 'wide', history: OK_SQL, columns: OK_COLUMNS }, first.id)
     expect(getProject(first.id).queries).toBeTruthy()
     expect(getProject(p.id).queries == null).toBe(true)
     // 配置视图的项目摘要正确
@@ -512,7 +513,7 @@ describe('apcConfig · 监测项目（dbSlot + SQL 模板 + 参数自成一套�
   it('没有监测项目时：写入类操作明确报错，而不是隐式造一个项目', () => {
     for (const x of listProjects()) deleteProject(x.id)
     expect(listProjects()).toEqual([])
-    expect(() => saveQueries({ mode: 'long', history: OK_SQL, columns: OK_COLUMNS })).toThrow(/尚未创建监测项目/)
+    expect(() => saveQueries({ mode: 'wide', history: OK_SQL, columns: OK_COLUMNS })).toThrow(/尚未创建监测项目/)
     expect(() => saveParams([{ code: 'A', ...P_BASE }])).toThrow(/尚未创建监测项目/)
     expect(() => resetSection('params')).toThrow(/尚未创建监测项目/)
     // 报错后依然没有任何项目被悄悄创建

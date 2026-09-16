@@ -2,13 +2,15 @@
 //
 // 定位：先进过程控制（APC）+ 实时优化（RTO）。
 //   - 即时读取只读数据源（HANA）中记录的过程数据列值；
-//   - 依据数据变化（均值偏移、波动、趋势）优化过程参数设定值，给出建议值；
+//   - 一个监测项 = 1 个输出结果（CV，被控量）+ N 个参与参数（MV，操纵量）；
+//   - 按加权最小调整把 CV 的偏差分摊给各 MV，给出「哪个参数动多少」的建议；
 //   - 全程只读，不做任何写库操作；数据源与安全边界在后端统一约束。
 //
-// 数据源：系统不内置仿真/演示数据源。未创建监测项目、项目未配 SQL 模板、或绑定的
-// 数据库未配置连接时，一律按「未配置数据源」展示空态引导，绝不展示任何推测数据。
+// 数据源：系统不内置仿真/演示数据源。未创建监测项目、项目未添加监测项、监测项未配
+// SQL 模板、或绑定的数据库未配置连接时，一律按「未配置数据源」展示空态引导，绝不展示任何推测数据。
 
 import { useCallback, useEffect, useMemo, useState } from 'react'
+import type { ReactNode } from 'react'
 import {
   fetchApcStatus,
   fetchApcOverview,
@@ -19,11 +21,14 @@ import {
 import { ApcTrendChart } from './ApcTrendChart'
 import { ApcConfigPanel } from './ApcConfigPanel'
 import type {
+  ApcCvResult,
   ApcHistoryResponse,
+  ApcItemRecommendation,
+  ApcMove,
   ApcOptimization,
   ApcOverview,
-  ApcParamItem,
   ApcParamStatus,
+  ApcSpecValue,
   ApcStatusResponse,
   ApcUrgency,
 } from '../types'
@@ -65,19 +70,34 @@ const OBJECTIVE_ICON: Record<string, string> = {
   stability: '⚖️',
 }
 
+/** 数据源未就绪时的下一步动作（与服务端 SOURCE_REASON_NOTE 对应） */
+const REASON_LABEL: Record<string, string> = {
+  'no-project': '尚未创建监测项目',
+  'no-item': '当前项目尚未添加监测项',
+  'no-template': '当前监测项尚未配置取数 SQL 模板',
+  'no-connection': '绑定的数据库系统尚未配置连接',
+}
+
 function fmt(v: number | null | undefined, decimals: number): string {
   if (v == null || !Number.isFinite(v)) return '—'
   return v.toFixed(decimals)
 }
 
+/** 规格类字段显示：数字按小数位格式化；列名表达式原样展示（运行期才求值） */
+function fmtSpec(v: ApcSpecValue | null | undefined, decimals: number): string {
+  if (v === null || v === undefined || v === '') return '—'
+  if (typeof v === 'number') return Number.isFinite(v) ? v.toFixed(decimals) : '—'
+  return String(v)
+}
+
 function fmtTime(iso: string | number | null): string {
   if (iso == null) return '—'
-  const d = typeof iso === 'number' ? new Date(iso) : new Date(iso)
+  const d = new Date(iso)
   if (Number.isNaN(d.getTime())) return '—'
   return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}:${String(d.getSeconds()).padStart(2, '0')}`
 }
 
-function trendArrow(trend: string) {
+function trendArrow(trend: string): string {
   if (trend === 'up') return '↑'
   if (trend === 'down') return '↓'
   return '→'
@@ -103,6 +123,17 @@ function confidenceColor(c: number): string {
   return '#ef4444'
 }
 
+/** 约束来源的中文说法（服务端可能返回逗号分隔的多个约束） */
+function clampLabel(c: string | null | undefined): string {
+  if (!c) return ''
+  return String(c)
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean)
+    .map(s => (s === 'step' ? '单次限幅' : s === 'max' ? '顶到可调上限' : s === 'min' ? '顶到可调下限' : s))
+    .join('、')
+}
+
 export function ApcRto({ initialProjectId }: { initialProjectId?: string | null } = {}) {
   const [status, setStatus] = useState<ApcStatusResponse | null>(null)
   const [overview, setOverview] = useState<ApcOverview | null>(null)
@@ -113,13 +144,17 @@ export function ApcRto({ initialProjectId }: { initialProjectId?: string | null 
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
   const [tab, setTab] = useState<'overview' | 'optimize'>('overview')
-  const [detailCode, setDetailCode] = useState<string | null>(null)
+  const [detail, setDetail] = useState<{ code: string; isOutput: boolean } | null>(null)
   const [updatedAt, setUpdatedAt] = useState<number | null>(null)
   const [copied, setCopied] = useState(false)
+
   // 项目制：当前选中的监测项目 + 正在编辑的项目 id（null = 新建）
   const [activeProject, setActiveProject] = useState<string>(() => {
     if (initialProjectId) return initialProjectId
     try { return localStorage.getItem('mes-ai-apc-project') || '' } catch { return '' }
+  })
+  const [activeItem, setActiveItem] = useState<string>(() => {
+    try { return localStorage.getItem('mes-ai-apc-item') || '' } catch { return '' }
   })
   const [editingId, setEditingId] = useState<string | null | undefined>(undefined) // undefined=关闭
 
@@ -127,13 +162,15 @@ export function ApcRto({ initialProjectId }: { initialProjectId?: string | null 
   // 选中项目必须真实存在于服务端返回的列表里：
   // localStorage 里可能残留已被删除（或旧版本自动迁移出来的 p_default）的项目 id，
   // 这种脏 id 会让「编辑项目」去读一个不存在的项目，报「监测项目不存在：xxx」。
-  // status 还没回来时先沿用本地记忆值（首屏少一次多余请求），拿到列表后严格校验，坏值回落到第一个项目。
   const activeProjectId = useMemo(() => {
     if (!status) return activeProject
     if (activeProject && projects.some(p => p.id === activeProject)) return activeProject
     return projects[0]?.id || ''
   }, [status, activeProject, projects])
   const activeProjectMeta = projects.find(p => p.id === activeProjectId) || null
+
+  // 监测项列表来自概览接口（服务端已按「当前有效项」回落），用于渲染选择器
+  const itemOptions = useMemo(() => overview?.items || [], [overview])
 
   // 槽位显示名：一律取系统显示名（侧边栏「数据库管理」页的「系统显示名」），
   // 不再写死「数据库系统 1 / 2」——系统里改了名字本页跟着变；取不到时回落为变量本身（db1 / db2）。
@@ -155,7 +192,18 @@ export function ApcRto({ initialProjectId }: { initialProjectId?: string | null 
 
   const handleSelectProject = useCallback((id: string) => {
     setActiveProject(id)
-    try { localStorage.setItem('mes-ai-apc-project', id) } catch { /* 忽略 */ }
+    // 换项目后原监测项多半不属于新项目，清掉选择让服务端回落为该项目的第一个
+    setActiveItem('')
+    try {
+      localStorage.setItem('mes-ai-apc-project', id)
+      localStorage.removeItem('mes-ai-apc-item')
+    } catch { /* 忽略 */ }
+  }, [])
+
+  const handleSelectItem = useCallback((id: string) => {
+    setActiveItem(id)
+    setDetail(null)
+    try { localStorage.setItem('mes-ai-apc-item', id) } catch { /* 忽略 */ }
   }, [])
 
   // 打开项目编辑器：只认列表里真实存在的项目，其余一律按「新建」打开，
@@ -169,21 +217,44 @@ export function ApcRto({ initialProjectId }: { initialProjectId?: string | null 
     if (!status || !activeProject) return
     if (projects.some(p => p.id === activeProject)) return
     setActiveProject('')
-    try { localStorage.removeItem('mes-ai-apc-project') } catch { /* 忽略 */ }
+    setActiveItem('')
+    try {
+      localStorage.removeItem('mes-ai-apc-project')
+      localStorage.removeItem('mes-ai-apc-item')
+    } catch { /* 忽略 */ }
   }, [status, activeProject, projects])
 
-  const loadStatus = useCallback(() => {
-    return fetchApcStatus()
-      .then(s => setStatus(s))
-      .catch(() => { /* 状态获取失败不阻塞主数据加载 */ })
+  // 自愈：服务端会按「实际生效的监测项」回落，这里把它同步回本地，
+  // 避免选中项已被删除后页面一直显示另一项却挂着旧的下拉值。
+  useEffect(() => {
+    const real = overview?.item?.id || ''
+    if (!real || real === activeItem) return
+    setActiveItem(real)
+    try { localStorage.setItem('mes-ai-apc-item', real) } catch { /* 忽略 */ }
+  }, [overview, activeItem])
+
+  // 状态获取一律吞掉异常，且必须自身永不 reject：它会在 load() 的 finally 里被
+  // 「发后不管」地调用（void loadStatus()），一旦这里抛错，外层 load 的 Promise 会
+  // 变成未捕获的 rejection。用 async + 内部 try 把同步抛错也一并兜住。
+  const loadStatus = useCallback(async () => {
+    try {
+      const s = await fetchApcStatus()
+      setStatus(s)
+    } catch { /* 状态获取失败不阻塞主数据加载 */ }
   }, [])
 
   const load = useCallback(async (opts: { refresh?: boolean } = {}) => {
     setLoading(true)
     try {
+      const base = {
+        minutes: windowMinutes,
+        refresh: opts.refresh,
+        project: activeProjectId || undefined,
+        item: activeItem || undefined,
+      }
       const [ov, op] = await Promise.all([
-        fetchApcOverview({ minutes: windowMinutes, refresh: opts.refresh, project: activeProjectId || undefined }),
-        fetchApcOptimization({ minutes: windowMinutes, refresh: opts.refresh, project: activeProjectId || undefined }),
+        fetchApcOverview(base),
+        fetchApcOptimization(base),
       ])
       setOverview(ov)
       setOptimization(op)
@@ -195,84 +266,98 @@ export function ApcRto({ initialProjectId }: { initialProjectId?: string | null 
       setLoading(false)
       // 取数之后连接状态一定变了（成功即已建连；失败则正是需要显示红灯的时候），
       // 所以这里无条件刷新一次状态——否则「已经取到数了，灯还是黄的」。
-      loadStatus()
+      void loadStatus()
     }
-  }, [windowMinutes, activeProjectId, loadStatus])
+  }, [windowMinutes, activeProjectId, activeItem, loadStatus])
 
   // 配置保存后：重新拉状态（数据源就绪与否可能已变化）并立即刷新数据
   const handleConfigSaved = useCallback(() => {
-    loadStatus()
-    load({ refresh: true })
+    void loadStatus()
+    void load({ refresh: true })
   }, [loadStatus, load])
 
   // 项目编辑器保存/删除成功后：刷新项目列表 + 数据；新建后自动切换选中
   const handleProjectSaved = useCallback((savedId?: string) => {
     setEditingId(undefined)
     if (savedId) handleSelectProject(savedId)
-    loadStatus()
+    void loadStatus()
     // load 依赖 activeProjectId，等一拍让选中项目生效后再刷新
-    setTimeout(() => load({ refresh: true }), 0)
+    setTimeout(() => void load({ refresh: true }), 0)
   }, [handleSelectProject, loadStatus, load])
 
-  useEffect(() => {
-    loadStatus()
-  }, [loadStatus])
-
-  useEffect(() => {
-    load()
-  }, [load])
+  useEffect(() => { void loadStatus() }, [loadStatus])
+  useEffect(() => { void load() }, [load])
 
   useEffect(() => {
     if (!auto) return
-    const id = setInterval(() => { load() }, Math.max(10, intervalSec) * 1000)
+    const id = setInterval(() => { void load() }, Math.max(10, intervalSec) * 1000)
     return () => clearInterval(id)
   }, [auto, intervalSec, load])
 
-  const paramByCode = useMemo(() => {
-    const map = new Map<string, ApcParamItem>()
-    for (const p of overview?.params || []) map.set(p.code, p)
-    return map
-  }, [overview])
+  const output = overview?.output || null
+  const rec: ApcItemRecommendation | null = output ? output.recommendation : null
+  const moves: ApcMove[] = useMemo(() => output?.moves || [], [output])
+  const movers = useMemo(() => moves.filter(m => m.delta !== 0), [moves])
+  const excluded = useMemo(() => moves.filter(m => !m.participating), [moves])
 
-  const detailParam = detailCode ? paramByCode.get(detailCode) || null : null
-
-  const grouped = useMemo(() => {
-    const out: { process: string; items: ApcParamItem[] }[] = []
-    for (const p of overview?.params || []) {
-      let g = out.find(x => x.process === p.process)
-      if (!g) { g = { process: p.process, items: [] }; out.push(g) }
-      g.items.push(p)
-    }
-    return out
-  }, [overview])
-
+  // ===== 复制建议 / 导出 CSV =====
   const buildAdviceText = useCallback((): string => {
-    if (!optimization) return ''
+    if (!overview || !overview.ready || !output) return ''
     const lines: string[] = []
-    lines.push(`# APC / RTO 过程参数优化建议`)
-    lines.push(`装置：${optimization.station}`)
-    lines.push(`统计窗口：近 ${optimization.windowMinutes} 分钟 · 生成时间：${fmtTime(optimization.generatedAt)}`)
-    lines.push(`数据源：${optimization.source.label}`)
+    const r = output.recommendation
+    lines.push('# APC / RTO 过程参数优化建议')
+    lines.push(`装置：${overview.station || '—'}`)
+    lines.push(`监测项目：${overview.projectName || '—'}`)
+    lines.push(`监测项：${overview.item?.name || '—'}${overview.item?.description ? `（${overview.item.description}）` : ''}`)
+    lines.push(`统计窗口：近 ${overview.windowMinutes} 分钟 · 生成时间：${fmtTime(overview.generatedAt)}`)
+    lines.push(`数据源：${overview.source.label}`)
     lines.push('')
-    const actionable = optimization.items.filter(i => !i.recommendation.hold)
-    if (actionable.length === 0) {
-      lines.push('所有过程参数均在工艺死区内，建议维持当前设定值。')
+    lines.push(`## 输出结果 ${output.name}（${output.code}）`)
+    lines.push(
+      `窗口均值 ${fmt(output.mean, output.decimals)}${output.unit}，` +
+      `RTO 理想点 ${fmt(output.target, output.decimals)}${output.unit}，` +
+      `偏差 ${fmt(r.cv.delta, output.decimals)}${output.unit}（${(r.cv.delta ?? 0) >= 0 ? '偏低' : '偏高'}）`
+    )
+    lines.push(`规格 ${fmt(output.lsl, output.decimals)} ~ ${fmt(output.usl, output.decimals)}${output.unit}，过程能力 Cpk=${output.cpk == null ? '—' : output.cpk}（${STATUS_META[output.status].label}）`)
+    lines.push(`紧急度：${URGENCY_META[r.urgency].label} · 置信度：${r.confidence}% · 分摊轮数：${r.rounds}`)
+    if (!r.hold) {
+      lines.push(
+        `预计调整后均值 ${fmt(r.predictedCV, output.decimals)}${output.unit}` +
+        (r.residual != null ? `，仍有残余偏差 ${fmt(r.residual, output.decimals)}${output.unit}（${r.residualPct}%）` : '')
+      )
     }
-    actionable.forEach((it, i) => {
-      const r = it.recommendation
-      lines.push(`${i + 1}. ${it.name}（${it.code}｜${it.process}）—— ${URGENCY_META[r.urgency].label}`)
-      lines.push(`   当前设定值 ${fmt(r.current, it.decimals)}${it.unit} → 建议值 ${fmt(r.suggested, it.decimals)}${it.unit}（${r.delta > 0 ? '+' : ''}${fmt(r.delta, it.decimals)}${it.unit}${r.deltaPct != null ? `，${r.deltaPct}%` : ''}）`)
-      lines.push(`   置信度 ${r.confidence}%`)
-      lines.push(`   理由：${r.reason}`)
-      if (r.risk) lines.push(`   风险：${r.risk}`)
-    })
-    const holds = optimization.items.filter(i => i.recommendation.hold)
-    if (holds.length > 0) {
+    lines.push('')
+    if (r.moves.length === 0) {
+      lines.push('## 参数调整')
+      lines.push(r.hold ? '各参数均无需调整（死区内或修正量小于最小调节步长）。' : '没有可参与求解的参数。')
+    } else {
+      lines.push('## 参数调整')
+      r.moves.forEach((m, i) => {
+        lines.push(
+          `${i + 1}. ${m.name}（${m.code}）：${fmt(m.current, m.decimals)} → ${fmt(m.suggested, m.decimals)}${m.unit}` +
+          `（${m.delta > 0 ? '+' : ''}${fmt(m.delta, m.decimals)}${m.unit}${m.deltaPct != null ? `，${m.deltaPct}%` : ''}）` +
+          `，承担偏差 ${Math.round(m.share * 100)}%，影响系数 k=${m.k}，调整阻力 w=${m.weight}` +
+          (m.clampedBy ? `（${clampLabel(m.clampedBy)}）` : '')
+        )
+      })
+    }
+    if (excluded.length > 0) {
       lines.push('')
-      lines.push(`保持不动的参数：${holds.map(i => i.name).join('、')}`)
+      lines.push('## 未参与本次求解')
+      excluded.forEach(m => lines.push(`- ${m.name}（${m.code}）：${m.excludedReason}`))
     }
+    lines.push('')
+    lines.push('## 推荐理由')
+    lines.push(r.reason)
+    if (r.risk) {
+      lines.push('')
+      lines.push('## 风险提示')
+      lines.push(r.risk)
+    }
+    lines.push('')
+    lines.push('说明：以上建议仅在页面展示，不会自动下发到 DCS/PLC，需由工艺工程师确认后手动执行。')
     return lines.join('\n')
-  }, [optimization])
+  }, [overview, output, excluded])
 
   const handleCopy = useCallback(async () => {
     const text = buildAdviceText()
@@ -287,20 +372,51 @@ export function ApcRto({ initialProjectId }: { initialProjectId?: string | null 
   }, [buildAdviceText])
 
   const handleExportCsv = useCallback(() => {
-    if (!optimization) return
-    const head = ['工序', '参数名称', '参数编码', '单位', '当前设定值', '建议值', '调整量', '调整幅度%', '实测均值', '标准差', 'Cpk', '状态', '紧急度', '置信度', '推荐理由']
-    const esc = (s: string) => `"${String(s).replace(/"/g, '""')}"`
-    const rows = optimization.items.map(it => {
-      const r = it.recommendation
-      return [
-        it.process, it.name, it.code, it.unit,
-        fmt(r.current, it.decimals), fmt(r.suggested, it.decimals),
-        fmt(r.delta, it.decimals), r.deltaPct == null ? '' : String(r.deltaPct),
-        fmt(it.mean, it.decimals), fmt(it.std, it.decimals), it.cpk == null ? '' : String(it.cpk),
-        STATUS_META[it.status].label, URGENCY_META[r.urgency].label, String(r.confidence), r.reason,
-      ].map(v => esc(String(v))).join(',')
-    })
-    const csv = '\uFEFF' + [head.join(','), ...rows].join('\r\n')
+    if (!overview || !output) return
+    const esc = (s: unknown) => `"${String(s ?? '').replace(/"/g, '""')}"`
+    const row = (cells: unknown[]) => cells.map(esc).join(',')
+    const lines: string[] = []
+
+    lines.push(row(['# APC / RTO 优化建议']))
+    lines.push(row(['装置', overview.station || '']))
+    lines.push(row(['监测项目', overview.projectName || '']))
+    lines.push(row(['监测项', overview.item?.name || '']))
+    lines.push(row(['统计窗口（分钟）', overview.windowMinutes]))
+    lines.push(row(['生成时间', fmtTime(overview.generatedAt)]))
+    lines.push(row(['数据源', overview.source.label]))
+    lines.push(row([
+      '输出结果', `${output.name}(${output.code})`, output.unit,
+      `均值 ${fmt(output.mean, output.decimals)}`,
+      `理想点 ${fmt(output.target, output.decimals)}`,
+      `偏差 ${fmt(output.recommendation.cv.delta, output.decimals)}`,
+      `Cpk ${output.cpk == null ? '—' : output.cpk}`,
+      STATUS_META[output.status].label,
+      URGENCY_META[output.recommendation.urgency].label,
+      `置信度 ${output.recommendation.confidence}%`,
+    ]))
+    lines.push('')
+    lines.push(row([
+      '参数名称', '参数编码', '单位', '当前值', '建议值', '调整量', '调整幅度%',
+      '承担份额%', '影响系数k', '调整阻力w', '可调下限', '可调上限', '约束', '是否参与', '说明',
+    ]))
+    for (const m of moves) {
+      lines.push(row([
+        m.name, m.code, m.unit,
+        fmt(m.current, m.decimals), fmt(m.suggested, m.decimals), fmt(m.delta, m.decimals),
+        m.deltaPct == null ? '' : m.deltaPct,
+        Math.round(m.share * 100),
+        m.k, m.weight,
+        fmtSpec(m.min, m.decimals), fmtSpec(m.max, m.decimals),
+        clampLabel(m.clampedBy),
+        m.participating ? '是' : '否',
+        m.participating ? '' : m.excludedReason,
+      ]))
+    }
+    lines.push('')
+    lines.push(row(['推荐理由', output.recommendation.reason]))
+    if (output.recommendation.risk) lines.push(row(['风险提示', output.recommendation.risk]))
+
+    const csv = '\uFEFF' + lines.join('\r\n')
     const stamp = new Date()
     const name = `APC优化建议_${stamp.getFullYear()}${String(stamp.getMonth() + 1).padStart(2, '0')}${String(stamp.getDate()).padStart(2, '0')}_${String(stamp.getHours()).padStart(2, '0')}${String(stamp.getMinutes()).padStart(2, '0')}.csv`
     const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' })
@@ -312,9 +428,9 @@ export function ApcRto({ initialProjectId }: { initialProjectId?: string | null 
     a.click()
     document.body.removeChild(a)
     setTimeout(() => URL.revokeObjectURL(url), 1000)
-  }, [optimization])
+  }, [overview, output, moves])
 
-  const summary = optimization?.summary
+  const canExport = Boolean(overview?.ready && output)
 
   return (
     <div className="h-full overflow-y-auto bg-mes-bg">
@@ -329,7 +445,7 @@ export function ApcRto({ initialProjectId }: { initialProjectId?: string | null 
               </span>
             </div>
             <p className="text-xs text-mes-textTertiary mt-1 leading-relaxed">
-              即时读取只读数据源中记录的过程数据列值，依据数据变化优化过程参数设定值，给出建议值。
+              即时读取只读数据源中记录的过程数据列值，把输出结果的偏差按影响系数分摊到各参与参数，给出调整建议。
             </p>
           </div>
 
@@ -381,7 +497,7 @@ export function ApcRto({ initialProjectId }: { initialProjectId?: string | null 
             <select
               value={activeProjectId}
               onChange={e => handleSelectProject(e.target.value)}
-              className="text-xs px-2.5 py-1.5 rounded-lg border border-mes-border bg-white text-mes-textSecondary focus:outline-none focus:border-mes-primary max-w-[200px]"
+              className="text-xs px-2.5 py-1.5 rounded-lg border border-mes-border bg-white text-mes-textSecondary focus:outline-none focus:border-mes-primary max-w-[180px]"
               title="监测项目"
             >
               {projects.length === 0 && <option value="">（暂无项目）</option>}
@@ -390,10 +506,23 @@ export function ApcRto({ initialProjectId }: { initialProjectId?: string | null 
               ))}
             </select>
 
+            <select
+              value={overview?.item?.id || ''}
+              onChange={e => handleSelectItem(e.target.value)}
+              disabled={itemOptions.length === 0}
+              className="text-xs px-2.5 py-1.5 rounded-lg border border-mes-border bg-white text-mes-textSecondary focus:outline-none focus:border-mes-primary max-w-[200px] disabled:opacity-60"
+              title="监测项（1 个输出结果 + N 个参与参数）"
+            >
+              {itemOptions.length === 0 && <option value="">（暂无监测项）</option>}
+              {itemOptions.map(it => (
+                <option key={it.id} value={it.id}>{it.name}</option>
+              ))}
+            </select>
+
             <button
               onClick={() => openEditor(activeProjectId)}
               disabled={!activeProjectId}
-              title="编辑当前监测项目（名称 / 数据库 / SQL 模板 / 参数）"
+              title="编辑当前监测项目（监测项 / 取数 SQL / 输出结果 / 参与参数）"
               className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border border-mes-border bg-white text-mes-textSecondary hover:border-mes-primary hover:text-mes-primary disabled:opacity-50 transition-colors"
             >
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
@@ -405,7 +534,7 @@ export function ApcRto({ initialProjectId }: { initialProjectId?: string | null 
 
             <button
               onClick={() => setEditingId(null)}
-              title="新建监测项目（用哪个数据库 + SQL 模板 + 参数）"
+              title="新建监测项目"
               className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border border-mes-border bg-white text-mes-textSecondary hover:border-mes-primary hover:text-mes-primary transition-colors"
             >
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
@@ -417,7 +546,7 @@ export function ApcRto({ initialProjectId }: { initialProjectId?: string | null 
 
             <button
               onClick={handleCopy}
-              disabled={!optimization || !optimization.ready}
+              disabled={!canExport}
               className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border border-mes-border bg-white text-mes-textSecondary hover:border-mes-primary hover:text-mes-primary disabled:opacity-50 transition-colors"
             >
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
@@ -429,7 +558,7 @@ export function ApcRto({ initialProjectId }: { initialProjectId?: string | null 
 
             <button
               onClick={handleExportCsv}
-              disabled={!optimization || !optimization.ready}
+              disabled={!canExport}
               className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border border-mes-border bg-white text-mes-textSecondary hover:border-mes-primary hover:text-mes-primary disabled:opacity-50 transition-colors"
             >
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
@@ -452,13 +581,20 @@ export function ApcRto({ initialProjectId }: { initialProjectId?: string | null 
                   ? 'bg-green-50 text-green-700'
                   : 'bg-amber-50 text-amber-700'
               }`}>
-                {overview?.source.label || '—'}
+                {overview?.source?.label || '—'}
               </span>
             </div>
             <div className="flex items-center gap-2">
               <span className="text-mes-textTertiary">只读模式</span>
               <span className="px-2 py-0.5 rounded-full bg-green-50 text-green-700 font-medium">仅 SELECT · 禁增删改</span>
             </div>
+            {activeProjectMeta && (
+              <div className="flex items-center gap-2">
+                <span className="text-mes-textTertiary">项目库</span>
+                {/* 槽位显示名一律取系统显示名（侧边栏「数据库管理」页），系统里改名这里跟着变 */}
+                <span className="text-mes-textSecondary">{slotLabel(activeProjectMeta.dbSlot)}</span>
+              </div>
+            )}
             {status?.hana && status.hana.slots?.length > 0 && (
               <div className="flex items-center gap-2 flex-wrap">
                 <span className="text-mes-textTertiary">连接</span>
@@ -477,7 +613,7 @@ export function ApcRto({ initialProjectId }: { initialProjectId?: string | null 
                 {overview?.mode !== 'hana' && <span className="text-mes-textSecondary">未配置（不展示数据）</span>}
               </div>
             )}
-            {overview && (
+            {overview && overview.ready && (
               <>
                 <div className="flex items-center gap-2">
                   <span className="text-mes-textTertiary">本次读取</span>
@@ -495,9 +631,9 @@ export function ApcRto({ initialProjectId }: { initialProjectId?: string | null 
               </span>
             )}
           </div>
-          {Array.isArray(overview?.source?.warnings) && overview.source.warnings.length > 0 && (
+          {Array.isArray(overview?.warnings) && overview.warnings.length > 0 && (
             <div className="mt-3 pt-3 border-t border-mes-border text-[11px] text-amber-700 leading-relaxed space-y-1">
-              {overview.source.warnings.map((w, i) => (
+              {overview.warnings.map((w, i) => (
                 <div key={i}>⚠ {w}</div>
               ))}
             </div>
@@ -531,13 +667,23 @@ export function ApcRto({ initialProjectId }: { initialProjectId?: string | null 
         )}
 
         {/* ===== 汇总指标（仅在数据源就绪时展示）===== */}
-        {summary && overview?.ready && (
+        {output && rec && overview?.ready && (
           <div className="grid grid-cols-2 sm:grid-cols-5 gap-px bg-mes-border rounded-xl overflow-hidden border border-mes-border mb-4">
-            <MetricCell label="过程参数" value={String(summary.total)} hint="纳入优化范围" />
-            <MetricCell label="需调整" value={String(summary.actionable)} hint="超出工艺死区" tone={summary.actionable > 0 ? 'primary' : 'normal'} />
-            <MetricCell label="高优先" value={String(summary.high)} hint="已触及单次限幅" tone={summary.high > 0 ? 'danger' : 'normal'} />
-            <MetricCell label="异常参数" value={String(summary.danger)} hint="过程能力不足" tone={summary.danger > 0 ? 'danger' : 'normal'} />
-            <MetricCell label="平均置信度" value={`${summary.avgConfidence}%`} hint="基于样本量与波动" />
+            <MetricCell label="输出结果" value={output.code} hint={output.name} />
+            <MetricCell
+              label="需调整参数"
+              value={`${movers.length} / ${moves.length}`}
+              hint="有修正量 / 全部参与参数"
+              tone={movers.length > 0 ? 'primary' : 'normal'}
+            />
+            <MetricCell
+              label="预计残余偏差"
+              value={rec.residual == null ? '—' : `${fmt(rec.residual, output.decimals)}`}
+              hint={rec.residualPct == null ? '—' : `占原偏差 ${rec.residualPct}%`}
+              tone={rec.residualPct != null && rec.residualPct > 20 ? 'danger' : 'normal'}
+            />
+            <MetricCell label="过程能力 Cpk" value={output.cpk == null ? '—' : String(output.cpk)} hint={STATUS_META[output.status].label} tone={output.status === 'danger' ? 'danger' : 'normal'} />
+            <MetricCell label="平均置信度" value={`${rec.confidence}%`} hint="基于样本量、能力与标定来源" />
           </div>
         )}
 
@@ -545,12 +691,11 @@ export function ApcRto({ initialProjectId }: { initialProjectId?: string | null 
         <div className="flex items-center gap-1 mb-3 border-b border-mes-border">
           <TabButton active={tab === 'overview'} onClick={() => setTab('overview')}>
             实时概览
-            {overview?.ready ? <span className="ml-1 text-[11px] text-mes-textTertiary">{overview.params.length}</span> : null}
           </TabButton>
           <TabButton active={tab === 'optimize'} onClick={() => setTab('optimize')}>
             优化建议
-            {summary && summary.actionable > 0 && (
-              <span className="ml-1.5 text-[10px] px-1.5 py-0.5 rounded-full bg-mes-tagBg text-mes-tagText font-medium">{summary.actionable}</span>
+            {movers.length > 0 && (
+              <span className="ml-1.5 text-[10px] px-1.5 py-0.5 rounded-full bg-mes-tagBg text-mes-tagText font-medium">{movers.length}</span>
             )}
           </TabButton>
         </div>
@@ -573,8 +718,13 @@ export function ApcRto({ initialProjectId }: { initialProjectId?: string | null 
               </svg>
             </div>
             <h3 className="text-sm font-semibold text-mes-text mb-1.5">未配置数据源</h3>
-            <p className="text-xs text-mes-textSecondary leading-relaxed max-w-[600px] mx-auto">
-              {overview.source?.note || '请先新建监测项目，并配置数据库连接与取数 SQL 模板。'}
+            {overview.reason && REASON_LABEL[overview.reason] && (
+              <div className="text-[11px] px-2 py-0.5 rounded-full bg-amber-50 text-amber-700 inline-block mb-2">
+                {REASON_LABEL[overview.reason]}
+              </div>
+            )}
+            <p className="text-xs text-mes-textSecondary leading-relaxed max-w-[640px] mx-auto">
+              {overview.source?.note || '请先新建监测项目，为它添加监测项并配置取数 SQL 模板。'}
             </p>
             <div className="mt-5 flex flex-wrap items-center justify-center gap-2">
               <button
@@ -584,7 +734,7 @@ export function ApcRto({ initialProjectId }: { initialProjectId?: string | null 
                 {activeProjectId ? '编辑当前项目' : '新建监测项目'}
               </button>
               <button
-                onClick={() => { loadStatus(); load({ refresh: true }) }}
+                onClick={() => { void loadStatus(); void load({ refresh: true }) }}
                 disabled={loading}
                 className="px-3 py-1.5 rounded-lg text-xs font-medium border border-mes-border bg-white text-mes-textSecondary hover:border-mes-primary hover:text-mes-primary disabled:opacity-50 transition-colors"
               >
@@ -592,100 +742,73 @@ export function ApcRto({ initialProjectId }: { initialProjectId?: string | null 
               </button>
             </div>
             <p className="mt-3 text-[11px] text-mes-textTertiary">
-              {projects.length === 0 ? '当前还没有任何监测项目' : `当前共 ${projects.length} 个监测项目`}
-              {activeProjectMeta && activeProjectMeta.hasQueries === false ? ' · 该项目尚未配置取数 SQL 模板' : ''}
+              {projects.length === 0
+                ? '当前还没有任何监测项目'
+                : `当前共 ${projects.length} 个监测项目${activeProjectMeta ? ` · 该项目有 ${activeProjectMeta.itemCount} 个监测项` : ''}`}
             </p>
           </div>
         )}
 
-        {overview && overview.ready && tab === 'overview' && (
-          <div className="space-y-5">
-            {/* 监测项目卡片：创建的项目显示在实时概览，点击切换 */}
-            {projects.length > 0 && (
-              <section>
-                <div className="flex items-center gap-2 mb-2">
-                  <span className="text-sm font-semibold text-mes-text">监测项目</span>
-                  <span className="text-[11px] text-mes-textTertiary">{projects.length} 个 · 点击切换</span>
-                  <div className="flex-1 h-px bg-mes-border" />
-                </div>
-                <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-3">
-                  {projects.map(p => {
-                    const active = p.id === activeProjectId
-                    return (
-                      <button
-                        key={p.id}
-                        onClick={() => handleSelectProject(p.id)}
-                        title="切换到该项目"
-                        className={`text-left rounded-xl border p-3.5 transition-all-smooth ${
-                          active
-                            ? 'border-mes-primary bg-mes-tagBg/40 shadow-sm'
-                            : 'border-mes-border bg-white hover:border-mes-primary/40 hover:shadow-md'
-                        }`}
-                      >
-                        <div className="flex items-center justify-between gap-2 mb-1.5">
-                          <span className={`text-sm font-semibold truncate ${active ? 'text-mes-primary' : 'text-mes-text'}`}>{p.name}</span>
-                          <span className="shrink-0 text-[10px] px-1.5 py-0.5 rounded-full bg-mes-tagBg text-mes-tagText font-medium">
-                            {slotLabel(p.dbSlot)}
-                          </span>
-                        </div>
-                        <p className="text-[11px] text-mes-textTertiary line-clamp-2 mb-1.5 min-h-[2em]">
-                          {p.description || '未填写描述'}
-                        </p>
-                        <div className="flex items-center gap-1.5 flex-wrap">
-                          <span className="text-[10px] text-mes-textSecondary">{p.paramCount} 个监测参数</span>
-                          {!p.hasQueries && (
-                            <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-amber-50 text-amber-700">未配 SQL</span>
-                          )}
-                          {active && (
-                            <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-mes-primary text-white">当前</span>
-                          )}
-                        </div>
-                      </button>
-                    )
-                  })}
-                </div>
-              </section>
-            )}
-            {grouped.map(g => (
-              <section key={g.process}>
-                <div className="flex items-center gap-2 mb-2">
-                  <span className="text-sm font-semibold text-mes-text">{g.process}工序</span>
-                  <span className="text-[11px] text-mes-textTertiary">{g.items.length} 个过程参数</span>
-                  <div className="flex-1 h-px bg-mes-border" />
-                </div>
-                <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-3">
-                  {g.items.map(p => (
-                    <ParamCard key={p.code} param={p} onClick={() => setDetailCode(p.code)} />
-                  ))}
-                </div>
-              </section>
-            ))}
+        {overview?.ready && output && rec && tab === 'overview' && (
+          <div className="space-y-4">
+            <OutputCard output={output} />
+            <ParamStatusTable
+              moves={moves}
+              unit={output.unit}
+              excludedCount={excluded.length}
+              onOpenCurve={m => setDetail({ code: m.code, isOutput: false })}
+              onOpenOutputCurve={() => setDetail({ code: output.code, isOutput: true })}
+            />
           </div>
         )}
 
-        {optimization && optimization.ready && tab === 'optimize' && (
-          <div className="space-y-3">
-            {optimization.items.length === 0 && (
-              <div className="py-16 text-center text-sm text-mes-textTertiary">窗口内没有可用的过程数据</div>
+        {overview?.ready && output && rec && tab === 'optimize' && (
+          <div className="space-y-4">
+            <RecommendationPanel
+              output={output}
+              rec={rec}
+              onOpenOutputCurve={() => setDetail({ code: output.code, isOutput: true })}
+            />
+            <MovesTable
+              title="参数调整明细"
+              desc="按杠杆份额 k²·量程²/w 把输出结果的偏差分摊给各参数；约束生效时会把未消除部分重新分摊给未顶限的参数"
+              moves={moves}
+              unit={output.unit}
+              emphasize
+              onOpenCurve={m => setDetail({ code: m.code, isOutput: false })}
+            />
+            {excluded.length > 0 && (
+              <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3">
+                <div className="text-xs font-semibold text-amber-800 mb-1.5">未参与本次求解的参数</div>
+                <div className="space-y-1">
+                  {excluded.map(m => (
+                    <div key={m.code} className="text-[11px] text-amber-800">
+                      · {m.name}（{m.code}）：{m.excludedReason || '未参与'}
+                    </div>
+                  ))}
+                </div>
+                <div className="mt-2 text-[10px] text-amber-700 leading-relaxed">
+                  k 为 0 的参数可用单变量试验估计：k ≈ ΔCV / ΔMV；标定后它才会参与分摊。
+                </div>
+              </div>
             )}
-            {optimization.items.map(item => (
-              <AdviceCard key={item.code} item={item} onOpenTrend={() => { setDetailCode(item.code); setTab('overview') }} />
-            ))}
           </div>
         )}
       </div>
 
       {/* ===== 详情抽屉 ===== */}
-      {detailParam && (
-        <ParamDetail
-          param={detailParam}
+      {detail && (
+        <CurveDetail
+          code={detail.code}
+          isOutput={detail.isOutput}
           windowMinutes={windowMinutes}
           projectId={activeProjectId}
-          onClose={() => setDetailCode(null)}
+          itemId={overview?.item?.id || ''}
+          onClose={() => setDetail(null)}
         />
       )}
 
-      {/* ===== 监测项目编辑器（项目设置 / SQL 模板 / 参数配置）===== */}
+      {/* ===== 监测项目编辑器（项目设置 / 监测项）===== */}
       {editingId !== undefined && (
         <ApcConfigPanel
           projectId={editingId}
@@ -699,7 +822,7 @@ export function ApcRto({ initialProjectId }: { initialProjectId?: string | null 
 
 // ===== 子组件 =====
 
-function TabButton({ active, onClick, children }: { active: boolean; onClick: () => void; children: React.ReactNode }) {
+function TabButton({ active, onClick, children }: { active: boolean; onClick: () => void; children: ReactNode }) {
   return (
     <button
       onClick={onClick}
@@ -719,8 +842,8 @@ function MetricCell({ label, value, hint, tone = 'normal' }: { label: string; va
   return (
     <div className="bg-white px-4 py-3">
       <div className="text-[11px] text-mes-textTertiary mb-1">{label}</div>
-      <div className={`text-xl font-bold ${color}`}>{value}</div>
-      <div className="text-[10px] text-mes-textTertiary mt-0.5">{hint}</div>
+      <div className={`text-xl font-bold truncate ${color}`}>{value}</div>
+      <div className="text-[10px] text-mes-textTertiary mt-0.5 truncate">{hint}</div>
     </div>
   )
 }
@@ -745,214 +868,342 @@ function Sparkline({ points, color }: { points: { t: number; v: number }[]; colo
   )
 }
 
-function ParamCard({ param, onClick }: { param: ApcParamItem; onClick: () => void }) {
-  const meta = STATUS_META[param.status]
-  const r = param.recommendation
-  return (
-    <button
-      onClick={onClick}
-      className="text-left rounded-xl border border-mes-border bg-white p-3.5 hover:shadow-md hover:border-mes-primary/40 transition-all-smooth"
-    >
-      <div className="flex items-start justify-between gap-2 mb-2">
-        <div className="min-w-0">
-          <div className="flex items-center gap-1.5">
-            <span className="text-sm">{OBJECTIVE_ICON[param.objective] || '🔧'}</span>
-            <span className="text-sm font-medium text-mes-text truncate">{param.name}</span>
-          </div>
-          <div className="text-[10px] text-mes-textTertiary mt-0.5 truncate">{param.code} · 影响{param.objectiveLabel}</div>
-        </div>
-        <span
-          className="shrink-0 text-[10px] px-1.5 py-0.5 rounded font-medium"
-          style={{ color: meta.color, backgroundColor: meta.bg }}
-        >
-          {meta.label}
-        </span>
-      </div>
-
-      <div className="flex items-end justify-between gap-2">
-        <div>
-          <div className="text-[10px] text-mes-textTertiary">实测值（最新）</div>
-          <div className="flex items-baseline gap-1">
-            <span className="text-xl font-bold" style={{ color: param.status === 'normal' ? '#1a1a1a' : meta.color }}>
-              {fmt(param.latest, param.decimals)}
-            </span>
-            {param.unit && <span className="text-[11px] text-mes-textTertiary">{param.unit}</span>}
-          </div>
-          <div className="text-[10px] text-mes-textTertiary mt-0.5">
-            均值 {fmt(param.mean, param.decimals)} · Cpk {param.cpk == null ? '—' : param.cpk}
-            <span className="ml-1">{trendArrow(param.trend)}</span>
-          </div>
-        </div>
-        <div className="w-[45%] shrink-0">
-          <Sparkline points={param.series} color={meta.dot} />
-        </div>
-      </div>
-
-      <div className="mt-2.5 pt-2.5 border-t border-mes-border flex items-center justify-between gap-2">
-        <div className="text-[11px] text-mes-textSecondary">
-          设定 {fmt(r.current, param.decimals)}
-          <span className="mx-1 text-mes-textTertiary">→</span>
-          <span className={r.hold ? 'text-mes-textSecondary' : 'text-mes-primary font-semibold'}>
-            建议 {fmt(r.suggested, param.decimals)}
-          </span>
-        </div>
-        <span
-          className="text-[10px] px-1.5 py-0.5 rounded font-medium shrink-0"
-          style={{ color: URGENCY_META[r.urgency].color, backgroundColor: URGENCY_META[r.urgency].bg }}
-        >
-          {URGENCY_META[r.urgency].label}
-        </span>
-      </div>
-    </button>
-  )
-}
-
-function AdviceCard({ item, onOpenTrend }: { item: ApcParamItem; onOpenTrend: () => void }) {
-  const meta = STATUS_META[item.status]
-  const r = item.recommendation
-  const uMeta = URGENCY_META[r.urgency]
-  const isUp = r.delta > 0
-  const cColor = confidenceColor(r.confidence)
-
+/** 输出结果（CV）大卡片：实时值 + 统计 + 规格 + 点级超限 */
+function OutputCard({ output }: { output: ApcCvResult }) {
+  const meta = STATUS_META[output.status]
+  const specExprs = output.specResolved?.ok ? Object.entries(output.specResolved.expressions || {}) : []
+  const pdev = output.pointDeviation
   return (
     <div className="rounded-xl border border-mes-border bg-white overflow-hidden">
       <div className="flex flex-wrap items-center justify-between gap-2 px-4 py-2.5 border-b border-mes-border bg-gray-50/60">
         <div className="flex items-center gap-2 min-w-0">
-          <span className="text-sm">{OBJECTIVE_ICON[item.objective] || '🔧'}</span>
-          <span className="text-sm font-semibold text-mes-text truncate">{item.name}</span>
+          <span className="text-sm">{OBJECTIVE_ICON[output.objective] || '🎯'}</span>
+          <span className="text-sm font-semibold text-mes-text truncate">{output.name}</span>
           <span className="text-[10px] px-1.5 py-0.5 rounded bg-white border border-mes-border text-mes-textTertiary shrink-0">
-            {item.process} · {item.code}
+            输出结果 · {output.code}
           </span>
           <span className="text-[10px] px-1.5 py-0.5 rounded font-medium shrink-0" style={{ color: meta.color, backgroundColor: meta.bg }}>
             {meta.label}
           </span>
         </div>
-        <div className="flex items-center gap-2">
-          <span className="text-[10px] px-1.5 py-0.5 rounded font-medium" style={{ color: uMeta.color, backgroundColor: uMeta.bg }}>
-            {uMeta.label}
-          </span>
-          <span className="flex items-center gap-1 text-[11px] text-mes-textSecondary">
-            置信度
-            <span className="font-semibold" style={{ color: cColor }}>{r.confidence}%</span>
-          </span>
-        </div>
+        <span className="text-[10px] text-mes-textTertiary shrink-0">影响{output.objectiveLabel}</span>
       </div>
 
       <div className="px-4 py-3">
-        <div className="flex flex-wrap items-center gap-x-4 gap-y-2 mb-3">
+        <div className="flex flex-wrap items-end gap-x-6 gap-y-3">
           <div>
-            <div className="text-[10px] text-mes-textTertiary mb-0.5">当前设定值</div>
-            <div className="text-lg font-bold text-mes-textSecondary">
-              {fmt(r.current, item.decimals)}
-              {item.unit && <span className="text-[11px] font-normal ml-0.5">{item.unit}</span>}
+            <div className="text-[10px] text-mes-textTertiary">实测值（最新）</div>
+            <div className="flex items-baseline gap-1">
+              <span className="text-2xl font-bold" style={{ color: output.status === 'normal' ? '#1a1a1a' : meta.color }}>
+                {fmt(output.latest, output.decimals)}
+              </span>
+              {output.unit && <span className="text-[11px] text-mes-textTertiary">{output.unit}</span>}
+            </div>
+            <div className="text-[10px] text-mes-textTertiary mt-0.5">
+              窗口均值 {fmt(output.mean, output.decimals)} · σ {fmt(output.std, output.decimals)}
+              <span className="ml-1">{trendArrow(output.trend)}</span>
             </div>
           </div>
-          <div className={`w-7 h-7 rounded-full flex items-center justify-center ${isUp ? 'bg-orange-50 text-orange-500' : r.hold ? 'bg-gray-100 text-gray-400' : 'bg-blue-50 text-blue-500'}`}>
-            {r.hold
-              ? <span className="text-xs">—</span>
-              : <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
-                  {isUp ? <polyline points="5 12 12 5 19 12" /> : <polyline points="19 12 12 19 5 12" />}
-                  <line x1="12" y1="5" x2="12" y2="19" />
-                </svg>}
+          <div className="w-[45%] max-w-[260px] min-w-[140px] flex-1">
+            <Sparkline points={output.series} color={meta.dot} />
           </div>
-          <div>
-            <div className="text-[10px] mb-0.5" style={{ color: r.hold ? '#999999' : '#4d6bfe' }}>
-              {r.hold ? '建议保持' : '优化建议值'}
-            </div>
-            <div className="text-lg font-bold" style={{ color: r.hold ? '#6b6b6b' : '#4d6bfe' }}>
-              {fmt(r.suggested, item.decimals)}
-              {item.unit && <span className="text-[11px] font-normal ml-0.5">{item.unit}</span>}
-            </div>
-          </div>
-          {!r.hold && (
-            <span className="text-[11px] px-2 py-0.5 rounded-full" style={{ backgroundColor: isUp ? '#fff7ed' : '#f0fdf4', color: isUp ? '#ea580c' : '#16a34a' }}>
-              {isUp ? '↑' : '↓'} {Math.abs(r.delta).toFixed(item.decimals)}{item.unit}
-              {r.deltaPct != null ? `（${Math.abs(r.deltaPct)}%）` : ''}
-            </span>
-          )}
-          {r.clampedBy && !r.hold && (
-            <span className="text-[11px] px-2 py-0.5 rounded-full bg-amber-50 text-amber-700">
-              {r.clampedBy === 'step' ? '已触及单次调整限幅' : r.clampedBy === 'max' ? '受可调上限约束' : '受可调下限约束'}
-            </span>
-          )}
         </div>
 
-        {/* 关键数据行 */}
-        <div className="grid grid-cols-3 sm:grid-cols-6 gap-px bg-mes-border rounded-lg overflow-hidden mb-3">
-          <MiniStat label="RTO 理想点" value={fmt(item.optimalTarget, item.decimals)} />
-          <MiniStat label="实测均值" value={fmt(item.mean, item.decimals)} />
-          <MiniStat label="标准差 σ" value={fmt(item.std, item.decimals)} />
-          <MiniStat label="Cpk" value={item.cpk == null ? '—' : String(item.cpk)} />
-          <MiniStat label="规格范围" value={`${fmt(item.lsl, item.decimals)} ~ ${fmt(item.usl, item.decimals)}`} />
-          <MiniStat label="样本点数" value={String(item.sampleCount)} />
+        <div className="mt-3 grid grid-cols-2 sm:grid-cols-6 gap-px bg-mes-border rounded-lg overflow-hidden">
+          <MiniStat label="RTO 理想点" value={fmt(output.target, output.decimals)} />
+          <MiniStat label="规格范围" value={`${fmt(output.lsl, output.decimals)} ~ ${fmt(output.usl, output.decimals)}`} />
+          <MiniStat label="Cpk" value={output.cpk == null ? '—' : String(output.cpk)} />
+          <MiniStat label="窗口极差" value={`${fmt(output.min_, output.decimals)} ~ ${fmt(output.max_, output.decimals)}`} />
+          <MiniStat label="样本点数" value={String(output.sampleCount)} />
+          <MiniStat label="趋势" value={`${trendArrow(output.trend)} ${output.trend === 'up' ? '上行' : output.trend === 'down' ? '下行' : '平稳'}`} />
         </div>
 
-        {/* 规格来自列名表达式时的可见性：解析失败、或在哪些点超限，都必须让人一眼看到 */}
-        {item.specResolved && !item.specResolved.ok && (
-          <div className="mb-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-[11px] text-amber-800 leading-relaxed">
-            规格未能确定，本次不做优化判定：{item.specResolved.errors.join('；')}。
-            {item.specResolved.columns.length > 0 && (
-              <> 涉及列：<span className="font-mono">{item.specResolved.columns.join('、')}</span>。</>
+        {output.specResolved && !output.specResolved.ok && (
+          <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-[11px] text-amber-800 leading-relaxed">
+            规格未能确定，本次不做优化判定：{output.specResolved.errors.join('；')}。
+            {output.specResolved.columns.length > 0 && (
+              <> 涉及列：<span className="font-mono">{output.specResolved.columns.join('、')}</span>。</>
             )}
+            请在「编辑项目 → 监测项 → 取数与输出」核对规格表达式引用的列名是否已出现在取数 SQL 的结果列中。
           </div>
         )}
-        {item.specResolved?.ok && Object.keys(item.specResolved.expressions).length > 0 && (
-          <div className="mb-2 text-[10px] text-mes-textTertiary leading-relaxed">
-            规格取自列名表达式：
-            {Object.entries(item.specResolved.expressions).map(([f, src]) => (
+        {specExprs.length > 0 && (
+          <div className="mt-2 text-[10px] text-mes-textTertiary leading-relaxed">
+            规格取自列名表达式（按每行求值）：
+            {specExprs.map(([f, src]) => (
               <span key={f} className="ml-1.5 font-mono">{f} = {src}</span>
             ))}
           </div>
         )}
-        {item.specResolved?.ok && item.pointDeviation && item.pointDeviation.n > 0 && (
-          <div className={`mb-3 rounded-lg border px-3 py-2 text-[11px] leading-relaxed ${
-            item.pointDeviation.outOfSpec > 0
+        {output.specResolved?.ok && pdev && pdev.n > 0 && (
+          <div className={`mt-3 rounded-lg border px-3 py-2 text-[11px] leading-relaxed ${
+            pdev.outOfSpec > 0
               ? 'border-red-200 bg-red-50 text-red-700'
               : 'border-emerald-200 bg-emerald-50 text-emerald-700'
           }`}
           >
-            {item.pointDeviation.outOfSpec > 0 ? (
+            {pdev.outOfSpec > 0 ? (
               <>
-                窗口 {item.pointDeviation.n} 个采样点中 <span className="font-semibold">{item.pointDeviation.outOfSpec}</span> 点超规格
-                （超上限 {item.pointDeviation.outHigh}、低下限 {item.pointDeviation.outLow}）
-                {item.pointDeviation.worst && (
+                窗口 {pdev.n} 个采样点中 <span className="font-semibold">{pdev.outOfSpec}</span> 点超规格
+                （超上限 {pdev.outHigh}、低下限 {pdev.outLow}）
+                {pdev.worst && (
                   <>
-                    　最差：{fmt(item.pointDeviation.worst.v, item.decimals)}{item.unit}，
-                    偏离 {fmt(item.pointDeviation.worst.deviation, item.decimals)}{item.unit}
-                    （{item.pointDeviation.worst.direction === 'high' ? '超上限' : '低下限'}）
+                    　最差：{fmt(pdev.worst.v, output.decimals)}{output.unit}，
+                    偏离 {fmt(pdev.worst.deviation, output.decimals)}{output.unit}
+                    （{pdev.worst.direction === 'high' ? '超上限' : '低下限'}）
                   </>
                 )}
               </>
             ) : (
-              <>窗口 {item.pointDeviation.n} 个采样点全部落在规格内。</>
+              <>窗口 {pdev.n} 个采样点全部落在规格内。</>
             )}
+            <span className="text-mes-textTertiary">（点级按各自数据行判定，不受趋势图降采样影响）</span>
           </div>
         )}
+      </div>
+    </div>
+  )
+}
+
+/** 优化建议面板：预计效果 + 理由 + 风险 */
+function RecommendationPanel({
+  output, rec, onOpenOutputCurve,
+}: {
+  output: ApcCvResult
+  rec: ApcItemRecommendation
+  onOpenOutputCurve: () => void
+}) {
+  const uMeta = URGENCY_META[rec.urgency]
+  const cColor = confidenceColor(rec.confidence)
+  return (
+    <div className="rounded-xl border border-mes-border bg-white overflow-hidden">
+      <div className="flex flex-wrap items-center justify-between gap-2 px-4 py-2.5 border-b border-mes-border bg-gray-50/60">
+        <div className="flex items-center gap-2 min-w-0">
+          <span className="text-sm font-semibold text-mes-text">优化建议 · {output.name}</span>
+          <span className="text-[10px] px-1.5 py-0.5 rounded font-medium shrink-0" style={{ color: uMeta.color, backgroundColor: uMeta.bg }}>
+            {uMeta.label}
+          </span>
+          {rec.hold && (
+            <span className="text-[10px] px-1.5 py-0.5 rounded bg-gray-100 text-gray-600 shrink-0">建议保持</span>
+          )}
+        </div>
+        <div className="flex items-center gap-3">
+          <span className="flex items-center gap-1 text-[11px] text-mes-textSecondary">
+            置信度
+            <span className="font-semibold" style={{ color: cColor }}>{rec.confidence}%</span>
+          </span>
+          {rec.rounds > 1 && (
+            <span className="text-[10px] text-mes-textTertiary" title="某参数顶到约束后，未消除的偏差被重新分摊给其它参数">
+              分摊 {rec.rounds} 轮
+            </span>
+          )}
+          <button onClick={onOpenOutputCurve} className="text-[11px] text-mes-primary hover:underline">
+            查看输出结果趋势 →
+          </button>
+        </div>
+      </div>
+
+      <div className="px-4 py-3">
+        <div className="flex flex-wrap items-center gap-x-5 gap-y-2 mb-3">
+          <div>
+            <div className="text-[10px] text-mes-textTertiary mb-0.5">输出结果均值</div>
+            <div className="text-lg font-bold text-mes-textSecondary">
+              {fmt(rec.cv.current, output.decimals)}
+              {output.unit && <span className="text-[11px] font-normal ml-0.5">{output.unit}</span>}
+            </div>
+          </div>
+          <div className={`w-7 h-7 rounded-full flex items-center justify-center shrink-0 ${
+            rec.hold ? 'bg-gray-100 text-gray-400' : ((rec.cv.delta ?? 0) > 0 ? 'bg-orange-50 text-orange-500' : 'bg-blue-50 text-blue-500')
+          }`}>
+            {rec.hold ? <span className="text-xs">—</span> : <span className="text-xs font-bold">{(rec.cv.delta ?? 0) > 0 ? '↑' : '↓'}</span>}
+          </div>
+          <div>
+            <div className="text-[10px] text-mes-textTertiary mb-0.5">RTO 理想操作点</div>
+            <div className="text-lg font-bold text-mes-text" style={{ color: '#4d6bfe' }}>
+              {fmt(rec.cv.target, output.decimals)}
+              {output.unit && <span className="text-[11px] font-normal ml-0.5">{output.unit}</span>}
+            </div>
+          </div>
+          {rec.cv.delta != null && (
+            <span className="text-[11px] px-2 py-0.5 rounded-full bg-mes-tagBg text-mes-tagText">
+              偏差 {fmt(rec.cv.delta, output.decimals)}{output.unit}（{(rec.cv.delta) >= 0 ? '偏低' : '偏高'}）
+            </span>
+          )}
+          {rec.clampedBy && (
+            <span className="text-[11px] px-2 py-0.5 rounded-full bg-amber-50 text-amber-700">
+              约束生效：{clampLabel(rec.clampedBy)}
+            </span>
+          )}
+        </div>
+
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-px bg-mes-border rounded-lg overflow-hidden mb-3">
+          <MiniStat label="预计调整后均值" value={fmt(rec.predictedCV, output.decimals)} />
+          <MiniStat label="预计残余偏差" value={rec.residual == null ? '—' : fmt(rec.residual, output.decimals)} />
+          <MiniStat label="残余占原偏差" value={rec.residualPct == null ? '—' : `${rec.residualPct}%`} />
+          <MiniStat label="需调整参数" value={`${rec.moves.length} 个`} />
+        </div>
 
         <div className="bg-gray-50 rounded-lg p-2.5">
           <p className="text-xs text-mes-textSecondary leading-relaxed">
-            <span className="font-medium text-mes-text">推荐理由：</span>{r.reason}
+            <span className="font-medium text-mes-text">推荐理由：</span>{rec.reason}
           </p>
-          {r.risk && (
+          {rec.risk && (
             <p className="text-xs text-amber-700 leading-relaxed mt-1.5">
-              <span className="font-medium">风险提示：</span>{r.risk}
-            </p>
-          )}
-          {!r.hold && r.predictedCpk != null && (
-            <p className="text-xs text-mes-textTertiary leading-relaxed mt-1.5">
-              预计调整后：均值 {fmt(r.predictedMean, item.decimals)}{item.unit}，Cpk {r.predictedCpk}
+              <span className="font-medium">风险提示：</span>{rec.risk}
             </p>
           )}
         </div>
+      </div>
+    </div>
+  )
+}
 
-        <div className="flex justify-end mt-2">
-          <button
-            onClick={onOpenTrend}
-            className="text-[11px] text-mes-primary hover:underline"
-          >
-            查看该参数趋势 →
-          </button>
+/** 参与参数调整表 */
+function MovesTable({
+  title, desc, moves, unit, emphasize = false, onOpenCurve,
+}: {
+  title: string
+  desc?: string
+  moves: ApcMove[]
+  unit: string
+  /** true=突出调整量与承担份额（优化建议页） */
+  emphasize?: boolean
+  onOpenCurve: (m: ApcMove) => void
+}) {
+  if (moves.length === 0) {
+    return (
+      <div className="rounded-xl border border-mes-border bg-white px-4 py-8 text-center text-xs text-mes-textTertiary">
+        该监测项尚未配置参与参数，只能观察输出结果。
+      </div>
+    )
+  }
+  return (
+    <div className="rounded-xl border border-mes-border bg-white overflow-hidden">
+      <div className="px-4 py-2.5 border-b border-mes-border bg-gray-50/60">
+        <div className="text-sm font-semibold text-mes-text">{title}</div>
+        {desc && <div className="text-[11px] text-mes-textTertiary mt-0.5 leading-relaxed">{desc}</div>}
+      </div>
+      <div className="overflow-x-auto">
+        <table className="min-w-full text-[11px]">
+          <thead className="bg-gray-50">
+            <tr>
+              <th className="px-3 py-2 text-left font-medium text-mes-textSecondary whitespace-nowrap border-b border-mes-border">参数</th>
+              <th className="px-3 py-2 text-right font-medium text-mes-textSecondary whitespace-nowrap border-b border-mes-border">当前值{unit ? `（${unit}）` : ''}</th>
+              <th className="px-3 py-2 text-center font-medium text-mes-textSecondary whitespace-nowrap border-b border-mes-border"></th>
+              <th className="px-3 py-2 text-right font-medium text-mes-textSecondary whitespace-nowrap border-b border-mes-border">建议值</th>
+              <th className="px-3 py-2 text-right font-medium text-mes-textSecondary whitespace-nowrap border-b border-mes-border">调整量</th>
+              <th className="px-3 py-2 text-right font-medium text-mes-textSecondary whitespace-nowrap border-b border-mes-border">幅度</th>
+              {emphasize && (
+                <th className="px-3 py-2 text-right font-medium text-mes-textSecondary whitespace-nowrap border-b border-mes-border">承担偏差</th>
+              )}
+              <th className="px-3 py-2 text-right font-medium text-mes-textSecondary whitespace-nowrap border-b border-mes-border">k</th>
+              <th className="px-3 py-2 text-right font-medium text-mes-textSecondary whitespace-nowrap border-b border-mes-border">w</th>
+              <th className="px-3 py-2 text-left font-medium text-mes-textSecondary whitespace-nowrap border-b border-mes-border">可调范围</th>
+              <th className="px-3 py-2 text-left font-medium text-mes-textSecondary whitespace-nowrap border-b border-mes-border">约束</th>
+              <th className="px-3 py-2 text-right font-medium text-mes-textSecondary whitespace-nowrap border-b border-mes-border"></th>
+            </tr>
+          </thead>
+          <tbody>
+            {moves.map(m => {
+              const moving = m.delta !== 0
+              return (
+                <tr key={m.code} className={`odd:bg-white even:bg-gray-50/50 ${m.participating ? '' : 'opacity-70'}`}>
+                  <td className="px-3 py-2 border-b border-mes-border/60 align-middle">
+                    <div className="flex items-center gap-1.5">
+                      <span className="font-medium text-mes-text">{m.name}</span>
+                      {!m.participating && (
+                        <span className="text-[9px] px-1 rounded bg-amber-50 text-amber-700" title={m.excludedReason}>未参与</span>
+                      )}
+                    </div>
+                    <div className="text-[10px] text-mes-textTertiary font-mono">{m.code}</div>
+                  </td>
+                  <td className="px-3 py-2 border-b border-mes-border/60 text-right whitespace-nowrap text-mes-textSecondary font-mono">
+                    {fmt(m.current, m.decimals)}
+                  </td>
+                  <td className="px-3 py-2 border-b border-mes-border/60 text-center text-mes-textTertiary">
+                    {m.participating ? '→' : '—'}
+                  </td>
+                  <td className={`px-3 py-2 border-b border-mes-border/60 text-right whitespace-nowrap font-mono ${moving ? 'font-semibold' : 'text-mes-textTertiary'}`}
+                      style={moving ? { color: m.delta > 0 ? '#ea580c' : '#16a34a' } : undefined}>
+                    {fmt(m.suggested, m.decimals)}
+                  </td>
+                  <td className={`px-3 py-2 border-b border-mes-border/60 text-right whitespace-nowrap font-mono ${moving ? 'font-semibold' : 'text-mes-textTertiary'}`}>
+                    {moving ? `${m.delta > 0 ? '+' : ''}${fmt(m.delta, m.decimals)}` : '0'}
+                  </td>
+                  <td className="px-3 py-2 border-b border-mes-border/60 text-right whitespace-nowrap text-mes-textSecondary">
+                    {m.deltaPct == null ? '—' : `${m.deltaPct > 0 ? '+' : ''}${m.deltaPct}%`}
+                  </td>
+                  {emphasize && (
+                    <td className="px-3 py-2 border-b border-mes-border/60 text-right whitespace-nowrap">
+                      {moving ? (
+                        <span className="inline-flex items-center gap-1">
+                          <span className="text-mes-text">{Math.round(m.share * 100)}%</span>
+                          <span className="w-10 h-1.5 rounded-full bg-gray-100 overflow-hidden inline-block">
+                            <span className="block h-full bg-mes-primary" style={{ width: `${Math.min(100, Math.round(m.share * 100))}%` }} />
+                          </span>
+                        </span>
+                      ) : <span className="text-mes-textTertiary">—</span>}
+                    </td>
+                  )}
+                  <td className="px-3 py-2 border-b border-mes-border/60 text-right whitespace-nowrap font-mono text-mes-textSecondary">
+                    {m.k === 0 ? <span className="text-amber-600">0</span> : m.k}
+                    {m.kMode === 'calibrated' && <span className="ml-1 text-[9px] text-emerald-600">标</span>}
+                  </td>
+                  <td className="px-3 py-2 border-b border-mes-border/60 text-right whitespace-nowrap font-mono text-mes-textSecondary">{m.weight}</td>
+                  <td className="px-3 py-2 border-b border-mes-border/60 whitespace-nowrap text-mes-textTertiary font-mono">
+                    {fmtSpec(m.min, m.decimals)} ~ {fmtSpec(m.max, m.decimals)}
+                  </td>
+                  <td className="px-3 py-2 border-b border-mes-border/60 whitespace-nowrap">
+                    {m.clampedBy
+                      ? <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-50 text-amber-700">{clampLabel(m.clampedBy)}</span>
+                      : <span className="text-mes-textTertiary">—</span>}
+                  </td>
+                  <td className="px-3 py-2 border-b border-mes-border/60 text-right whitespace-nowrap">
+                    <button onClick={() => onOpenCurve(m)} className="text-[10px] text-mes-primary hover:underline">
+                      曲线
+                    </button>
+                  </td>
+                </tr>
+              )
+            })}
+          </tbody>
+        </table>
+      </div>
+      <div className="px-4 py-2 text-[10px] text-mes-textTertiary bg-gray-50 border-t border-mes-border">
+        调整量按各参数自己的小数位取整；「承担偏差」= |kᵢ·ΔMVᵢ| / |ΔCV|；「k」标「标」表示该系数来自自动标定。
+      </div>
+    </div>
+  )
+}
+
+/** 实时概览页的参数现状表（不做分摊，只看现状与求解资格） */
+function ParamStatusTable({
+  moves, unit, excludedCount, onOpenCurve, onOpenOutputCurve,
+}: {
+  moves: ApcMove[]
+  unit: string
+  excludedCount: number
+  onOpenCurve: (m: ApcMove) => void
+  onOpenOutputCurve: () => void
+}) {
+  return (
+    <div>
+      {excludedCount > 0 && (
+        <div className="mb-2 text-[11px] text-amber-700">
+          有 {excludedCount} 个参与参数未参与求解（停用 / 未取到数据 / k 未标定），详见「优化建议」页。
         </div>
+      )}
+      <MovesTable
+        title="参与参数现状"
+        desc="当前工作点、可调范围与求解资格；点右侧「曲线」可看该参数的历史走势"
+        moves={moves}
+        unit={unit}
+        onOpenCurve={onOpenCurve}
+      />
+      <div className="mt-2 text-right">
+        <button onClick={onOpenOutputCurve} className="text-[11px] text-mes-primary hover:underline">
+          查看输出结果趋势 →
+        </button>
       </div>
     </div>
   )
@@ -967,15 +1218,15 @@ function MiniStat({ label, value }: { label: string; value: string }) {
   )
 }
 
-function ParamDetail({
-  param,
-  windowMinutes,
-  projectId,
-  onClose,
+/** 单条曲线详情抽屉：输出结果（含规格带）或任一参与参数 */
+function CurveDetail({
+  code, isOutput, windowMinutes, projectId, itemId, onClose,
 }: {
-  param: ApcParamItem
+  code: string
+  isOutput: boolean
   windowMinutes: number
   projectId?: string
+  itemId?: string
   onClose: () => void
 }) {
   const [history, setHistory] = useState<ApcHistoryResponse | null>(null)
@@ -988,30 +1239,32 @@ function ParamDetail({
     let cancelled = false
     setLoading(true)
     setErr('')
-    fetchApcHistory(param.code, { minutes: windowMinutes, project: projectId || undefined })
+    fetchApcHistory(code, { minutes: windowMinutes, project: projectId || undefined, item: itemId || undefined })
       .then(h => { if (!cancelled) setHistory(h) })
       .catch(e => { if (!cancelled) setErr(e?.message || String(e)) })
       .finally(() => { if (!cancelled) setLoading(false) })
     return () => { cancelled = true }
-  }, [param.code, windowMinutes, projectId])
+  }, [code, windowMinutes, projectId, itemId])
 
-  const r = param.recommendation
-  const meta = STATUS_META[param.status]
-  const points = history?.points || param.series
-  const specInfo = history?.specResolved || param.specResolved
-  const pdev = history?.pointDeviation || param.pointDeviation
-  // 规格若来自列名表达式，横轴切换旁顺带说明来源，免得读者以为规格是写死的
+  const param = history?.param || null
+  const stats = history?.stats || null
+  const points = history?.points || []
+  const specInfo = history?.specResolved
+  const pdev = history?.pointDeviation
+  const status: ApcParamStatus = stats?.status || 'unknown'
+  const meta = STATUS_META[status]
+  const decimals = param?.decimals ?? 3
   const specExprs = specInfo?.ok ? Object.entries(specInfo.expressions || {}) : []
 
   // 时间戳缺失或重复时，用相邻点时间差算出的「采样间隔」会是 0 秒，属于误导性数字，直接给 —。
   const sampleIntervalSec = useMemo(() => {
-    const pts = history?.points || []
+    const pts = points
     if (pts.length < 2) return null
     const span = pts[pts.length - 1].t - pts[0].t
     const uniq = new Set(pts.map(p => p.t)).size
     if (!Number.isFinite(span) || span <= 0 || uniq < 2) return null
     return Math.round(span / (pts.length - 1) / 1000)
-  }, [history])
+  }, [points])
 
   return (
     <div className="fixed inset-0 z-50 flex items-stretch justify-end bg-black/30" onClick={onClose}>
@@ -1022,14 +1275,20 @@ function ParamDetail({
         <div className="sticky top-0 bg-white border-b border-mes-border px-5 py-3 flex items-center justify-between gap-3 z-10">
           <div className="min-w-0">
             <div className="flex items-center gap-2">
-              <span className="text-sm">{OBJECTIVE_ICON[param.objective] || '🔧'}</span>
-              <h2 className="text-base font-semibold text-mes-text truncate">{param.name}</h2>
+              <h2 className="text-base font-semibold text-mes-text truncate">{param?.name || code}</h2>
+              {isOutput ? (
+                <span className="text-[10px] px-1.5 py-0.5 rounded bg-mes-tagBg text-mes-tagText font-medium shrink-0">输出结果</span>
+              ) : (
+                <span className="text-[10px] px-1.5 py-0.5 rounded bg-white border border-mes-border text-mes-textTertiary shrink-0">参与参数</span>
+              )}
               <span className="text-[10px] px-1.5 py-0.5 rounded font-medium shrink-0" style={{ color: meta.color, backgroundColor: meta.bg }}>
                 {meta.label}
               </span>
             </div>
             <div className="text-[11px] text-mes-textTertiary mt-0.5">
-              {param.process}工序 · {param.code} · 影响{param.objectiveLabel}
+              {param?.code || code}
+              {history?.item?.name ? ` · 监测项 ${history.item.name}` : ''}
+              {param?.unit ? ` · 单位 ${param.unit}` : ''}
             </div>
           </div>
           <button onClick={onClose} className="p-2 rounded-lg hover:bg-gray-100 text-mes-textTertiary shrink-0">
@@ -1042,11 +1301,16 @@ function ParamDetail({
 
         <div className="px-5 py-4 space-y-4">
           {loading && !history && (
-            <div className="text-xs text-mes-textTertiary animate-pulse">正在读取该参数的历史数据列值…</div>
+            <div className="text-xs text-mes-textTertiary animate-pulse">正在读取该曲线的历史数据列值…</div>
           )}
           {err && (
             <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
-              读取失败：{err}（展示概览窗口数据）
+              读取失败：{err}
+            </div>
+          )}
+          {history && !history.ready && (
+            <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+              当前监测项未就绪，无法读取曲线：{history.reason ? REASON_LABEL[history.reason] || history.reason : ''}
             </div>
           )}
 
@@ -1056,7 +1320,7 @@ function ParamDetail({
               {specInfo.columns.length > 0 && (
                 <> 涉及列：<span className="font-mono">{specInfo.columns.join('、')}</span>。</>
               )}
-              请在「数据源配置 → 参数配置」核对规格表达式引用的列名是否已写进取数 SQL 的 SELECT。
+              请在「编辑项目 → 监测项 → 取数与输出」核对规格表达式引用的列名是否已写进取数 SQL 的 SELECT。
             </div>
           )}
           {specExprs.length > 0 && (
@@ -1087,59 +1351,42 @@ function ParamDetail({
 
           <ApcTrendChart
             points={points}
-            lsl={history?.param.lsl ?? param.lsl}
-            usl={history?.param.usl ?? param.usl}
-            setpoint={history?.param.setpoint ?? param.setpoint}
-            optimalTarget={history?.param.optimalTarget ?? param.optimalTarget}
-            unit={param.unit}
-            decimals={param.decimals}
-            status={param.status}
-            suggested={r.hold || r.suggested == null ? undefined : r.suggested}
+            lsl={isOutput ? (param?.lsl ?? null) : null}
+            usl={isOutput ? (param?.usl ?? null) : null}
+            setpoint={isOutput ? null : (param?.min ?? null)}
+            optimalTarget={isOutput ? (param?.target ?? null) : (param?.max ?? null)}
+            unit={param?.unit || ''}
+            decimals={decimals}
+            status={status}
             height={240}
             axisMode={axisMode}
+            setpointLabel="可调下限"
+            targetLabel="可调上限"
           />
 
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-px bg-mes-border rounded-xl overflow-hidden border border-mes-border">
-            <MiniStat label="最新实测值" value={`${fmt(param.latest, param.decimals)}${param.unit ? ' ' + param.unit : ''}`} />
-            <MiniStat label="窗口均值" value={`${fmt(param.mean, param.decimals)}${param.unit ? ' ' + param.unit : ''}`} />
-            <MiniStat label="标准差 σ" value={fmt(param.std, param.decimals)} />
-            <MiniStat label="过程能力 Cpk" value={param.cpk == null ? '—' : String(param.cpk)} />
-            <MiniStat label="规格下限 LSL" value={fmt(param.lsl, param.decimals)} />
-            <MiniStat label="规格上限 USL" value={fmt(param.usl, param.decimals)} />
-            <MiniStat label="可调范围" value={`${fmt(param.min, param.decimals)} ~ ${fmt(param.max, param.decimals)}`} />
-            <MiniStat label="单次调整上限" value={`±${param.maxStepPct}%`} />
+            <MiniStat label="窗口均值" value={`${fmt(stats?.mean ?? null, decimals)}${param?.unit ? ' ' + param.unit : ''}`} />
+            <MiniStat label="标准差 σ" value={fmt(stats?.std ?? null, decimals)} />
+            <MiniStat label="窗口极值" value={`${fmt(stats?.min ?? null, decimals)} ~ ${fmt(stats?.max ?? null, decimals)}`} />
+            <MiniStat label="样本点数" value={String(stats?.n ?? 0)} />
+            {isOutput ? (
+              <>
+                <MiniStat label="RTO 理想点" value={fmt(param?.target ?? null, decimals)} />
+                <MiniStat label="规格下限 LSL" value={fmt(param?.lsl ?? null, decimals)} />
+                <MiniStat label="规格上限 USL" value={fmt(param?.usl ?? null, decimals)} />
+                <MiniStat label="过程能力 Cpk" value={stats?.cpk == null ? '—' : String(stats.cpk)} />
+              </>
+            ) : (
+              <>
+                <MiniStat label="可调下限" value={fmt(param?.min ?? null, decimals)} />
+                <MiniStat label="可调上限" value={fmt(param?.max ?? null, decimals)} />
+                <MiniStat label="趋势" value={`${trendArrow(stats?.trend || 'stable')} ${stats?.trend === 'up' ? '上行' : stats?.trend === 'down' ? '下行' : '平稳'}`} />
+                <MiniStat label="采样间隔" value={sampleIntervalSec == null ? '—（未取到时间列）' : `${sampleIntervalSec} 秒`} />
+              </>
+            )}
           </div>
 
-          <div className="rounded-xl border border-mes-border overflow-hidden">
-            <div className="px-4 py-2.5 bg-gray-50 border-b border-mes-border flex items-center justify-between">
-              <span className="text-sm font-semibold text-mes-text">优化建议</span>
-              <span className="text-[11px] text-mes-textTertiary">
-                置信度 <span className="font-semibold" style={{ color: confidenceColor(r.confidence) }}>{r.confidence}%</span>
-              </span>
-            </div>
-            <div className="px-4 py-3">
-              <div className="flex items-center gap-3 flex-wrap mb-3">
-                <span className="text-xs text-mes-textTertiary">当前设定值</span>
-                <span className="text-base font-bold text-mes-textSecondary">{fmt(r.current, param.decimals)}{param.unit}</span>
-                <span className="text-mes-textTertiary">→</span>
-                <span className="text-xs" style={{ color: r.hold ? '#999999' : '#4d6bfe' }}>
-                  {r.hold ? '建议保持' : '优化建议值'}
-                </span>
-                <span className="text-base font-bold" style={{ color: r.hold ? '#6b6b6b' : '#4d6bfe' }}>
-                  {fmt(r.suggested, param.decimals)}{param.unit}
-                </span>
-                {!r.hold && r.deltaPct != null && (
-                  <span className="text-[11px] px-2 py-0.5 rounded-full bg-mes-tagBg text-mes-tagText">
-                    {r.delta > 0 ? '+' : ''}{r.deltaPct}%
-                  </span>
-                )}
-              </div>
-              <p className="text-xs text-mes-textSecondary leading-relaxed">{r.reason}</p>
-              {r.risk && <p className="text-xs text-amber-700 leading-relaxed mt-2">{r.risk}</p>}
-            </div>
-          </div>
-
-          {pdev && pdev.n > 0 && (
+          {pdev && pdev.n > 0 && isOutput && (
             <div className={`rounded-xl border px-4 py-3 text-[11px] leading-relaxed ${
               pdev.outOfSpec > 0
                 ? 'border-red-200 bg-red-50 text-red-700'
@@ -1151,7 +1398,7 @@ function ParamDetail({
                 ? ` ${pdev.outOfSpec} 点超规格（超上限 ${pdev.outHigh}、低下限 ${pdev.outLow}）`
                 : ' 全部落在规格内'}
               {pdev.worst && (
-                <>；最差点 {fmt(pdev.worst.v, param.decimals)}{param.unit}，偏离 {fmt(pdev.worst.deviation, param.decimals)}{param.unit}（{pdev.worst.direction === 'high' ? '超上限' : '低下限'}）</>
+                <>；最差点 {fmt(pdev.worst.v, decimals)}{param?.unit || ''}，偏离 {fmt(pdev.worst.deviation, decimals)}{param?.unit || ''}（{pdev.worst.direction === 'high' ? '超上限' : '低下限'}）</>
               )}
               。超限点在趋势图上以红点标出。
             </div>
@@ -1160,7 +1407,6 @@ function ParamDetail({
           <div className="rounded-xl bg-gray-50 px-4 py-3 text-[11px] text-mes-textTertiary leading-relaxed">
             说明：本页所有过程数据均来自只读数据源的 SELECT 查询，不做任何写库操作；
             设定值建议仅在页面展示，不会自动下发到 DCS/PLC，需由工艺工程师确认后手动执行。
-            窗口内共 {param.sampleCount} 个采样点，采样间隔 {sampleIntervalSec == null ? '—（未取到时间列）' : `${sampleIntervalSec} 秒`}。
           </div>
         </div>
       </div>

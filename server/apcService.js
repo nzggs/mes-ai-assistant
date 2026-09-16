@@ -21,7 +21,7 @@
 import fs from 'fs'
 import { isDataSourceConfigured, queryReadOnly, getHanaStatus, pickColumn, pingHana } from './hanaClient.js'
 import * as apcConfig from './apcConfig.js'
-import { CODE_RE, normalizeQueries, normalizeParams, queryTemplateWarnings } from './apcCatalog.js'
+import { CODE_RE, normalizeQueries, normalizeParams, normalizeItem, queryTemplateWarnings, WEIGHT_MIN } from './apcCatalog.js'
 import { quoteIdent, renderSqlTemplate, assertIdent, assertReadOnlySql, applyRowLimit } from './sqlGuard.js'
 import { parseExpr, evalExpr } from './specExpr.js'
 
@@ -295,6 +295,72 @@ export async function previewQuery({ queries, params, minutes, maxRows, slot } =
     vars,
     columns,
     specColumns,
+    rows: rows.slice(0, cap).map(sanitizeRow),
+    rowCount: rows.length,
+    truncated,
+    elapsedMs: Date.now() - started,
+    warnings,
+  }
+}
+
+/**
+ * 按监测项试运行取数 SQL（草稿态）：真实执行一次**只读**查询，返回列名、前 N 行，
+ * 以及对「页面要用的每一列是否真的取回来了」的逐项核对。不落盘、不影响现有配置。
+ * 草稿同样要过只读护栏与模板校验——试运行不能成为绕过安全边界的口子。
+ */
+export async function previewItemQuery({ project, item, minutes, maxRows, slot } = {}) {
+  const projectId = apcConfig.resolveProjectId(project)
+  const cat = loadCatalog(false, projectId)
+  const slotId = slot === 'db2' ? 'db2' : 'db1'
+  // 纯文本校验先行：即使还没配好数据库连接，也能先把 SQL 本身的问题挑出来，
+  // 而不是一律回「未配置连接」把真正的原因盖掉。
+  const draft = normalizeItem(item, 0)
+
+  if (!isDataSourceConfigured(slotId)) {
+    const err = new Error(
+      `数据库系统（${slotId === 'db2' ? '2' : '1'}）尚未配置连接，无法试运行 SQL；` +
+      '请先在侧边栏「数据库管理」填写连接信息并保存'
+    )
+    err.status = 400
+    throw err
+  }
+
+  const mins = Math.max(1, Math.round(num(minutes, cat.defaultWindowMinutes)))
+  const cap = Math.max(1, Math.min(200, Math.round(num(maxRows, 50))))
+  const vars = buildItemTemplateVars(cat, draft, { minutes: mins, limit: cap })
+  const sqlText = renderSqlTemplate(draft.query.history, vars)
+
+  const started = Date.now()
+  const { rows, truncated } = await queryReadOnly(sqlText, { maxRows: cap, slotId })
+  const columns = rows.length > 0 ? Object.keys(rows[0]) : []
+  const has = (name) => columns.some(c => c.toUpperCase() === String(name).toUpperCase())
+  const warnings = queryTemplateWarnings(draft.query.history, { mode: 'wide' })
+
+  const tsColumn = String((draft.query.columns && draft.query.columns.ts) || 'TS')
+  if (rows.length > 0 && !has(tsColumn)) {
+    warnings.push(`时间戳列 ${tsColumn} 未出现在查询结果列中（当前返回：${columns.join('、')}），趋势图将无法按时间展开。`)
+  }
+  // 逐列核对：页面要用的每一列（输出结果 + 全部参与参数）是否真的取回来了。
+  // 这类问题只看 SQL 文本看不出来——列写在 ORDER BY 里并不等于被 SELECT 出来。
+  const columnCheck = [
+    { role: 'output', code: draft.output.code, column: draft.output.column },
+    ...draft.params.map(p => ({ role: 'param', code: p.code, column: p.column })),
+  ].map(e => ({ ...e, present: rows.length === 0 ? null : has(e.column) }))
+  for (const e of columnCheck) {
+    if (e.present === false) {
+      warnings.push(
+        `${e.role === 'output' ? '输出结果' : '参与参数'} ${e.code} 的列「${e.column}」未出现在查询结果中，该项将取不到数据。`
+      )
+    }
+  }
+
+  return {
+    ok: true,
+    mode: 'wide',
+    sql: sqlText,
+    vars,
+    columns,
+    columnCheck,
     rows: rows.slice(0, cap).map(sanitizeRow),
     rowCount: rows.length,
     truncated,
@@ -681,6 +747,185 @@ export async function fetchProcessSeries(options = {}) {
   }
 }
 
+// ===== 按监测项取数（多对 1 调优的数据入口）=====
+
+/**
+ * CV 的规格编译源：把 output.spec 的 3 个字段补齐成 compileParamSpec 认识的 6 个。
+ * - min/max 对 CV 没有意义（CV 不是被调量，不会去「调」它），补成 lsl/usl 只为通过编译；
+ * - target 未配置时取规格中心 `(lsl + usl) / 2`——用**表达式字符串**拼接，
+ *   这样 lsl/usl 本身是列名表达式时也能在运行期正确求值。
+ */
+function cvSpecSource(output) {
+  const spec = (output && output.spec) || {}
+  const lsl = spec.lsl
+  const usl = spec.usl
+  const hasTarget = !(spec.target === null || spec.target === undefined || String(spec.target).trim() === '')
+  const asText = (v) => (typeof v === 'number' ? String(v) : `(${String(v)})`)
+  const target = hasTarget ? spec.target : `(${asText(lsl)} + ${asText(usl)}) / 2`
+  return { ...output, setpoint: target, optimalTarget: target, lsl, usl, min: lsl, max: usl }
+}
+
+/** 从宽表结果里抽某一列组成时间序列（一行一个点；原始行挂在点上但不可枚举） */
+function extractColumnPoints(rows, tsColumn, column) {
+  const out = []
+  for (const row of rows) {
+    const value = Number(pickColumn(row, column))
+    if (!Number.isFinite(value)) continue
+    let t = parseTimestamp(pickColumn(row, tsColumn))
+    if (!Number.isFinite(t)) t = Date.now()
+    out.push(attachRow({ t, v: value }, row))
+  }
+  out.sort((a, b) => a.t - b.t)
+  return out
+}
+
+/**
+ * 监测项就绪判定：项目存在 → 该监测项有取数 SQL → 项目绑定的数据库已配连接。
+ * 三者缺一即「未就绪」，返回空结果 + 明确原因，**绝不伪造数据**。
+ * @returns {{ready:boolean, reason:string, projectId:string, projectName:string, slot:string, itemId:string, itemName:string}}
+ */
+export function getItemReadiness(projectId, itemId) {
+  const pid = apcConfig.resolveProjectId(projectId)
+  const project = pid ? apcConfig.getProject(pid) : null
+  const base = {
+    projectId: pid || '',
+    projectName: (project && project.name) || '',
+    slot: (project && project.dbSlot) || 'db1',
+    itemId: '',
+    itemName: '',
+  }
+  if (!project) return { ...base, ready: false, reason: 'no-project' }
+  const items = Array.isArray(project.items) ? project.items : []
+  if (items.length === 0) return { ...base, ready: false, reason: 'no-item' }
+  const wanted = String(itemId == null ? '' : itemId).trim()
+  const item = (wanted && items.find(it => it && it.id === wanted)) || items[0]
+  const withItem = { ...base, itemId: item.id, itemName: item.name }
+  if (!(item.query && item.query.history)) return { ...withItem, ready: false, reason: 'no-template' }
+  if (!isDataSourceConfigured(base.slot)) return { ...withItem, ready: false, reason: 'no-connection' }
+  return { ...withItem, ready: true, reason: '' }
+}
+
+/**
+ * 组装监测项的模板变量。
+ * {{columns}} 必须同时展开：时间戳列 + 输出结果列 + 全部参与参数列 + 规格表达式引用列。
+ * 少展开任何一列，运行期都会以「取不到值」的形式静默降级，所以这里宁可多展开也不要漏。
+ */
+export function buildItemTemplateVars(catalog, item, { minutes, limit }) {
+  const cols = (item.query && item.query.columns) || {}
+  const colNames = []
+  const push = (name, label) => {
+    const n = assertIdent(name, label)
+    if (!colNames.some(c => c.toUpperCase() === n.toUpperCase())) colNames.push(n)
+  }
+  if (cols.ts) push(cols.ts, '时间戳列')
+  push(item.output.column, `输出结果 ${item.output.code} 的数据列名`)
+  for (const p of item.params || []) push(p.column, `参数 ${p.code} 的数据列名`)
+  for (const ident of specReferencedColumns(compileParamSpec(cvSpecSource(item.output)))) {
+    push(ident, `输出结果 ${item.output.code} 规格表达式引用的列名`)
+  }
+  return {
+    minutes: String(Math.max(1, Math.round(minutes))),
+    limit: String(Math.max(1, Math.round(limit))),
+    schema: String((catalog && catalog.schema) || ''),
+    codeFilter: '',
+    columns: colNames.map(quoteIdent).join(', '),
+  }
+}
+
+/** 按监测项渲染取数 SQL */
+export function buildItemHistorySql(catalog, item, { minutes, limit }) {
+  if (!item.query || !item.query.history) throw new Error(`监测项「${item.name}」未配置取数 SQL 模板`)
+  return renderSqlTemplate(item.query.history, buildItemTemplateVars(catalog, item, { minutes, limit }))
+}
+
+/**
+ * 拉取某个监测项窗口内的数据：**一条 SQL** 取回输出结果 CV 与全部参与参数 MV
+ * （同一行的不同列——这正是宽表成为唯一取数模式的原因）。
+ * @returns {Promise<{ready:boolean, reason:string, mode:string, output:object, params:object[], meta:object}>}
+ */
+export async function fetchItemSeries({ project, item, minutes, maxRows } = {}) {
+  const projectId = apcConfig.resolveProjectId(project)
+  const cat = loadCatalog(false, projectId)
+  const readiness = getItemReadiness(projectId, item && item.id)
+  const mins = Math.max(1, Math.round(num(minutes, cat.defaultWindowMinutes)))
+  const slotId = readiness.slot === 'db2' ? 'db2' : 'db1'
+  const resolvedItem = item || (() => {
+    const p = apcConfig.getProject(projectId)
+    const list = (p && p.items) || []
+    return list.find(it => it.id === readiness.itemId) || list[0] || null
+  })()
+
+  if (!readiness.ready || !resolvedItem) {
+    return {
+      ready: false,
+      reason: readiness.reason,
+      mode: 'unconfigured',
+      readiness,
+      item: resolvedItem,
+      output: { points: [], column: '' },
+      params: [],
+      queryMode: 'wide',
+      meta: {
+        windowMinutes: mins,
+        sampleIntervalSec: cat.sampleIntervalSec,
+        rowCount: 0,
+        truncated: false,
+        reason: readiness.reason,
+        queryMode: 'wide',
+        warnings: [],
+      },
+    }
+  }
+
+  const cap = Math.max(50, Math.round(num(maxRows, Number(process.env.HANA_MAX_ROWS || 2000))))
+  const sql = buildItemHistorySql(cat, resolvedItem, { minutes: mins, limit: cap })
+  const { rows, truncated } = await queryReadOnly(sql, { maxRows: cap, slotId })
+
+  const tsColumn = (resolvedItem.query.columns && resolvedItem.query.columns.ts) || 'TS'
+  const warnings = []
+  if (rows.length > 0 && pickColumn(rows[0], tsColumn) === undefined) {
+    warnings.push(
+      `时间戳列 ${tsColumn} 未出现在取数结果中，趋势图将无法按时间展开（已回退为按采样点序号显示）。` +
+      '请在取数 SQL 的 SELECT 列表中加入该列。'
+    )
+  }
+  // 规格表达式引用的列是否真的取回来了：不取回必然求值失败，提前说清楚，
+  // 好过让使用者对着页面上的「未知」猜原因。
+  const specMissing = specReferencedColumns(compileParamSpec(cvSpecSource(resolvedItem.output)))
+    .filter(name => rows.length > 0 && pickColumn(rows[0], name) === undefined)
+  if (specMissing.length > 0) {
+    warnings.push(
+      `输出结果 ${resolvedItem.output.code} 的规格表达式引用了未出现在结果列中的「${specMissing.join('、')}」，规格将无法判定。`
+    )
+  }
+
+  return {
+    ready: true,
+    reason: '',
+    mode: 'hana',
+    readiness,
+    item: resolvedItem,
+    output: {
+      points: extractColumnPoints(rows, tsColumn, resolvedItem.output.column),
+      column: resolvedItem.output.column,
+    },
+    params: (resolvedItem.params || []).map((p) => ({
+      param: p,
+      points: extractColumnPoints(rows, tsColumn, p.column),
+    })),
+    queryMode: 'wide',
+    meta: {
+      windowMinutes: mins,
+      sampleIntervalSec: cat.sampleIntervalSec,
+      rowCount: rows.length,
+      truncated,
+      usedSlots: [slotId],
+      queryMode: 'wide',
+      warnings,
+    },
+  }
+}
+
 // ===== 状态与趋势判定 =====
 
 export function statusOf(param, stats) {
@@ -982,6 +1227,412 @@ export function optimizeParam(param, series, opts = {}) {
   }
 }
 
+// ===== 多对 1 加权求解 =====
+//
+// 给定输出结果 CV 的偏差 ΔCV = 理想点 − 实测均值，求各参与参数 MV 的调整量 ΔMVᵢ：
+//     min  Σ wᵢ · (ΔMVᵢ / sᵢ)²           ← 归一化后的「最小调整」
+//     s.t. Σ kᵢ · ΔMVᵢ = ΔCV             ← 必须把偏差补回来
+// 其中 sᵢ = 量程 (max − min)，用于让「1 g」与「1 %」可比；wᵢ 是调整阻力（越大越不愿动）。
+//
+// 拉格朗日闭式解：
+//     ΔMVᵢ = (kᵢ·sᵢ²/wᵢ) · ΔCV / Σⱼ (kⱼ²·sⱼ²/wⱼ)
+//
+// N = 1 时退化为 ΔMV = ΔCV / k —— 与改造前的单回路公式逐字一致，这就是老项目
+// 迁移后行为不变的数学依据。语义上：kᵢsᵢ²/wᵢ 大的参数（影响大、量程宽、不愿动指数低）
+// 承担更多份额。
+
+const K_EPS = 1e-12
+
+/** 参数未能参与本次求解的原因（要能直接展示给现场看） */
+function excludeReason(c) {
+  if (!c.enabled) return '已停用'
+  if (!c.hasData) return '本次未取到有效数据'
+  if (!Number.isFinite(c.k) || Math.abs(c.k) < K_EPS) return '影响系数 k 未标定（为 0）'
+  return ''
+}
+
+/**
+ * 单监测项的多对 1 优化建议（纯函数：只吃数据，不碰 IO，可单测）。
+ * @param {object} item    监测项（含 output / params / tuning）
+ * @param {object} series  fetchItemSeries 的结果（output.points + params[].points）
+ */
+export function optimizeItem(item, series, opts = {}) {
+  const output = item.output
+  const tuning = item.tuning || {}
+  const decimals = num(output.decimals, 3)
+  const cvPoints = (series && series.output && series.output.points) || []
+  const cvValues = cvPoints.map(p => p.v).filter(v => Number.isFinite(v))
+  const stats = basicStats(cvValues)
+  const latest = cvValues.length > 0 ? cvValues[cvValues.length - 1] : NaN
+  const slope = linearSlope(cvValues)
+  const sparkPoints = opts.sparkPoints || 60
+
+  const compiled = compileParamSpec(cvSpecSource(output))
+  const lastRow = cvPoints.length > 0 ? cvPoints[cvPoints.length - 1].rawRow : undefined
+  const spec = resolveCompiledSpec(compiled, lastRow)
+  const pointDev = evaluatePoints(compiled, cvPoints)
+
+  const specResolved = {
+    ok: spec.ok,
+    errors: spec.errors,
+    expressions: compiled.expressions,
+    columns: specReferencedColumns(compiled),
+  }
+  const pointDeviation = {
+    n: pointDev.n,
+    outOfSpec: pointDev.outOfSpec,
+    outLow: pointDev.outLow,
+    outHigh: pointDev.outHigh,
+    worst: pointDev.worst
+      ? {
+        t: pointDev.worst.t,
+        v: roundTo(pointDev.worst.v, decimals),
+        lsl: roundTo(pointDev.worst.lsl, decimals),
+        usl: roundTo(pointDev.worst.usl, decimals),
+        deviation: roundTo(pointDev.worst.deviation, decimals),
+        direction: pointDev.worst.direction,
+      }
+      : null,
+  }
+
+  const common = {
+    code: output.code,
+    name: output.name,
+    unit: output.unit,
+    decimals,
+    objective: output.objective,
+    objectiveLabel: OBJECTIVE_LABEL[output.objective] || '综合',
+    latest: Number.isFinite(latest) ? roundTo(latest, decimals) : null,
+    mean: Number.isFinite(stats.mean) ? roundTo(stats.mean, decimals) : null,
+    std: Number.isFinite(stats.std) ? roundTo(stats.std, Math.min(4, decimals + 2)) : null,
+    min_: Number.isFinite(stats.min) ? roundTo(stats.min, decimals) : null,
+    max_: Number.isFinite(stats.max) ? roundTo(stats.max, decimals) : null,
+    sampleCount: stats.n,
+    slope: roundTo(slope, Math.min(4, decimals + 3)),
+    trend: trendOf(slope, stats.std),
+    specResolved,
+    pointDeviation,
+    series: buildSeries(pointDev.points, decimals, compiled, sparkPoints),
+    tuning: {
+      deadbandPct: num(tuning.deadbandPct, 10),
+      maxRounds: num(tuning.maxRounds, 2),
+      residualTolerancePct: num(tuning.residualTolerancePct, 5),
+    },
+  }
+
+  // ---- 规格确定不了（表达式引用的列没取回来 / 写法有误）----
+  // 不做任何判定，明确降级为「未知」。绝不拿 NaN 硬算出「正常」「保持」这类会误导现场的结论。
+  if (!spec.ok) {
+    return {
+      ...common,
+      target: null, lsl: null, usl: null, cpk: null, status: 'unknown',
+      moves: [],
+      recommendation: {
+        cv: { current: null, target: null, delta: null },
+        moves: [],
+        predictedCV: null, residual: null, residualPct: null,
+        confidence: 0, urgency: 'none', hold: true, rounds: 0, clampedBy: null,
+        reason:
+          `输出结果的规格未能确定，本次不做优化判定：${spec.errors.join('；')}。` +
+          '请在「APC 和 RTO → 数据源配置 → 监测项」检查规格表达式引用的列名是否已出现在取数 SQL 的结果列中。',
+        risk: '',
+      },
+    }
+  }
+
+  const lsl = spec.spec.lsl
+  const usl = spec.spec.usl
+  const target = Number.isFinite(spec.spec.optimalTarget) ? spec.spec.optimalTarget : (lsl + usl) / 2
+  const width = usl - lsl
+  const resolvedOut = { ...output, lsl, usl }
+  const cpk = computeCpk(resolvedOut, stats.mean, stats.std)
+  const status = statusOf(resolvedOut, stats)
+  const base = {
+    ...common,
+    target: roundTo(target, decimals),
+    lsl: roundTo(lsl, decimals),
+    usl: roundTo(usl, decimals),
+    cpk: cpk == null ? null : roundTo(cpk, 2),
+    status,
+  }
+
+  // ---- 参与参数的现状与杠杆份额 ----
+  const seriesParams = (series && series.params) || []
+  const candidates = seriesParams.map((sp) => {
+    const p = sp.param
+    const values = (sp.points || []).map(pt => pt.v).filter(v => Number.isFinite(v))
+    const mean = values.length > 0 ? basicStats(values).mean : NaN
+    const span = Math.abs(num(p.max, 0) - num(p.min, 0))
+    const w = Math.max(WEIGHT_MIN, num(p.weight, 1))
+    const k = p.k ? num(p.k.value, 0) : 0
+    // 工作点：优先用配置的「当前设定值」——现场真正能拧的就是它；
+    // 未配置时退回该参数窗口内的实测均值。老配置迁移来的项都带设定值，
+    // 因此建议值与改造前一致；新建的多对 1 监测项通常把取数列当设定值用，直接取均值即可。
+    // 注意 Number(null) === 0：留空必须被识别为「未配置」，否则会被当作设定值 0
+    const rawSetpoint = p.setpoint
+    const configured = (rawSetpoint === null || rawSetpoint === undefined || rawSetpoint === '')
+      ? null
+      : (Number.isFinite(num(rawSetpoint, NaN)) ? num(rawSetpoint, NaN) : null)
+    return {
+      param: p,
+      values,
+      current: configured !== null ? configured : mean,
+      currentSource: configured !== null ? 'setpoint' : 'mean',
+      span, w, k,
+      leverage: (k * k * span * span) / w,
+      enabled: p.enabled !== false,
+      hasData: Number.isFinite(mean) && span > 0,
+    }
+  })
+  const isActive = c => c.enabled && c.hasData && Number.isFinite(c.k) && Math.abs(c.k) >= K_EPS
+  const active = candidates.filter(isActive)
+  const excluded = candidates.filter(c => !isActive(c))
+  const sumLev = active.reduce((a, c) => a + c.leverage, 0)
+
+  // 正 = 实测偏低，需要把 CV 抬上去
+  const deltaCV = target - stats.mean
+
+  const maxRounds = Math.max(0, Math.min(5, Math.round(num(tuning.maxRounds, 2))))
+  const totals = new Map(candidates.map(c => [c.param.code, 0]))
+  const limitsHit = new Map()
+
+  // ---- 数据不足：只观察，不给激进建议 ----
+  const MIN_SAMPLES = 8
+  if (stats.n < MIN_SAMPLES) {
+    return {
+      ...base,
+      moves: [],
+      recommendation: {
+        cv: {
+          current: Number.isFinite(stats.mean) ? roundTo(stats.mean, decimals) : null,
+          target: roundTo(target, decimals),
+          delta: Number.isFinite(stats.mean) ? roundTo(deltaCV, decimals) : null,
+        },
+        moves: [],
+        predictedCV: Number.isFinite(stats.mean) ? roundTo(stats.mean, decimals) : null,
+        residual: null, residualPct: null,
+        confidence: 30, urgency: 'none', hold: true, rounds: 0, clampedBy: null,
+        reason: `窗口内仅 ${stats.n} 个有效数据点（需 ≥ ${MIN_SAMPLES} 个），样本不足无法可靠估计过程状态，建议保持现状并继续采集数据。`,
+        risk: '',
+      },
+    }
+  }
+
+  // ---- 死区 / 无可用参数 ----
+  const deadbandPct = num(tuning.deadbandPct, 10)
+  const deadband = width * (deadbandPct / 100)
+  const inDeadband = status === 'normal' && Math.abs(deltaCV) <= deadband
+  const noActive = active.length === 0 || !(sumLev > K_EPS)
+
+  if (inDeadband || noActive) {
+    const why = inDeadband
+      ? `偏差 ${roundTo(Math.abs(deltaCV), decimals)}${output.unit} 处于工艺死区内（±${roundTo(deadband, decimals)}${output.unit}，为规格带宽的 ${deadbandPct}%）且过程能力正常，调整收益低于扰动成本，建议保持。`
+      : active.length === 0
+        ? `没有可参与求解的参数：${excluded.map(c => `${c.param.name}（${excludeReason(c)}）`).join('、') || '尚未配置参与参数'}。请先在监测项里添加参与参数并填写影响系数 k。`
+        : '各参数的影响系数均为 0，无法建立「参数变化 → 输出变化」的关系，建议先完成 k 的标定。'
+    return {
+      ...base,
+      moves: candidates.map((c) => ({
+        code: c.param.code, name: c.param.name, unit: c.param.unit,
+        decimals: num(c.param.decimals, 3),
+        current: Number.isFinite(c.current) ? roundTo(c.current, num(c.param.decimals, 3)) : null,
+        suggested: Number.isFinite(c.current) ? roundTo(c.current, num(c.param.decimals, 3)) : null,
+        delta: 0, deltaPct: 0,
+        min: c.param.min, max: c.param.max, span: roundTo(c.span, 3),
+        weight: c.w, k: c.k, kMode: c.param.k ? c.param.k.mode : 'manual',
+        leverage: roundTo(c.leverage, 6),
+        share: 0, clampedBy: null,
+        participating: isActive(c),
+        excludedReason: isActive(c) ? '' : excludeReason(c),
+      })),
+      recommendation: {
+        cv: {
+          current: roundTo(stats.mean, decimals),
+          target: roundTo(target, decimals),
+          delta: roundTo(deltaCV, decimals),
+        },
+        moves: [],
+        predictedCV: roundTo(stats.mean, decimals),
+        residual: roundTo(deltaCV, decimals),
+        residualPct: 100,
+        confidence: noActive ? 30 : 45,
+        urgency: 'none',
+        hold: true,
+        rounds: 0,
+        clampedBy: null,
+        reason: `${why}输出结果均值 ${common.mean}${output.unit}，Cpk=${cpk == null ? '—' : roundTo(cpk, 2)}（${statusLabel(status)}）。`,
+        risk: status === 'danger' ? '当前过程能力不足，建议先排查工艺而非只调参数。' : '',
+      },
+    }
+  }
+
+  // ---- 迭代求解：加权分摊 → 施加约束 → 把未消除的部分再分摊给未顶限的参数 ----
+  let remaining = deltaCV
+  let rounds = 0
+  for (let r = 0; r <= maxRounds; r++) {
+    if (Math.abs(remaining) <= Math.max(K_EPS, Math.abs(deltaCV) * 1e-4)) break
+    const pool = active.filter(c => !limitsHit.has(c.param.code))
+    if (pool.length === 0) break
+    const poolLev = pool.reduce((a, c) => a + c.leverage, 0)
+    if (!(poolLev > K_EPS)) break
+
+    let produced = 0
+    for (const c of pool) {
+      const p = c.param
+      const already = totals.get(p.code) || 0
+      const from = c.current + already
+      const raw = ((c.k * c.span * c.span) / c.w) * remaining / poolLev
+
+      // ③ 量程裁剪（相对「本轮起点」）
+      const lo = num(p.min, -Infinity) - from
+      const hi = num(p.max, Infinity) - from
+      let d = Math.max(lo, Math.min(hi, raw))
+      let clamped = null
+      if (Math.abs(d - raw) > 1e-12) clamped = raw > hi ? 'max' : 'min'
+
+      // ④ 单次幅度限幅：基准取当前值；当前值≈0 时退回量程，
+      //    否则 |0| × 百分比 = 0 会让参数永远动不了。
+      const stepBase = Math.abs(from) > 1e-9 ? Math.abs(from) : c.span
+      const stepCap = stepBase * (num(p.maxStepPct, 3) / 100)
+      if (Math.abs(d) > stepCap) {
+        d = Math.sign(d) * stepCap
+        clamped = clamped || 'step'
+      }
+
+      // ⑤ 量化到该参数的最小调节步长
+      const dec = num(p.decimals, 3)
+      const q = Math.pow(10, -dec)
+      d = Math.round(d / q) * q
+      if (Math.abs(d) < q / 2) d = 0
+
+      totals.set(p.code, already + d)
+      produced += c.k * d
+      if (clamped && Math.abs(d) > 1e-12) limitsHit.set(p.code, clamped)
+    }
+
+    // 本轮一点都没推动（参数全被顶死）→ 立即停止，避免空转
+    if (Math.abs(produced) <= Math.max(1e-12, Math.abs(remaining) * 1e-6)) break
+    remaining -= produced
+    rounds = r + 1
+  }
+
+  const applied = active.reduce((a, c) => a + c.k * (totals.get(c.param.code) || 0), 0)
+  const predictedCV = stats.mean + applied
+  const residual = remaining
+  const residualPct = Math.abs(deltaCV) > K_EPS ? (Math.abs(residual) / Math.abs(deltaCV)) * 100 : 0
+  const residualTol = num(tuning.residualTolerancePct, 5)
+
+  const moves = candidates.map((c) => {
+    const p = c.param
+    const d = num(p.decimals, 3)
+    const delta = totals.get(p.code) || 0
+    const has = Number.isFinite(c.current)
+    return {
+      code: p.code, name: p.name, unit: p.unit, decimals: d,
+      current: has ? roundTo(c.current, d) : null,
+      suggested: has ? roundTo(c.current + delta, d) : null,
+      delta: roundTo(delta, d),
+      deltaPct: has && Math.abs(c.current) > 1e-9 ? roundTo((delta / Math.abs(c.current)) * 100, 2) : null,
+      min: p.min, max: p.max,
+      span: roundTo(c.span, d),
+      weight: c.w, k: c.k, kMode: p.k ? p.k.mode : 'manual',
+      leverage: roundTo(c.leverage, 6),
+      share: Math.abs(deltaCV) > K_EPS ? roundTo(Math.abs(c.k * delta) / Math.abs(deltaCV), 3) : 0,
+      clampedBy: limitsHit.get(p.code) || null,
+      participating: isActive(c),
+      excludedReason: isActive(c) ? '' : excludeReason(c),
+    }
+  })
+
+  const movers = moves.filter(m => m.delta !== 0)
+  const keep = movers.length === 0
+
+  // ---- 置信度：样本量、过程能力、标定来源、约束松紧 ----
+  let confidence = 50
+  confidence += Math.min(20, (stats.n / 60) * 20)
+  if (cpk == null || cpk < 1.0) confidence -= 12
+  const sigmaSpec = specSigma(resolvedOut)
+  const noiseRatio = sigmaSpec > 0 ? stats.std / sigmaSpec : 0
+  if (noiseRatio > 0.6) confidence -= 10
+  else if (noiseRatio < 0.25) confidence += 8
+  const calibratedCount = active.filter(c => c.param.k && c.param.k.mode === 'calibrated').length
+  if (active.length > 0) confidence += Math.round((calibratedCount / active.length) * 12)
+  else confidence -= 10
+  if (limitsHit.size > 0) confidence -= 6
+  if (residualPct > residualTol) confidence -= 5
+  confidence = Math.max(30, Math.min(95, Math.round(confidence)))
+
+  // ---- 紧急度：按 CV 偏差占规格带宽的比例 ----
+  const relDev = width > 0 ? Math.abs(deltaCV) / width : 0
+  let urgency = 'none'
+  if (!keep) urgency = (status === 'danger' || relDev >= 0.3) ? 'high' : relDev >= 0.1 ? 'medium' : 'low'
+
+  // ---- 中文理由 ----
+  const parts = []
+  parts.push(
+    `近 ${base.sampleCount} 个采样点，输出结果「${output.name}」均值 ${base.mean}${output.unit}，` +
+    `相对 RTO 理想点 ${base.target}${output.unit} ${deltaCV >= 0 ? '偏低' : '偏高'} ` +
+    `${roundTo(Math.abs(deltaCV), decimals)}${output.unit}` +
+    `（占规格带宽 ${width > 0 ? roundTo((Math.abs(deltaCV) / width) * 100, 1) : '—'}%）`
+  )
+  parts.push(`波动 σ=${base.std}，过程能力 Cpk=${cpk == null ? '—' : roundTo(cpk, 2)}（${statusLabel(status)}）`)
+  if (keep) {
+    parts.push('各参数按加权最小调整解出的修正量均小于其最小调节步长，建议保持现状')
+  } else {
+    parts.push(
+      `按影响系数把偏差分摊给 ${movers.length} 个参数：` +
+      movers.map(m => `${m.name} ${m.current}→${m.suggested}${m.unit}` +
+        `（${m.delta > 0 ? '上调' : '下调'} ${Math.abs(m.delta)}${m.unit}，承担 ${Math.round(m.share * 100)}%）`).join('；')
+    )
+    if (rounds > 1) parts.push(`其中 ${rounds - 1} 轮用于把触及约束的部分重新分摊给未顶限的参数`)
+    parts.push(`预计调整后均值回落到 ${roundTo(predictedCV, decimals)}${output.unit}`)
+  }
+  if (excluded.length > 0) {
+    parts.push(`未参与本次求解：${excluded.map(c => `${c.param.name}（${excludeReason(c)}）`).join('、')}`)
+  }
+  const reason = parts.join('；') + '。'
+
+  // ---- 风险提示：约束可能同时生效，逐条说明避免信息丢失 ----
+  const riskNotes = []
+  if (status === 'danger') riskNotes.push('当前过程能力不足，存在批量超规格风险，建议优先处理')
+  for (const [code, why] of limitsHit) {
+    const m = moves.find(x => x.code === code)
+    const label = m ? m.name : code
+    const what = why === 'max' ? '可调上限' : why === 'min' ? '可调下限' : '单次调整幅度上限'
+    riskNotes.push(`${label} 受${what}约束，未能足额调整`)
+  }
+  if (residualPct > residualTol) {
+    riskNotes.push(
+      `受约束限制，预计仍有 ${roundTo(Math.abs(residual), decimals)}${output.unit}` +
+      `（约 ${roundTo(residualPct, 1)}%）偏差无法消除，需评估工艺窗口或上游条件`
+    )
+  }
+  const risk = riskNotes.length > 0 ? `${riskNotes.join('；')}。` : ''
+
+  return {
+    ...base,
+    moves,
+    recommendation: {
+      cv: {
+        current: roundTo(stats.mean, decimals),
+        target: roundTo(target, decimals),
+        delta: roundTo(deltaCV, decimals),
+      },
+      moves: movers,
+      predictedCV: roundTo(predictedCV, decimals),
+      residual: roundTo(residual, decimals),
+      residualPct: roundTo(residualPct, 1),
+      confidence,
+      urgency,
+      hold: keep,
+      rounds,
+      clampedBy: limitsHit.size > 0 ? [...new Set(limitsHit.values())].join(',') : null,
+      reason,
+      risk,
+    },
+  }
+}
+
 function statusLabel(status) {
   if (status === 'normal') return '正常'
   if (status === 'warning') return '预警'
@@ -1014,131 +1665,171 @@ function cacheTtl() {
 
 // ===== 对外聚合接口 =====
 
-/** 参数概览：当前值、统计量、趋势、状态（含压缩曲线）；未配置数据源时返回空态 */
-export async function getOverview({ minutes, project } = {}) {
+/**
+ * 监测项概览：1 个输出结果 CV 的当前值 / 统计量 / 趋势 / 状态 / 建议，
+ * 以及 N 个参与参数各自的工作点与建议调整量。
+ * 未配置数据源时返回空态（output 为 null）+ 原因，页面据此渲染引导。
+ */
+export async function getOverview({ minutes, project, item } = {}) {
   const projectId = apcConfig.resolveProjectId(project)
   const cat = loadCatalog(false, projectId)
   const ttl = cacheTtl()
-  const key = `overview:${projectId}:${minutes || 'default'}`
+  const key = `overview:${projectId}:${item || 'default'}:${minutes || 'default'}`
   const loader = async () => {
     const started = Date.now()
-    const { mode, series, meta } = await fetchProcessSeries({ minutes, project: projectId })
-    const ready = mode === 'hana'
-    return {
+    const readiness = getItemReadiness(projectId, item)
+    const proj = apcConfig.getProject(projectId)
+    const items = (proj && proj.items) || []
+    const target = items.find(it => it.id === readiness.itemId) || null
+    const base = {
       project: projectId,
-      projectName: (apcConfig.getProject(projectId) || {}).name || '',
-      station: ready ? cat.station : '',
-      mode,
-      ready,
-      reason: meta.reason || '',
+      projectName: (proj && proj.name) || '',
+      item: target ? { id: target.id, name: target.name, description: target.description || '' } : null,
+      // 供前端渲染监测项选择器：只给 id 与名称，不把整份配置塞进运行接口
+      items: items.map(it => ({ id: it.id, name: it.name })),
+      windowMinutes: Math.max(1, Math.round(num(minutes, cat.defaultWindowMinutes))),
+      sampleIntervalSec: cat.sampleIntervalSec,
       generatedAt: new Date().toISOString(),
+      warnings: [],
+    }
+
+    if (!readiness.ready || !target) {
+      return {
+        ...base,
+        mode: 'unconfigured',
+        ready: false,
+        reason: readiness.reason,
+        readiness,
+        station: '',
+        elapsedMs: Date.now() - started,
+        rowCount: 0,
+        truncated: false,
+        source: describeSource('unconfigured', { reason: readiness.reason }),
+        output: null,
+      }
+    }
+
+    const data = await fetchItemSeries({ project: projectId, item: target, minutes })
+    return {
+      ...base,
+      mode: 'hana',
+      ready: true,
+      reason: '',
+      readiness,
+      station: cat.station,
       elapsedMs: Date.now() - started,
-      windowMinutes: meta.windowMinutes,
-      sampleIntervalSec: meta.sampleIntervalSec,
-      rowCount: meta.rowCount,
-      truncated: meta.truncated,
-      source: describeSource(mode, meta),
-      // 未就绪时不展示任何参数卡（页面据此渲染空态引导）
-      params: ready ? cat.params.map((p) => optimizeParam(p, series.get(p.code) || [], { sparkPoints: 60 })) : [],
+      windowMinutes: data.meta.windowMinutes,
+      sampleIntervalSec: data.meta.sampleIntervalSec,
+      rowCount: data.meta.rowCount,
+      truncated: data.meta.truncated,
+      source: describeSource('hana', data.meta),
+      warnings: data.meta.warnings || [],
+      output: optimizeItem(target, data, { sparkPoints: 60 }),
     }
   }
   if (ttl <= 0) return loader()
   return withCache(key, ttl, loader)
 }
 
-/** 优化建议：按紧急度排序，只返回需要动作或需要关注的项；未配置数据源时返回空列表 */
-export async function getOptimization({ minutes, codes, project } = {}) {
+/** 优化建议：复用概览（同一份数据、同一份缓存），只把建议相关字段提到顶层 */
+export async function getOptimization({ minutes, project, item } = {}) {
+  const overview = await getOverview({ minutes, project, item })
+  const out = overview.output
+  return {
+    project: overview.project,
+    projectName: overview.projectName,
+    item: overview.item,
+    items: overview.items,
+    station: overview.station,
+    mode: overview.mode,
+    ready: overview.ready,
+    reason: overview.reason,
+    generatedAt: overview.generatedAt,
+    windowMinutes: overview.windowMinutes,
+    source: overview.source,
+    warnings: overview.warnings,
+    output: out,
+    recommendation: out ? out.recommendation : null,
+    moves: out ? out.moves : [],
+  }
+}
+
+/** 单条曲线（输出结果 CV 或任一参与参数），供详情面板 */
+export async function getHistory({ code, minutes, project, item } = {}) {
   const projectId = apcConfig.resolveProjectId(project)
   const cat = loadCatalog(false, projectId)
+  const readiness = getItemReadiness(projectId, item)
   const ttl = cacheTtl()
-  const key = `optimize:${projectId}:${minutes || 'default'}:${(codes || []).join(',')}`
+  const key = `history:${projectId}:${readiness.itemId}:${code || ''}:${minutes || 'default'}`
   const loader = async () => {
-    const { mode, series, meta } = await fetchProcessSeries({ minutes, codes, project: projectId })
-    const ready = mode === 'hana'
-    const all = ready ? cat.params.map((p) => optimizeParam(p, series.get(p.code) || [], { sparkPoints: 72 })) : []
-    const order = { high: 0, medium: 1, low: 2, none: 3 }
-    const items = all
-      .filter((it) => Array.isArray(codes) && codes.length > 0 ? codes.includes(it.code) : true)
-      .sort((a, b) => {
-        const oa = order[a.recommendation.urgency] - order[b.recommendation.urgency]
-        if (oa !== 0) return oa
-        return (b.recommendation.confidence - a.recommendation.confidence)
-      })
-    return {
-      project: projectId,
-      projectName: (apcConfig.getProject(projectId) || {}).name || '',
-      station: ready ? cat.station : '',
-      mode,
-      ready,
-      reason: meta.reason || '',
-      generatedAt: new Date().toISOString(),
-      windowMinutes: meta.windowMinutes,
-      source: describeSource(mode, meta),
-      summary: {
-        total: items.length,
-        actionable: items.filter((it) => !it.recommendation.hold).length,
-        high: items.filter((it) => it.recommendation.urgency === 'high').length,
-        medium: items.filter((it) => it.recommendation.urgency === 'medium').length,
-        danger: items.filter((it) => it.status === 'danger').length,
-        avgConfidence: items.length
-          ? Math.round(items.reduce((a, b) => a + b.recommendation.confidence, 0) / items.length)
-          : 0,
-      },
-      items,
+    const proj = apcConfig.getProject(projectId)
+    const target = ((proj && proj.items) || []).find(it => it.id === readiness.itemId) || null
+    if (!readiness.ready || !target) {
+      return {
+        ready: false,
+        mode: 'unconfigured',
+        reason: readiness.reason,
+        item: target ? { id: target.id, name: target.name } : null,
+        windowMinutes: Math.max(1, Math.round(num(minutes, cat.defaultWindowMinutes))),
+        param: null,
+        points: [],
+        stats: null,
+      }
     }
-  }
-  if (ttl <= 0) return loader()
-  return withCache(key, ttl, loader)
-}
 
-/** 单个参数的历史曲线（供详情面板） */
-export async function getHistory({ code, minutes, project } = {}) {
-  const projectId = apcConfig.resolveProjectId(project)
-  const param = findParam(code, projectId)
-  if (!param) {
-    const err = new Error(`未找到参数：${code}`)
-    err.status = 404
-    throw err
-  }
-  const ttl = cacheTtl()
-  const key = `history:${projectId}:${param.code}:${minutes || 'default'}`
-  const loader = async () => {
-    const { mode, series, meta } = await fetchProcessSeries({ minutes, codes: [param.code], project: projectId })
-    const points = series.get(param.code) || []
-    const values = points.map((p) => p.v)
+    const data = await fetchItemSeries({ project: projectId, item: target, minutes })
+    const wanted = String(code || '').trim()
+    const isCv = !wanted || wanted === target.output.code
+    const member = isCv ? null : (target.params || []).find(p => p.code === wanted)
+    if (!isCv && !member) {
+      const err = new Error(`监测项「${target.name}」下未找到输出结果或参与参数：${wanted}`)
+      err.status = 404
+      throw err
+    }
+
+    const points = isCv
+      ? data.output.points
+      : (data.params.find(sp => sp.param.code === wanted) || { points: [] }).points
+    const decimals = num(isCv ? target.output.decimals : member.decimals, 3)
+    const values = points.map(p => p.v).filter(v => Number.isFinite(v))
     const stats = basicStats(values)
+    const slope = linearSlope(values)
 
-    // 规格可能是列名表达式：按最新一行求值用于窗口级统计，逐点求值用于规格带与偏离点
-    const compiled = compileParamSpec(param)
+    // 规格只对输出结果有意义（参与参数没有规格带）
+    const compiled = isCv ? compileParamSpec(cvSpecSource(target.output)) : null
     const lastRow = points.length > 0 ? points[points.length - 1].rawRow : undefined
-    const spec = resolveCompiledSpec(compiled, lastRow)
-    const pointDev = evaluatePoints(compiled, points)
-    const resolved = spec.ok ? { ...param, ...spec.spec } : param
-    const cpk = spec.ok ? computeCpk(resolved, stats.mean, stats.std) : null
-    const varySpec = specFieldIsExpr(compiled, 'lsl') || specFieldIsExpr(compiled, 'usl')
+    const spec = compiled ? resolveCompiledSpec(compiled, lastRow) : { ok: false, spec: {}, errors: [] }
+    const pointDev = compiled ? evaluatePoints(compiled, points) : { points: [], n: 0, outOfSpec: 0, outLow: 0, outHigh: 0, worst: null }
+    const resolved = spec.ok ? { ...target.output, lsl: spec.spec.lsl, usl: spec.spec.usl } : target.output
+    const varySpec = compiled ? (specFieldIsExpr(compiled, 'lsl') || specFieldIsExpr(compiled, 'usl')) : false
 
     return {
+      ready: true,
+      mode: 'hana',
+      reason: '',
+      item: { id: target.id, name: target.name },
+      windowMinutes: data.meta.windowMinutes,
+      source: describeSource('hana', data.meta),
+      warnings: data.meta.warnings || [],
+      isOutput: isCv,
       param: {
-        code: param.code,
-        name: param.name,
-        process: param.process,
-        unit: param.unit,
-        decimals: param.decimals,
-        setpoint: spec.ok ? spec.spec.setpoint : null,
-        optimalTarget: spec.ok ? spec.spec.optimalTarget : null,
-        lsl: spec.ok ? spec.spec.lsl : null,
-        usl: spec.ok ? spec.spec.usl : null,
-        min: spec.ok ? spec.spec.min : null,
-        max: spec.ok ? spec.spec.max : null,
+        code: isCv ? target.output.code : member.code,
+        name: isCv ? target.output.name : member.name,
+        unit: isCv ? target.output.unit : member.unit,
+        decimals,
+        target: isCv && spec.ok
+          ? roundTo(Number.isFinite(spec.spec.optimalTarget) ? spec.spec.optimalTarget : (spec.spec.lsl + spec.spec.usl) / 2, decimals)
+          : null,
+        lsl: isCv && spec.ok ? roundTo(spec.spec.lsl, decimals) : null,
+        usl: isCv && spec.ok ? roundTo(spec.spec.usl, decimals) : null,
+        min: isCv ? null : member.min,
+        max: isCv ? null : member.max,
       },
-      mode,
-      windowMinutes: meta.windowMinutes,
-      source: describeSource(mode, meta),
       specResolved: {
         ok: spec.ok,
         errors: spec.errors,
-        expressions: compiled.expressions,
-        columns: specReferencedColumns(compiled),
+        expressions: compiled ? compiled.expressions : {},
+        columns: compiled ? specReferencedColumns(compiled) : [],
       },
       pointDeviation: {
         n: pointDev.n,
@@ -1148,29 +1839,32 @@ export async function getHistory({ code, minutes, project } = {}) {
         worst: pointDev.worst
           ? {
             t: pointDev.worst.t,
-            v: roundTo(pointDev.worst.v, param.decimals),
-            lsl: roundTo(pointDev.worst.lsl, param.decimals),
-            usl: roundTo(pointDev.worst.usl, param.decimals),
-            deviation: roundTo(pointDev.worst.deviation, param.decimals),
+            v: roundTo(pointDev.worst.v, decimals),
+            lsl: roundTo(pointDev.worst.lsl, decimals),
+            usl: roundTo(pointDev.worst.usl, decimals),
+            deviation: roundTo(pointDev.worst.deviation, decimals),
             direction: pointDev.worst.direction,
           }
           : null,
       },
       stats: {
         n: stats.n,
-        mean: Number.isFinite(stats.mean) ? roundTo(stats.mean, param.decimals) : null,
-        std: Number.isFinite(stats.std) ? roundTo(stats.std, Math.min(4, param.decimals + 2)) : null,
-        min: Number.isFinite(stats.min) ? roundTo(stats.min, param.decimals) : null,
-        max: Number.isFinite(stats.max) ? roundTo(stats.max, param.decimals) : null,
-        cpk: cpk == null ? null : roundTo(cpk, 2),
-        trend: trendOf(linearSlope(values), stats.std),
-        status: spec.ok ? statusOf(resolved, stats) : 'unknown',
+        mean: Number.isFinite(stats.mean) ? roundTo(stats.mean, decimals) : null,
+        std: Number.isFinite(stats.std) ? roundTo(stats.std, Math.min(4, decimals + 2)) : null,
+        min: Number.isFinite(stats.min) ? roundTo(stats.min, decimals) : null,
+        max: Number.isFinite(stats.max) ? roundTo(stats.max, decimals) : null,
+        cpk: isCv && spec.ok ? (() => {
+          const c = computeCpk(resolved, stats.mean, stats.std)
+          return c == null ? null : roundTo(c, 2)
+        })() : null,
+        trend: trendOf(slope, stats.std),
+        status: isCv && spec.ok ? statusOf(resolved, stats) : 'unknown',
       },
-      points: pointDev.points.map((p) => {
-        const out = { t: p.t, v: roundTo(p.v, param.decimals) }
+      points: (compiled ? pointDev.points : points).map((p) => {
+        const out = { t: p.t, v: roundTo(p.v, decimals) }
         if (varySpec) {
-          if (Number.isFinite(p.lsl)) out.lsl = roundTo(p.lsl, param.decimals)
-          if (Number.isFinite(p.usl)) out.usl = roundTo(p.usl, param.decimals)
+          if (Number.isFinite(p.lsl)) out.lsl = roundTo(p.lsl, decimals)
+          if (Number.isFinite(p.usl)) out.usl = roundTo(p.usl, decimals)
           if (p.direction === 'low' || p.direction === 'high') out.direction = p.direction
         }
         return out
@@ -1184,7 +1878,8 @@ export async function getHistory({ code, minutes, project } = {}) {
 /** 未就绪时按具体原因给出下一步动作（页面空态引导文案） */
 const SOURCE_REASON_NOTE = {
   'no-project': '尚未创建监测项目。请点击「新建项目」，选择数据库系统，并配置取数 SQL 模板与过程参数。',
-  'no-template': '当前项目尚未配置取数 SQL 模板。请在项目的「SQL 模板」页填写取数语句并保存。',
+  'no-item': '当前项目尚未添加监测项。请点击「新建监测项」，为它配置取数 SQL、输出结果与参与参数。',
+  'no-template': '当前监测项尚未配置取数 SQL 模板。请在监测项的「取数 SQL」页填写语句并保存。',
   'no-connection': '当前项目绑定的数据库系统尚未配置连接信息。请在侧边栏「数据库管理」页填写连接参数。',
 }
 

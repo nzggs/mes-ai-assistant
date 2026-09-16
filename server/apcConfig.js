@@ -22,7 +22,7 @@
 import fs from 'fs'
 import path from 'path'
 import { fileURLToPath } from 'url'
-import { validateCatalog, normalizeQueries, normalizeParams } from './apcCatalog.js'
+import { validateCatalog, normalizeQueries, normalizeParams, normalizeItems, normalizeItem } from './apcCatalog.js'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const DEFAULT_SEED_FILE = path.join(__dirname, 'apc.catalog.json')
@@ -392,17 +392,79 @@ function projectsMap() {
   return raw && typeof raw === 'object' ? raw : {}
 }
 
-/** 项目列表（按创建时间先后），不含密码等敏感字段（项目本身不含） */
+// ===== legacy → 监测项 的惰性迁移 =====
+// 多对 1 改造前，一个项目只有一套 { queries, params }，且每个参数都是「自调优」：
+// setpoint 与实测值来自同一条曲线，processGain 描述的是「调自己一个单位、自己变多少」。
+// 把这样一个参数迁成「N = 1 的监测项」，令 k = processGain，新公式的闭式解
+//     ΔMV = (k·s²/w)·ΔCV / (k²·s²/w) = ΔCV / k
+// 恰好逐字退化为旧公式 wanted = setpoint + (optimalTarget − mean) / processGain，
+// 因此下面的合成是**严格等价**的：老项目不重建也能继续跑，行为与改造前一致。
+
+/** 由 legacy 的 queries + params 合成监测项；无法安全合成时返回 null（宁可不迁移，也不猜） */
+function synthesizeItems(project) {
+  const queries = project.queries
+  const legacyParams = Array.isArray(project.params) ? project.params : []
+  if (!queries || !queries.history) return null
+  if (legacyParams.length === 0) return null
+  // 窄表已物理移除：这里不做「长转宽」的猜测（列名根本对不上），保持原样交给上层明确报错
+  if (String(queries.mode || '').trim() === 'long') return null
+
+  return legacyParams.map((p, i) => ({
+    id: `it_legacy_${String(p.code || i).replace(/[^A-Za-z0-9_]/g, '').slice(0, 48) || i}`,
+    name: String(p.name || p.code || `监测项 ${i + 1}`),
+    description: '由旧版单参数配置自动迁移',
+    query: { mode: 'wide', history: queries.history, columns: { ...(queries.columns || {}) } },
+    output: {
+      code: p.code,
+      name: p.name || p.code,
+      unit: p.unit || '',
+      decimals: p.decimals,
+      column: p.column || p.code,
+      objective: p.objective,
+      spec: { lsl: p.lsl, usl: p.usl, target: p.optimalTarget },
+    },
+    params: [{
+      code: p.code,
+      name: p.name || p.code,
+      process: p.process || '其他',
+      unit: p.unit || '',
+      decimals: p.decimals,
+      column: p.column || p.code,
+      min: p.min,
+      max: p.max,
+      // 带上原设定值：这是迁移后建议值能与改造前**逐字一致**的关键
+      setpoint: Number.isFinite(Number(p.setpoint)) ? Number(p.setpoint) : null,
+      maxStepPct: p.maxStepPct,
+      weight: 1,
+      enabled: true,
+      k: { mode: 'manual', value: num(p.processGain, 1) || 1 },
+    }],
+    tuning: { deadbandPct: p.deadbandPct, maxRounds: 2, residualTolerancePct: 5 },
+    migrated: true,
+  }))
+}
+
+/** 让项目的 items 一定可用：legacy 项目在这里合成，**只在内存里**，不写盘 */
+function materializeProject(project) {
+  if (!project || typeof project !== 'object') return project
+  if (Array.isArray(project.items) && project.items.length > 0) return project
+  const synthesized = synthesizeItems(project)
+  if (!synthesized) return project
+  return { ...project, items: synthesized, synthesizedFromLegacy: true }
+}
+
+/** 项目列表（按创建时间先后）；legacy 项目会带上内存合成的 items */
 export function listProjects() {
   return Object.values(projectsMap())
     .filter(p => p && typeof p === 'object' && p.id)
     .sort((a, b) => String(a.createdAt || '').localeCompare(String(b.createdAt || '')))
+    .map(materializeProject)
 }
 
-/** 读取单个项目（不存在返回 null） */
+/** 读取单个项目（不存在返回 null）；legacy 项目会带上内存合成的 items */
 export function getProject(id) {
   const p = projectsMap()[String(id || '')]
-  return p && typeof p === 'object' ? p : null
+  return p && typeof p === 'object' ? materializeProject(p) : null
 }
 
 /** 解析实际项目 id：显式传入优先；缺省取列表第一个项目；一个都没有时返回空串 */
@@ -458,6 +520,15 @@ function normalizeProject(input, { partial = false } = {}) {
     const slot = out.dbSlot || input._projectDbSlot
     out.params = slot ? params.map(p => ({ ...p, dbSlot: slot })) : params
   }
+  // 监测项：多对 1 调优的基本单位（每项自带 SQL + 1 个输出结果 CV + N 个参与参数 MV）。
+  // 一旦保存 items，就视为「迁移完成」——同时清空 legacy 的 queries/params，
+  // 否则下次读取又会把老结构合成成一批重复的监测项。
+  if (input.items !== undefined) {
+    out.items = normalizeItems(input.items)
+    out.legacyMigrated = true
+    out.queries = null
+    out.params = []
+  }
   return out
 }
 
@@ -502,19 +573,99 @@ export function deleteProject(id) {
   return listProjects()
 }
 
+// ===== 监测项：读 / 增改 / 删 =====
+
+/** 读取项目的监测项（含 legacy 合成项） */
+export function listItems(projectId) {
+  const project = getProject(resolveProjectId(projectId))
+  return project && Array.isArray(project.items) ? project.items : []
+}
+
+/** 读取单个监测项（不存在返回 null） */
+export function getItem(projectId, itemId) {
+  const id = String(itemId || '').trim()
+  if (!id) return null
+  return listItems(projectId).find(it => it && it.id === id) || null
+}
+
+/**
+ * 新增 / 更新一个监测项（全量提交语义：传入的即该项最终形态）。
+ *
+ * 关键：先 materialize 再改再落盘。legacy 项目的 items 是内存合成的，
+ * 若直接按传入数组覆盖，「编辑迁移来的第 2 项」会因为数组里只有 1 项而把其余项弄丢。
+ */
+export function upsertItem(projectId, itemInput, itemId) {
+  const cur = readConfig(true)
+  const projects = { ...(cur.projects || {}) }
+  const key = String(projectId || '').trim()
+  const existing = projects[key]
+  if (!existing || typeof existing !== 'object') throw projectIdError(`监测项目不存在：${key || '(空)'}`)
+
+  const materialized = materializeProject(existing)
+  const items = Array.isArray(materialized.items) ? [...materialized.items] : []
+  const targetId = String(itemId || (itemInput && itemInput.id) || '').trim()
+  const norm = normalizeItem({ ...(itemInput || {}), id: targetId || undefined }, 0)
+
+  const idx = items.findIndex(it => it && it.id === norm.id)
+  if (idx >= 0) items[idx] = norm
+  else items.push(norm)
+
+  // 落盘即视为迁移完成：清掉 legacy 字段，避免下次读取又合成出一批重复监测项
+  projects[key] = {
+    ...existing,
+    items,
+    legacyMigrated: true,
+    queries: null,
+    params: [],
+    updatedAt: new Date().toISOString(),
+  }
+  persist({ ...cur, projects })
+  return norm
+}
+
+/** 删除一个监测项，返回剩余列表 */
+export function deleteItem(projectId, itemId) {
+  const cur = readConfig(true)
+  const projects = { ...(cur.projects || {}) }
+  const key = String(projectId || '').trim()
+  const existing = projects[key]
+  if (!existing || typeof existing !== 'object') throw projectIdError(`监测项目不存在：${key || '(空)'}`)
+  const id = String(itemId || '').trim()
+  if (!id) throw projectIdError('缺少要删除的监测项 id')
+
+  const materialized = materializeProject(existing)
+  const items = Array.isArray(materialized.items) ? materialized.items : []
+  const left = items.filter(it => it && it.id !== id)
+  if (left.length === items.length) throw projectIdError(`监测项不存在：${id}`)
+
+  projects[key] = {
+    ...existing,
+    items: left,
+    legacyMigrated: true,
+    queries: null,
+    params: [],
+    updatedAt: new Date().toISOString(),
+  }
+  persist({ ...cur, projects })
+  return left
+}
+
 /** 用「种子 + 全局 meta + 项目内容」拼出待校验目录（不落盘）；overrides 可预览保存后的效果 */
 function rawCatalogFor(projectId, overrides) {
   const seedRaw = readSeedRaw()
   if (isCatalogFileLocked()) return seedRaw
   const pid = resolveProjectId(projectId)
+  // getProject 已对 legacy 项目做过内存合成，这里直接拿到可用的 items
   const project = { ...((pid ? getProject(pid) : null) || {}), ...(overrides || {}) }
   const meta = { ...(savedMeta()) }
   const seedParams = Array.isArray(seedRaw.params) ? seedRaw.params : []
   return {
     ...seedRaw,
     ...meta,
+    // queries / params 只对尚未迁移的 legacy 项目有值；已迁移的项目走 items（每项自带 query）
     queries: project.queries !== undefined ? project.queries : seedRaw.queries,
     params: project.params !== undefined ? project.params : seedParams,
+    items: Array.isArray(project.items) ? project.items : [],
   }
 }
 
