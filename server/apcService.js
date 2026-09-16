@@ -1956,14 +1956,7 @@ export function getApcStatus() {
   } catch (err) {
     catalogError = String((err && err.message) || err)
   }
-  const projects = apcConfig.listProjects().map(p => ({
-    id: p.id,
-    name: p.name,
-    description: p.description || '',
-    dbSlot: p.dbSlot || 'db1',
-    paramCount: Array.isArray(p.params) ? p.params.length : 0,
-    hasQueries: Boolean(p.queries && p.queries.history),
-  }))
+  const projects = apcConfig.listProjects().map(apcConfig.summarizeProject).filter(Boolean)
   return {
     enabled: isApcEnabled(),
     mode: cat ? getSourceMode() : 'unavailable',

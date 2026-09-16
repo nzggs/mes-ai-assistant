@@ -467,6 +467,34 @@ export function getProject(id) {
   return p && typeof p === 'object' ? materializeProject(p) : null
 }
 
+/**
+ * 项目摘要：列表/卡片用，**不含** queries/params/items 全文。
+ *
+ * 这是项目摘要的唯一构造点（/api/apc/status 与 /api/apc/config 都走这里），
+ * 避免两处各写一份、迁移到 items 后漏改其中一处。
+ *
+ * - itemCount：监测项数量（N 对 1 调优的基本单位），legacy 项目用内存合成的 items 计数
+ * - paramCount：老结构（queries+params）里的参数个数，仅作兼容保留，新代码用 itemCount
+ * - hasQueries：新结构看「监测项自带的模板」，老结构看 queries.history；
+ *   迁移后 p.queries 已被清空，只看老字段会恒为 false。
+ */
+export function summarizeProject(p) {
+  if (!p || typeof p !== 'object') return null
+  const items = Array.isArray(p.items) ? p.items : []
+  const itemHasQuery = items.some(it => it && it.query && String(it.query.history || '').trim())
+  return {
+    id: p.id,
+    name: p.name,
+    description: p.description || '',
+    dbSlot: p.dbSlot || 'db1',
+    itemCount: items.length,
+    paramCount: Array.isArray(p.params) ? p.params.length : 0,
+    hasQueries: itemHasQuery || Boolean(p.queries && p.queries.history),
+    createdAt: p.createdAt || null,
+    updatedAt: p.updatedAt || null,
+  }
+}
+
 /** 解析实际项目 id：显式传入优先；缺省取列表第一个项目；一个都没有时返回空串 */
 export function resolveProjectId(id) {
   const explicit = String(id == null ? '' : id).trim()
@@ -851,16 +879,7 @@ export function getConfigForClient() {
   envValues.passwordSet = Boolean(env.password)
 
   // 项目摘要列表（不含 queries/params 全文，详情走 /api/apc/projects）
-  const projects = listProjects().map(p => ({
-    id: p.id,
-    name: p.name,
-    description: p.description || '',
-    dbSlot: p.dbSlot || 'db1',
-    paramCount: Array.isArray(p.params) ? p.params.length : 0,
-    hasQueries: Boolean(p.queries && p.queries.history),
-    createdAt: p.createdAt || null,
-    updatedAt: p.updatedAt || null,
-  }))
+  const projects = listProjects().map(summarizeProject).filter(Boolean)
 
   return {
     configFile: file,

@@ -1533,12 +1533,16 @@ if (isMain) {
     console.log(`  ${ADMIN_TOKEN ? '管理操作：已启用 ADMIN_TOKEN' : '管理操作：仅本机(loopback)可写'}`)
     try {
       const apc = getApcStatus()
-      const modeDesc = apc.queryMode === 'wide' ? '宽表' : apc.queryMode === 'long' ? '窄表' : '—'
+      // 窄表（long）模式已移除：只可能是 wide，或目录里没配 queries
+      const modeDesc = apc.queryMode === 'wide' ? '宽表' : '—'
+      const projects = Array.isArray(apc.projects) ? apc.projects : []
+      const itemTotal = projects.reduce((sum, p) => sum + (Number(p.itemCount) || 0), 0)
+      const scopeDesc = `${projects.length} 个监测项目 / ${itemTotal} 个监测项`
       const apcDesc = !apc.enabled
         ? '已关闭'
         : apc.mode === 'hana'
-          ? `只读数据源 ${apc.hana.host}:${apc.hana.port}（${modeDesc}取数 · ${apc.paramCount} 个过程参数）`
-          : `未配置数据源（${apc.paramCount} 个过程参数）· 请新建监测项目并配置数据库连接与取数 SQL`
+          ? `只读数据源 ${apc.hana.host}:${apc.hana.port}（${modeDesc}取数 · ${scopeDesc}）`
+          : `未配置数据源（${scopeDesc}）· 请新建监测项目并配置数据库连接与取数 SQL`
       console.log(`  APC/RTO:   ${apcDesc}${apc.catalogError ? `  [目录异常] ${apc.catalogError}` : ''}`)
     } catch { /* 状态打印失败不影响启动 */ }
     console.log(`========================================\n`)

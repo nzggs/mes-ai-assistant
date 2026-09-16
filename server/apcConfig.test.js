@@ -20,6 +20,7 @@ import {
   invalidateConfigCache, getDatabases,
   DEFAULT_PROJECT_ID, DEFAULT_CHAT_ROWS, listProjects, getProject,
   createProject, updateProject, deleteProject, saveLimits, getEffectiveLimits,
+  summarizeProject, upsertItem,
 } from './apcConfig.js'
 import { loadCatalog, buildTemplateVars, buildHistorySql, previewQuery } from './apcService.js'
 
@@ -518,5 +519,76 @@ describe('apcConfig · 监测项目（dbSlot + SQL 模板 + 参数自成一套�
     expect(() => resetSection('params')).toThrow(/尚未创建监测项目/)
     // 报错后依然没有任何项目被悄悄创建
     expect(listProjects()).toEqual([])
+  })
+})
+
+// ===== 项目摘要（列表 / 卡片口径）=====
+// 回归：迁移到 N 对 1（items）后，摘要一度只回 paramCount、漏了 itemCount，
+// 前端「该项目有 N 个监测项」会渲染成 undefined。摘要只有一个构造点，
+// /api/apc/status 与 /api/apc/config 都必须带上它。
+describe('apcConfig · 项目摘要的字段口径', () => {
+  /** 一个字段齐备的监测项，可用 over 覆盖任意字段 */
+  const makeItem = (over = {}) => ({
+    name: '涂布面密度回路',
+    query: { mode: 'wide', history: 'SELECT {{columns}} FROM "T"', columns: { ts: 'TS' } },
+    output: {
+      code: 'CV1', name: '面密度', unit: 'mg/cm2', decimals: 2, column: 'CV1',
+      objective: 'quality', spec: { lsl: 0, usl: 100, target: 50 },
+    },
+    params: [{
+      code: 'MV1', name: '张力', unit: 'N', decimals: 2, column: 'MV1',
+      min: 0, max: 10, setpoint: 5, maxStepPct: 10, weight: 1, enabled: true,
+      k: { mode: 'manual', value: 0 },
+    }],
+    ...over,
+  })
+
+  it('老结构项目：itemCount 按内存合成出的监测项计数，不是 undefined / 0', () => {
+    // 只有 queries + params 的老项目，没有 items 字段
+    const legacy = createProject({
+      name: '老结构项目',
+      dbSlot: 'db1',
+      params: [{ code: 'P1', ...P_BASE }, { code: 'P2', ...P_BASE }],
+    })
+    saveQueries({ mode: 'wide', history: OK_SQL, columns: OK_COLUMNS }, legacy.id)
+
+    // 老项目被合成成 2 个「自调优」监测项 → 摘要必须如实报 2
+    const sum = summarizeProject(getProject(legacy.id))
+    expect(sum.itemCount).toBe(2)
+    expect(sum.hasQueries).toBe(true)
+    // 兼容字段照旧保留，供老客户端读取
+    expect(sum.paramCount).toBe(2)
+
+    // 配置视图走同一条摘要构造路径：一处漏改就会在这里暴露
+    const inView = getConfigForClient().projects.find(x => x.id === legacy.id)
+    expect(inView.itemCount).toBe(2)
+  })
+
+  it('新结构项目：hasQueries 看监测项自带的模板（迁移后 p.queries 已为 null，老逻辑会误报 false）', () => {
+    const p = createProject({ name: '新结构项目', dbSlot: 'db1' })
+    upsertItem(p.id, makeItem())
+
+    // upsertItem 落盘即迁移完成：老结构字段被清空，模板只存在于监测项里
+    expect(getProject(p.id).queries).toBeNull()
+    const sum = summarizeProject(getProject(p.id))
+    expect(sum.itemCount).toBe(1)
+    // 只看老字段会得到 false —— 摘要必须据监测项判定为「有模板」
+    expect(sum.hasQueries).toBe(true)
+    expect(sum.paramCount).toBe(0)
+  })
+
+  it('新增第二个监测项后 itemCount 累加', () => {
+    const p = createProject({ name: '多项项目', dbSlot: 'db1' })
+    upsertItem(p.id, makeItem())
+    upsertItem(p.id, makeItem({ name: '第二回路' }))
+    const sum = summarizeProject(getProject(p.id))
+    expect(sum.itemCount).toBe(2)
+    expect(sum.hasQueries).toBe(true)
+  })
+
+  it('非法输入返回 null，不抛错', () => {
+    expect(summarizeProject(null)).toBeNull()
+    expect(summarizeProject(undefined)).toBeNull()
+    expect(summarizeProject('p1')).toBeNull()
   })
 })
